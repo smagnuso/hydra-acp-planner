@@ -33,6 +33,7 @@ import { rmSync } from "node:fs";
 import {
   allTerminal,
   canonicalProjectId,
+  inFlightCount,
   listProjects,
   loadBoard,
   newBoard,
@@ -97,6 +98,11 @@ const COMMANDS = [
     description: "Show the board for this session's project.",
   },
   {
+    verb: "cancel",
+    argsHint: "[<projectId>]",
+    description: "Stop this session's project (or another by id). Cancels in-flight workers; pending tasks stay frozen on the board.",
+  },
+  {
     verb: "remove",
     argsHint: "[<projectId>]",
     description: "Delete this session's project (or another by id). Closes worker sessions; orchestrator session is left intact.",
@@ -129,6 +135,20 @@ function findBoardOnDisk(orchestratorSessionId: string): Board | undefined {
   for (const entry of listProjects()) {
     if (entry.orchestratorSessionId === orchestratorSessionId) {
       return loadBoard(entry.projectId);
+    }
+  }
+  return undefined;
+}
+
+// Inverse of findBoardOnDisk — given a projectId, return its
+// orchestrator session id (the session the user typed /hydra planner
+// create in). Reads the `orchestrator` pointer file via listProjects'
+// existing scan. Used by `cancel <projectId>` from a non-orchestrator
+// session.
+function orchestratorSessionForProject(projectId: string): string | undefined {
+  for (const entry of listProjects()) {
+    if (entry.projectId === projectId) {
+      return entry.orchestratorSessionId;
     }
   }
   return undefined;
@@ -354,11 +374,103 @@ export class PlannerBridge {
       this.handleStatus(req.id, sessionId);
       return;
     }
+    if (verb === "cancel") {
+      this.handleCancel(req.id, sessionId, args);
+      return;
+    }
     if (verb === "remove") {
       this.handleRemove(req.id, sessionId, args);
       return;
     }
     this.client.reply(req.id, { text: `unknown planner verb: ${verb}` });
+  }
+
+  // Stop a project mid-run. With no args, cancels the current session's
+  // project; with an arg, cancels the named project (handy from any
+  // session). For each task currently `assigned` to a worker, force-
+  // cancel the worker's in-flight turn and mark the task `failed`.
+  // Pending tasks stay frozen on the board. Board state transitions to
+  // `failed`. The scheduler's terminal-state guard prevents the
+  // worker-completion callbacks from re-arming. No sessions are deleted —
+  // both orchestrator and worker sessions remain, so the user can
+  // inspect (or later, when M5 resurrection lands, resume).
+  private handleCancel(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): void {
+    let board: Board | undefined;
+    let orchestratorSessionId: string | undefined;
+    if (args.length > 0) {
+      const canonical = canonicalProjectId(args.split(/\s+/)[0]!);
+      board = loadBoard(canonical);
+      if (board) {
+        orchestratorSessionId = orchestratorSessionForProject(canonical);
+      }
+    } else {
+      board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+      orchestratorSessionId = sessionId;
+    }
+    if (!board || !orchestratorSessionId) {
+      this.client.reply(reqId, {
+        text:
+          args.length > 0
+            ? `No project '${args}' found.`
+            : "No plan in this session to cancel. Use `/hydra planner cancel <projectId>` for a different project.",
+      });
+      return;
+    }
+    const canonical = board.projectId;
+    if (board.state === "done" || board.state === "failed") {
+      this.client.reply(reqId, {
+        text: `Project ${shortProjectId(canonical)} is already ${board.state}.`,
+      });
+      return;
+    }
+
+    // Snapshot in-flight workers before mutating, then mark each as
+    // failed. The actual force_cancel happens async; we don't await
+    // because the user's reply should be immediate.
+    const inFlight: Array<{ workerId: string; taskId: string }> = [];
+    for (const task of board.tasks) {
+      if (task.status === "assigned" && task.assignedTo) {
+        inFlight.push({ workerId: task.assignedTo, taskId: task.id });
+        task.status = "failed";
+        task.finishedAt = nowIso();
+      }
+    }
+    board.state = "failed";
+    saveBoard(board, orchestratorSessionId);
+
+    // Force-cancel each in-flight worker. force_cancel is a request
+    // that aggressively halts the agent's current turn — more decisive
+    // than the notification-shaped session/cancel. We swallow errors:
+    // a worker that's already done/closed won't accept the cancel, and
+    // that's fine because the goal is "stop running, drop state."
+    log.info(
+      `cancelling project ${shortProjectId(canonical)} — ${inFlight.length} in-flight worker${inFlight.length === 1 ? "" : "s"}`,
+    );
+    for (const { workerId } of inFlight) {
+      void this.client
+        .request("hydra-acp/session/force_cancel", { sessionId: workerId })
+        .catch((err) => {
+          log.warn(
+            `force_cancel of worker ${workerId} failed: ${(err as Error).message}`,
+          );
+        });
+    }
+
+    const tail =
+      inFlight.length > 0
+        ? `; ${inFlight.length} in-flight task${inFlight.length === 1 ? "" : "s"} cancelled`
+        : "";
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `⨯ Project ${shortProjectId(canonical)} cancelled${tail}.`,
+    );
+    this.client.reply(reqId, {
+      text: `Cancelled project ${shortProjectId(canonical)}${tail}.`,
+    });
   }
 
   // Drop a project. With no args, removes the project owned by the
@@ -563,8 +675,8 @@ export class PlannerBridge {
 
     // Turn complete — parse the accumulated reply and emit the summary.
     // finishDecomposition is synchronous; it also kicks off the first
-    // task assignment via `void this.assignNextTask(...)` which runs in
-    // the background after we return (workers don't keep the
+    // pass of scheduling via `void this.scheduleEligibleTasks(...)` which
+    // runs in the background after we return (workers don't keep the
     // orchestrator's slash-command turn busy).
     const doneState = getOrchestratorState(sessionId);
     if (doneState && doneState.awaitingDecomposition) {
@@ -607,7 +719,7 @@ export class PlannerBridge {
   // We do NOT key on turn_complete: hydra synthesizes it via
   // broadcastTurnComplete → recordAndBroadcast, bypassing the response
   // chain. End-of-turn is detected by awaiting the message/emit promise
-  // in handleCreate (orchestrator) and assignNextTask (worker).
+  // in handleCreate (orchestrator) and spawnTaskOnNewWorker (worker).
   private handleUpdateResponse(reqId: number | string, sessionId: string, envelope: unknown): void {
     const orchState = getOrchestratorState(sessionId);
     if (orchState && orchState.awaitingDecomposition) {
@@ -693,42 +805,69 @@ export class PlannerBridge {
         : "";
     void this.emitSyntheticMessage(sessionId, `${summary}${warningsBlock}`);
 
-    // M2: kick off the first eligible task. M3+ replaces this with a
-    // proper scheduler that maintains concurrencyCap workers in flight.
-    void this.assignNextTask(sessionId, board);
+    // Kick off the scheduler: fills up to concurrencyCap workers with
+    // initial eligible tasks. Subsequent completions trigger refill.
+    void this.scheduleEligibleTasks(sessionId, board);
   }
 
   // ── Worker scheduling ─────────────────────────────────────────────
 
-  // Pick the next eligible task, spawn a fresh worker session for it,
-  // attach the planner to the child's chain, fire off the task prompt,
-  // and process the result on emit-promise resolution. M2 fires at most
-  // one worker; M3 generalizes to maintain board.concurrencyCap in flight.
-  private async assignNextTask(orchestratorSessionId: string, board: Board): Promise<void> {
+  // The scheduler: spawn up to `board.concurrencyCap` workers,
+  // each on the next eligible task. Called after decomposition
+  // (initial fill), after every task completion (refill the freed
+  // slot + any newly-unblocked tasks), and after every task failure
+  // (likewise — don't stall on failure).
+  //
+  // Invocation is idempotent and safe to call concurrently with
+  // itself: each spawn synchronously marks its task `assigned` and
+  // persists the board before yielding the event loop, so a second
+  // entry sees the up-to-date state. Single-threaded JS means no
+  // real races.
+  private async scheduleEligibleTasks(orchestratorSessionId: string, board: Board): Promise<void> {
+    // Terminal-state guard: once a board is done or failed (including
+    // user-cancelled), never schedule new work. Completion callbacks
+    // from in-flight workers still fire after cancel — the guard
+    // prevents them from re-arming the scheduler.
+    if (board.state === "done" || board.state === "failed") {
+      return;
+    }
+    // Project-complete short-circuit. Emit once, transition state, return.
     if (allTerminal(board)) {
+      board.state = "done";
+      saveBoard(board, orchestratorSessionId);
       void this.emitSyntheticMessage(
         orchestratorSessionId,
         `🎉 Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`,
       );
-      board.state = "done";
-      saveBoard(board, orchestratorSessionId);
       return;
     }
 
-    const task = pickEligible(board);
-    if (!task) {
-      // Nothing pending and deps-satisfied right now. (M2 doesn't expect
-      // this branch — with no parallelism yet, every non-terminal
-      // sequence reaches here only between turns.) For now, just return.
-      log.debug(
-        `no eligible task for ${board.projectId}; ${board.tasks.length} tasks total`,
-      );
-      return;
+    while (inFlightCount(board) < board.concurrencyCap) {
+      const task = pickEligible(board);
+      if (!task) {
+        // Nothing eligible right now. Either we hit the cap, or
+        // remaining work is dep-blocked behind in-flight tasks. The
+        // next task completion will retry — no need to poll.
+        return;
+      }
+      // Spawn synchronously enough to claim the task before the
+      // next loop iteration sees it. The actual emit + run is
+      // fire-and-forget; on completion it calls back into
+      // scheduleEligibleTasks to fill the slot.
+      await this.spawnTaskOnNewWorker(orchestratorSessionId, board, task);
     }
+  }
 
-    // Spawn the worker session. cwd is omitted — the daemon inherits it
-    // from the orchestrator (parentSessionId), so the worker runs in
-    // the same project root.
+  // Spawn a fresh worker session, attach to it, mark the task as
+  // assigned, persist the board, fire the task prompt. The promise
+  // resolves once the task is claimed (board state is consistent) —
+  // not when the turn completes. Turn completion is handled by the
+  // inner async closure firing handleTaskComplete / handleTaskFailure.
+  private async spawnTaskOnNewWorker(
+    orchestratorSessionId: string,
+    board: Board,
+    task: Task,
+  ): Promise<void> {
     let childSessionId: string;
     try {
       const spawnResult = await this.client.request<{ childSessionId: string }>(
@@ -754,7 +893,6 @@ export class PlannerBridge {
       return;
     }
 
-    // Attach ourselves to the worker's chain so we see its response chunks.
     try {
       await this.client.request("hydra-acp/transformer/attach", {
         sessionId: childSessionId,
@@ -765,11 +903,15 @@ export class PlannerBridge {
         `transformer/attach to worker ${childSessionId} failed: ${(err as Error).message}`,
       );
       void this.closeWorker(childSessionId);
+      task.status = "failed";
+      task.attemptCount += 1;
+      saveBoard(board, orchestratorSessionId);
       return;
     }
 
-    // Reserve the task and the worker. Persist BEFORE emitting so a
-    // crash in between leaves a recoverable record.
+    // Claim the task: mark assigned + persist BEFORE the outer
+    // scheduler loop can pickEligible again. After this point the
+    // task is no longer "pending" to anyone.
     task.status = "assigned";
     task.assignedTo = childSessionId;
     task.startedAt = nowIso();
@@ -792,11 +934,11 @@ export class PlannerBridge {
       `▶ ${task.id} → worker ${shortSessionId(childSessionId)}  (${task.title})`,
     );
 
-    // Fire the task prompt. As with decomposition, the emit promise
-    // resolves when the agent's session/prompt response comes back —
-    // i.e. when the task turn is complete. Mark ancillary so the worker
-    // session stays out of default UI surfaces unless the user opts in
-    // by attaching.
+    // Fire the task prompt asynchronously. We're not awaiting the
+    // emit promise here because the scheduler needs to return so
+    // the next iteration of its loop can spawn the next worker in
+    // parallel — that's the whole point of concurrent execution.
+    // Turn completion is handled when this promise resolves.
     void (async () => {
       try {
         await this.client.request("hydra-acp/message/emit", {
@@ -879,15 +1021,11 @@ export class PlannerBridge {
     unregisterWorker(workerSessionId);
     void this.closeWorker(workerSessionId);
 
-    // M2: halt after one task. M3+: void this.assignNextTask(...).
-    if (allTerminal(board)) {
-      void this.emitSyntheticMessage(
-        orchestratorSessionId,
-        `🎉 Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`,
-      );
-      board.state = "done";
-      saveBoard(board, orchestratorSessionId);
-    }
+    // Try to refill the freed slot. Completing this task may have also
+    // unblocked dependents — scheduleEligibleTasks loops until it hits
+    // the cap or runs out of eligible work. Also handles the
+    // project-complete transition when no more work remains.
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
   }
 
   private handleTaskFailure(
@@ -912,6 +1050,10 @@ export class PlannerBridge {
     clearWorkerState(workerSessionId);
     unregisterWorker(workerSessionId);
     void this.closeWorker(workerSessionId);
+
+    // Don't stall on failure — the next eligible task (or project
+    // completion when nothing remains) is still the right thing.
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
   }
 
   private async closeWorker(workerSessionId: string): Promise<void> {

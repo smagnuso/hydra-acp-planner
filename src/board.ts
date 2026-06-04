@@ -173,10 +173,21 @@ export function pickEligible(board: Board): Task | undefined {
 }
 
 // All tasks are terminal (done or failed). Used to decide when to emit
-// the project-complete message and (M3+) to stop spawning workers.
+// the project-complete message and to stop spawning workers.
 export function allTerminal(board: Board): boolean {
   if (board.tasks.length === 0) return false;
   return board.tasks.every((t) => t.status === "done" || t.status === "failed");
+}
+
+// Number of tasks currently in `assigned` state — i.e. workers
+// actively running. The scheduler uses this against board.concurrencyCap
+// to decide whether to spawn another worker.
+export function inFlightCount(board: Board): number {
+  let n = 0;
+  for (const t of board.tasks) {
+    if (t.status === "assigned") n += 1;
+  }
+  return n;
 }
 
 export function listProjects(): ProjectIndexEntry[] {

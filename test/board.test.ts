@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   allTerminal,
   canonicalProjectId,
+  inFlightCount,
   listProjects,
   loadBoard,
   newBoard,
@@ -237,6 +238,94 @@ describe("pickEligible", () => {
       makeTask("T5", { status: "pending" }),
     ]);
     assert.equal(pickEligible(b)?.id, "T5");
+  });
+});
+
+describe("inFlightCount", () => {
+  function makeTask(id: string, status: Task["status"]): Task {
+    return { id, title: id, deps: [], status, attemptCount: 0 };
+  }
+  function makeBoard(tasks: Task[]): Board {
+    return {
+      version: 1,
+      projectId: "proj_if",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks,
+      workers: {},
+      concurrencyCap: 1,
+    };
+  }
+
+  it("returns 0 for empty board", () => {
+    assert.equal(inFlightCount(makeBoard([])), 0);
+  });
+
+  it("counts only assigned tasks", () => {
+    const b = makeBoard([
+      makeTask("T1", "done"),
+      makeTask("T2", "assigned"),
+      makeTask("T3", "pending"),
+      makeTask("T4", "assigned"),
+      makeTask("T5", "failed"),
+      makeTask("T6", "blocked"),
+    ]);
+    assert.equal(inFlightCount(b), 2);
+  });
+
+  it("composes with pickEligible to model scheduler invariants", () => {
+    // Scenario: 4 independent tasks, concurrencyCap=2. The scheduler
+    // loop says: while inFlight < cap, pick + assign. After 2
+    // iterations, inFlight should equal cap and pickEligible should
+    // still return work (which the scheduler then declines to assign).
+    const tasks = [
+      makeTask("T1", "pending"),
+      makeTask("T2", "pending"),
+      makeTask("T3", "pending"),
+      makeTask("T4", "pending"),
+    ];
+    const b = makeBoard(tasks);
+    b.concurrencyCap = 2;
+
+    // Simulate the scheduler loop deterministically.
+    while (inFlightCount(b) < b.concurrencyCap) {
+      const t = pickEligible(b);
+      if (!t) break;
+      t.status = "assigned";
+    }
+    assert.equal(inFlightCount(b), 2);
+    // 2 still pending, eligible — scheduler declines to assign because cap is hit.
+    assert.equal(b.tasks.filter((t) => t.status === "pending").length, 2);
+  });
+
+  it("scheduler invariant: completing a task frees a slot and pickEligible refills", () => {
+    const tasks = [
+      makeTask("T1", "assigned"),
+      makeTask("T2", "assigned"),
+      makeTask("T3", "pending"),
+      makeTask("T4", "pending"),
+    ];
+    const b = makeBoard(tasks);
+    b.concurrencyCap = 2;
+    assert.equal(inFlightCount(b), 2);
+
+    // T1 completes.
+    tasks[0]!.status = "done";
+    assert.equal(inFlightCount(b), 1);
+
+    // Scheduler loop fills back to cap.
+    while (inFlightCount(b) < b.concurrencyCap) {
+      const t = pickEligible(b);
+      if (!t) break;
+      t.status = "assigned";
+    }
+    assert.equal(inFlightCount(b), 2);
+    // T3 just got picked up (first pending), T4 still waiting.
+    assert.equal(tasks[2]!.status, "assigned");
+    assert.equal(tasks[3]!.status, "pending");
   });
 });
 
