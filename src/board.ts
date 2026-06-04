@@ -79,6 +79,19 @@ export function shortProjectId(id: string): string {
     : id;
 }
 
+const HYDRA_SESSION_PREFIX = "hydra_session_";
+
+// Strip the `hydra_session_` prefix for user-visible output. Hydra's
+// own resolveCanonicalId accepts both forms as input, and `hydra-acp
+// session` (the table-list view) renders the short form — so showing
+// the short form in planner output is both scannable and still
+// paste-able into `hydra-acp --session <id>`.
+export function shortSessionId(id: string): string {
+  return id.startsWith(HYDRA_SESSION_PREFIX)
+    ? id.slice(HYDRA_SESSION_PREFIX.length)
+    : id;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }

@@ -14,8 +14,9 @@ import {
   listProjects,
   loadBoard,
   shortProjectId,
+  shortSessionId,
 } from "./board.js";
-import { projectDir } from "./paths.js";
+import { orchestratorPointerPath, projectDir } from "./paths.js";
 
 function readVersion(): string {
   try {
@@ -35,7 +36,7 @@ function printHelp(): void {
       "hydra-acp-planner — multi-agent project orchestrator for hydra-acp",
       "",
       "Usage:",
-      "  hydra-acp planner [list]              List active projects",
+      "  hydra-acp planner [list]              List active projects (--all includes done/failed)",
       "  hydra-acp planner info <projectId>    Show one project's board",
       "  hydra-acp planner remove <projectId>  Delete a project (closes worker sessions; orchestrator session untouched)",
       "  hydra-acp planner --version",
@@ -69,12 +70,26 @@ function ageString(iso: string): string {
 
 function runList(argv: readonly string[]): void {
   const json = argv.includes("--json");
-  const projects = listProjects();
+  const all = argv.includes("--all");
+  const everything = listProjects();
+  // Default view: hide terminal projects (done / failed). Same idea as
+  // `hydra-acp session` filtering to live + recent. --all to include.
+  const projects = all
+    ? everything
+    : everything.filter((p) => p.state !== "done" && p.state !== "failed");
+  const hiddenCount = everything.length - projects.length;
+
   if (json) {
     process.stdout.write(JSON.stringify(projects, null, 2) + "\n");
     return;
   }
   if (projects.length === 0) {
+    if (hiddenCount > 0) {
+      process.stdout.write(
+        `No active planner projects. (${hiddenCount} terminal — re-run with --all to see them.)\n`,
+      );
+      return;
+    }
     process.stdout.write(
       "No planner projects yet. Start one with:\n  /hydra planner create <description>\nin any hydra-acp session.\n",
     );
@@ -97,6 +112,11 @@ function runList(argv: readonly string[]): void {
       `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${desc}\n`,
     );
   }
+  if (hiddenCount > 0) {
+    process.stdout.write(
+      `\n(${hiddenCount} terminal project${hiddenCount === 1 ? "" : "s"} hidden — re-run with --all to include.)\n`,
+    );
+  }
 }
 
 function runInfo(projectId: string | undefined, argv: readonly string[]): void {
@@ -116,6 +136,31 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   }
   process.stdout.write(`${shortProjectId(board.projectId)}  (${board.state})\n`);
   process.stdout.write(`${board.description}\n\n`);
+
+  // Show the orchestrator session this project lives in, so the user
+  // can hydra-acp --session <id> to attach and chat with it.
+  let orchestratorSessionId: string | undefined;
+  try {
+    orchestratorSessionId = readFileSync(
+      orchestratorPointerPath(canonical),
+      "utf8",
+    ).trim();
+  } catch {
+    orchestratorSessionId = undefined;
+  }
+  if (orchestratorSessionId) {
+    process.stdout.write(`Orchestrator: ${shortSessionId(orchestratorSessionId)}\n`);
+  }
+  const workerIds = Object.keys(board.workers);
+  if (workerIds.length > 0) {
+    process.stdout.write(
+      `Workers:      ${workerIds.map(shortSessionId).join(", ")}\n`,
+    );
+  }
+  if (orchestratorSessionId || workerIds.length > 0) {
+    process.stdout.write("\n");
+  }
+
   process.stdout.write(
     `Tasks: ${board.tasks.length} total, ${board.tasks.filter((t) => t.status === "done").length} done, ${board.tasks.filter((t) => t.status === "assigned").length} in flight\n`,
   );
@@ -128,8 +173,12 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   const stateW = Math.max(7, ...board.tasks.map((t) => t.status.length));
   for (const t of board.tasks) {
     const deps = t.deps.length === 0 ? "" : `  ← ${t.deps.join(", ")}`;
+    const worker =
+      t.status === "assigned" && t.assignedTo
+        ? `  → ${shortSessionId(t.assignedTo)}`
+        : "";
     process.stdout.write(
-      `  ${t.id.padEnd(idW)}  ${t.status.padEnd(stateW)}  ${t.title}${deps}\n`,
+      `  ${t.id.padEnd(idW)}  ${t.status.padEnd(stateW)}  ${t.title}${deps}${worker}\n`,
     );
   }
 }
@@ -166,19 +215,17 @@ export function runCli(argv: readonly string[]): void {
     process.stdout.write(`hydra-acp-planner ${readVersion()}\n`);
     return;
   }
-  if (argv.length === 0) {
-    // Default: list — matches `git status` / `hydra-acp session` pattern.
-    runList(argv);
-    return;
-  }
   if (argv.includes("--help") || argv.includes("-h")) {
     printHelp();
     return;
   }
+  // Default to list when there's no positional verb (either no args at
+  // all, or the user passed only flags like `--all` / `--json`).
+  // Matches `git status` / `hydra-acp session` patterns.
   const sub = argv[0];
   const rest = argv.slice(1);
-  if (sub === "list") {
-    runList(rest);
+  if (sub === undefined || sub.startsWith("-") || sub === "list") {
+    runList(sub === "list" ? rest : argv);
     return;
   }
   if (sub === "info") {

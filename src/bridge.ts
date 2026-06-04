@@ -29,8 +29,10 @@ import {
   extractUpdateText,
   updateKind,
 } from "./util/text.js";
+import { rmSync } from "node:fs";
 import {
   allTerminal,
+  canonicalProjectId,
   listProjects,
   loadBoard,
   newBoard,
@@ -38,9 +40,11 @@ import {
   pickEligible,
   saveBoard,
   shortProjectId,
+  shortSessionId,
   type Board,
   type Task,
 } from "./board.js";
+import { projectDir } from "./paths.js";
 import {
   buildDecompositionPrompt,
   extractJsonBlock,
@@ -88,6 +92,15 @@ const COMMANDS = [
     argsHint: "<description>",
     description: "Plan a new project from a description and spawn workers (M2+).",
   },
+  {
+    verb: "status",
+    description: "Show the board for this session's project.",
+  },
+  {
+    verb: "remove",
+    argsHint: "[<projectId>]",
+    description: "Delete this session's project (or another by id). Closes worker sessions; orchestrator session is left intact.",
+  },
 ];
 
 export interface BridgeOptions {
@@ -99,6 +112,74 @@ export interface BridgeOptions {
 // intercept. Updates flow to board.json on every state transition; the
 // in-memory copy is the source of truth during process lifetime.
 const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
+
+// Sessions we've successfully attached to via hydra-acp/transformer/attach
+// during this process lifetime. Best-effort: if the daemon restarted
+// the session or removed us from its chain, this set is wrong, but
+// there's no current way for the planner to know that without
+// querying. Used by `/hydra planner status` to report whether we
+// believe we're observing the session.
+const attachedSessions = new Set<string>();
+
+// Walk projects on disk and find the board owned by `orchestratorSessionId`.
+// Cheap fallback for `/hydra planner status` queries on done/failed
+// projects that rehydrateFromDisk leaves out of the in-memory boards map.
+// O(N) over the number of projects on disk; not on the intercept hot path.
+function findBoardOnDisk(orchestratorSessionId: string): Board | undefined {
+  for (const entry of listProjects()) {
+    if (entry.orchestratorSessionId === orchestratorSessionId) {
+      return loadBoard(entry.projectId);
+    }
+  }
+  return undefined;
+}
+
+const TASK_STATUS_GLYPH: Record<string, string> = {
+  done: "✓",
+  assigned: "▶",
+  failed: "⨯",
+  blocked: "⊘",
+  pending: "·",
+};
+
+// Render a board as the body of a `/hydra planner status` reply.
+// Multi-line plain text; gets emitted as a synthetic agent_message_chunk
+// by hydra's emitExtensionReply, so it lands cleanly in any client's
+// transcript renderer. The `attached` flag is the planner's
+// best-effort belief about whether it's currently in this session's
+// transformer chain — true if we've called transformer/attach this
+// process lifetime and haven't dropped it.
+function formatStatus(board: Board, attached: boolean): string {
+  const lines: string[] = [];
+  const done = board.tasks.filter((t) => t.status === "done").length;
+  const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
+  const failed = board.tasks.filter((t) => t.status === "failed").length;
+  lines.push(`📋 ${shortProjectId(board.projectId)}  (${board.state})`);
+  lines.push(`   ${board.description}`);
+  lines.push("");
+  const counts = [`${board.tasks.length} total`, `${done} done`];
+  if (inFlight > 0) counts.push(`${inFlight} in flight`);
+  if (failed > 0) counts.push(`${failed} failed`);
+  lines.push(`   Tasks: ${counts.join(", ")}`);
+  lines.push(`   Concurrency cap: ${board.concurrencyCap}`);
+  lines.push(
+    `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`,
+  );
+  if (board.tasks.length === 0) {
+    return lines.join("\n");
+  }
+  lines.push("");
+  for (const task of board.tasks) {
+    const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
+    const deps = task.deps.length === 0 ? "" : `  ← ${task.deps.join(", ")}`;
+    const worker =
+      task.status === "assigned" && task.assignedTo
+        ? `  → ${shortSessionId(task.assignedTo)}`
+        : "";
+    lines.push(`   ${glyph} ${task.id}  ${task.title}${deps}${worker}`);
+  }
+  return lines.join("\n");
+}
 
 export class PlannerBridge {
   private client: TransformerClient;
@@ -221,6 +302,7 @@ export class PlannerBridge {
   private async tryAttach(sessionId: string, label: string): Promise<boolean> {
     try {
       await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
       return true;
     } catch (err) {
       log.warn(
@@ -258,13 +340,122 @@ export class PlannerBridge {
     const args = (params.args ?? "").trim();
 
     if (verb === "create") {
-      this.handleCreate(req.id, sessionId, args);
+      void this.handleCreate(req.id, sessionId, args).catch((err) => {
+        log.error(`handleCreate threw: ${(err as Error).message}`);
+        // The slash command's commands/invoke is still pending —
+        // dispatch a reply so it doesn't hang forever.
+        this.client.reply(req.id, {
+          text: `⚠️ Internal error: ${(err as Error).message}`,
+        });
+      });
+      return;
+    }
+    if (verb === "status") {
+      this.handleStatus(req.id, sessionId);
+      return;
+    }
+    if (verb === "remove") {
+      this.handleRemove(req.id, sessionId, args);
       return;
     }
     this.client.reply(req.id, { text: `unknown planner verb: ${verb}` });
   }
 
-  private handleCreate(reqId: number | string, sessionId: string, description: string): void {
+  // Drop a project. With no args, removes the project owned by the
+  // current session (the orchestrator). With an arg, removes that
+  // project — useful when the user wants to clean up from inside an
+  // unrelated session. The orchestrator session itself is never touched
+  // (that's a real conversation the user might want to keep); worker
+  // sessions ARE closed via the daemon.
+  private handleRemove(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): void {
+    let board: Board | undefined;
+    let canonical: string | undefined;
+    if (args.length > 0) {
+      canonical = canonicalProjectId(args.split(/\s+/)[0]!);
+      board = loadBoard(canonical);
+      if (!board) {
+        this.client.reply(reqId, {
+          text: `No project '${args}' found.`,
+        });
+        return;
+      }
+    } else {
+      board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+      if (!board) {
+        this.client.reply(reqId, {
+          text: "No plan in this session to remove. Use `/hydra planner remove <projectId>` for a different project.",
+        });
+        return;
+      }
+      canonical = board.projectId;
+    }
+
+    const workerIds = Object.keys(board.workers);
+    // Close every worker session via the daemon. Best-effort — a worker
+    // that's already gone won't block the cleanup.
+    void (async () => {
+      for (const workerId of workerIds) {
+        try {
+          await this.client.request("hydra-acp/session/delete", {
+            sessionId: workerId,
+          });
+        } catch {
+          // already-gone worker is fine; planner record removal is what matters
+        }
+      }
+    })();
+
+    // Drop in-memory state for the orchestrator (so /hydra planner
+    // create in this session starts cleanly).
+    if (boards.get(sessionId)?.projectId === canonical) {
+      boards.delete(sessionId);
+      clearOrchestratorState(sessionId);
+    }
+    // And worker state.
+    for (const workerId of workerIds) {
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      attachedSessions.delete(workerId);
+    }
+
+    rmSync(projectDir(canonical), { recursive: true, force: true });
+    log.info(
+      `removed project ${shortProjectId(canonical)} (${workerIds.length} worker session${workerIds.length === 1 ? "" : "s"} closed)`,
+    );
+    this.client.reply(reqId, {
+      text: `Removed project ${shortProjectId(canonical)}${workerIds.length > 0 ? ` (${workerIds.length} worker session${workerIds.length === 1 ? "" : "s"} closed)` : ""}.`,
+    });
+  }
+
+  // Show the current session's project (if any) inline in the
+  // transcript. Reply text becomes a synthetic agent_message_chunk via
+  // hydra's emitExtensionReply path — no decomposition turn, no agent
+  // round-trip.
+  private handleStatus(reqId: number | string, sessionId: string): void {
+    // In-memory first (hot path for active projects). Falls back to
+    // disk for done/failed projects, which rehydrateFromDisk skips on
+    // restart to keep the active set lean.
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    if (!board) {
+      const attached = attachedSessions.has(sessionId);
+      const tail = attached
+        ? " (planner is attached to this session but has no project for it)"
+        : "";
+      this.client.reply(reqId, {
+        text: `No plan in this session yet. Start one with \`/hydra planner create <description>\`.${tail}`,
+      });
+      return;
+    }
+    this.client.reply(reqId, {
+      text: formatStatus(board, attachedSessions.has(sessionId)),
+    });
+  }
+
+  private async handleCreate(reqId: number | string, sessionId: string, description: string): Promise<void> {
     if (!sessionId) {
       this.client.reply(reqId, { text: "planner create: missing sessionId" });
       return;
@@ -295,75 +486,94 @@ export class PlannerBridge {
       `decomposing project ${board.projectId} for session …${sessionId.slice(-8)}: ${description.slice(0, 80)}`,
     );
 
-    // Self-install into this session's chain so our response intercepts
-    // fire on the decomposition turn we're about to start. Idempotent:
-    // hydra's session.addTransformer is a no-op when we're already in
-    // the chain (e.g. when the user did wire us into defaultTransformers
-    // anyway). Lets users keep us out of defaultTransformers and have
-    // invocation be the opt-in — the planner only joins sessions it's
-    // actively driving.
-    //
-    // Fire the substitute decomposition prompt and await the message/emit
-    // promise — it resolves when the agent's session/prompt response
-    // returns, which IS the end-of-turn signal we need. (The daemon's
-    // own synthesized turn_complete session/update bypasses the
-    // response chain via broadcastTurnComplete, so we can't detect end
-    // of turn via the intercept stream — we have to ride the emit
-    // promise.) The agent's chunks have already streamed through our
-    // response intercepts by the time the promise resolves.
-    void (async () => {
-      try {
-        await this.client.request("hydra-acp/transformer/attach", {
-          sessionId,
-        });
-      } catch (err) {
-        log.error(
-          `transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
-        );
-        return;
-      }
-      try {
-        await this.client.request("hydra-acp/message/emit", {
-          sessionId,
-          method: "session/prompt",
-          envelope: buildTextPromptEnvelope({
-            sessionId,
-            text: buildDecompositionPrompt(description),
-          }),
-          route: "chain",
-        });
-      } catch (err) {
-        log.error(
-          `decomposition turn failed for ${board.projectId}: ${(err as Error).message}`,
-        );
-        const failedState = getOrchestratorState(sessionId);
-        if (failedState) {
-          failedState.awaitingDecomposition = false;
-        }
-        const failedBoard = boards.get(sessionId);
-        if (failedBoard) {
-          failedBoard.state = "failed";
-          saveBoard(failedBoard, sessionId);
-        }
-        void this.emitSyntheticMessage(
-          sessionId,
-          `⚠️ Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
-        );
-        return;
-      }
-      // Agent's turn is complete. The chunks were accumulated via our
-      // response:session/update intercepts; now parse + emit summary.
-      const doneState = getOrchestratorState(sessionId);
-      if (doneState && doneState.awaitingDecomposition) {
-        this.finishDecomposition(sessionId, doneState);
-      }
-    })();
+    // Surface the initial status immediately so the user sees something
+    // happen while decomposition runs. Then we hold the commands/invoke
+    // response open until the work completes, which keeps hydra's
+    // in-flight turn (the slash command itself) busy — driving the
+    // busy indicator in the TUI / other clients.
+    await this.emitSyntheticMessage(
+      sessionId,
+      `🧩 Planning project ${shortProjectId(board.projectId)} — asking the agent to decompose.`,
+    );
 
-    // Ack to hydra — surfaces as an agent_message_chunk in the user's
-    // transcript right after their /hydra planner create command.
-    this.client.reply(reqId, {
-      text: `🧩 Planning project ${shortProjectId(board.projectId)} — asking the agent to decompose.`,
-    });
+    // Self-install into this session's chain so our response intercepts
+    // fire on the decomposition turn we're about to start. Idempotent.
+    try {
+      await this.client.request("hydra-acp/transformer/attach", {
+        sessionId,
+      });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.error(
+        `transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
+      );
+      board.state = "failed";
+      saveBoard(board, sessionId);
+      const errState = getOrchestratorState(sessionId);
+      if (errState) errState.awaitingDecomposition = false;
+      await this.emitSyntheticMessage(
+        sessionId,
+        `⚠️ Could not attach to this session: ${(err as Error).message}`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
+
+    // Fire the substitute decomposition prompt. The emit promise
+    // resolves when the agent's session/prompt response returns — i.e.
+    // when the synthetic turn completes. We await it because:
+    //
+    //   - It IS the end-of-turn signal we use to parse the accumulator
+    //     and emit the plan summary (the daemon's synthesized
+    //     turn_complete bypasses the response chain via
+    //     broadcastTurnComplete, so we can't observe end-of-turn through
+    //     intercepts).
+    //   - Holding the await keeps commands/invoke pending, which keeps
+    //     the user's slash-command turn in flight in hydra's queue, which
+    //     keeps the busy indicator on while decomposition runs.
+    //
+    // Agent chunks during the await still flow through our response
+    // intercepts (separate handler dispatch), so accumulation works
+    // even though we're "blocked" here.
+    try {
+      await this.client.request("hydra-acp/message/emit", {
+        sessionId,
+        method: "session/prompt",
+        envelope: buildTextPromptEnvelope({
+          sessionId,
+          text: buildDecompositionPrompt(description),
+        }),
+        route: "chain",
+      });
+    } catch (err) {
+      log.error(
+        `decomposition turn failed for ${board.projectId}: ${(err as Error).message}`,
+      );
+      const failedState = getOrchestratorState(sessionId);
+      if (failedState) failedState.awaitingDecomposition = false;
+      board.state = "failed";
+      saveBoard(board, sessionId);
+      await this.emitSyntheticMessage(
+        sessionId,
+        `⚠️ Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
+
+    // Turn complete — parse the accumulated reply and emit the summary.
+    // finishDecomposition is synchronous; it also kicks off the first
+    // task assignment via `void this.assignNextTask(...)` which runs in
+    // the background after we return (workers don't keep the
+    // orchestrator's slash-command turn busy).
+    const doneState = getOrchestratorState(sessionId);
+    if (doneState && doneState.awaitingDecomposition) {
+      this.finishDecomposition(sessionId, doneState);
+    }
+
+    // Reply empty so hydra doesn't tack on a redundant synthetic chunk —
+    // we've already emitted everything we wanted to say.
+    this.client.reply(reqId, { text: "" });
   }
 
   // ── Transformer message intercepts ─────────────────────────────────
@@ -549,6 +759,7 @@ export class PlannerBridge {
       await this.client.request("hydra-acp/transformer/attach", {
         sessionId: childSessionId,
       });
+      attachedSessions.add(childSessionId);
     } catch (err) {
       log.error(
         `transformer/attach to worker ${childSessionId} failed: ${(err as Error).message}`,
@@ -578,7 +789,7 @@ export class PlannerBridge {
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `▶ ${task.id} → worker …${childSessionId.slice(-8)}  (${task.title})`,
+      `▶ ${task.id} → worker ${shortSessionId(childSessionId)}  (${task.title})`,
     );
 
     // Fire the task prompt. As with decomposition, the emit promise
@@ -704,6 +915,7 @@ export class PlannerBridge {
   }
 
   private async closeWorker(workerSessionId: string): Promise<void> {
+    attachedSessions.delete(workerSessionId);
     try {
       await this.client.request("hydra-acp/child_session/close", {
         childSessionId: workerSessionId,
@@ -730,12 +942,19 @@ export class PlannerBridge {
 
   // ── Helpers ────────────────────────────────────────────────────────
 
+  // Synthetic progress messages get wrapped with leading + trailing
+  // newlines so successive emissions render with visible separation in
+  // the transcript. Mirrors how hydra's own emitExtensionReply formats
+  // slash-command replies.
   private async emitSyntheticMessage(sessionId: string, text: string): Promise<void> {
     try {
       await this.client.request("hydra-acp/message/emit", {
         sessionId,
         method: "session/update",
-        envelope: buildAgentMessageChunkEnvelope({ sessionId, text }),
+        envelope: buildAgentMessageChunkEnvelope({
+          sessionId,
+          text: `\n${text}\n`,
+        }),
         route: "chain",
       });
     } catch (err) {

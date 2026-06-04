@@ -13,6 +13,7 @@ import {
   pickEligible,
   saveBoard,
   shortProjectId,
+  shortSessionId,
   type Board,
   type Task,
 } from "../src/board.ts";
@@ -74,6 +75,20 @@ describe("shortProjectId", () => {
   it("is the inverse of canonicalProjectId", () => {
     assert.equal(shortProjectId(canonicalProjectId("xyz")), "xyz");
     assert.equal(canonicalProjectId(shortProjectId("hydra_plan_xyz")), "hydra_plan_xyz");
+  });
+});
+
+describe("shortSessionId", () => {
+  it("strips the hydra_session_ prefix when present", () => {
+    assert.equal(shortSessionId("hydra_session_abc123"), "abc123");
+  });
+
+  it("leaves a bare id alone", () => {
+    assert.equal(shortSessionId("abc123"), "abc123");
+  });
+
+  it("doesn't strip a project prefix (different namespace)", () => {
+    assert.equal(shortSessionId("hydra_plan_abc"), "hydra_plan_abc");
   });
 });
 

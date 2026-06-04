@@ -199,7 +199,5 @@ export function formatPlanSummary(tasks: Task[], concurrencyCap: number): string
     const depStr = t.deps.length === 0 ? "no deps" : `depends on ${t.deps.join(", ")}`;
     lines.push(`  ${t.id}  ${t.title}  —  ${depStr}`);
   }
-  lines.push("");
-  lines.push("Workers will be spawned once scheduling lands (M2+).");
   return lines.join("\n");
 }
