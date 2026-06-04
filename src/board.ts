@@ -11,7 +11,7 @@ import {
 export const BOARD_SCHEMA_VERSION = 1;
 
 export type TaskStatus = "pending" | "assigned" | "done" | "failed" | "blocked";
-export type BoardState = "decomposing" | "running" | "done" | "failed";
+export type BoardState = "decomposing" | "running" | "paused" | "done" | "failed";
 
 export interface TaskArtifacts {
   files_changed?: string[];

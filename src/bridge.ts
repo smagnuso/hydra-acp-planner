@@ -139,6 +139,14 @@ const COMMANDS = [
     description: "Close a specific worker session. Requeues its current task as pending.",
   },
   {
+    verb: "pause",
+    description: "Stop scheduling new tasks. In-flight workers run to completion; their results land normally but no new tasks dispatch until resume.",
+  },
+  {
+    verb: "resume",
+    description: "Resume scheduling on a paused project.",
+  },
+  {
     verb: "remove",
     argsHint: "[<projectId>]",
     description: "Delete this session's project (or another by id). Closes worker sessions; orchestrator session is left intact.",
@@ -537,6 +545,14 @@ export class PlannerBridge {
     }
     if (verb === "remove") {
       this.handleRemove(req.id, sessionId, args);
+      return;
+    }
+    if (verb === "pause") {
+      this.handlePause(req.id, sessionId);
+      return;
+    }
+    if (verb === "resume") {
+      this.handleResume(req.id, sessionId);
       return;
     }
     this.client.reply(req.id, { text: `unknown planner verb: ${verb}` });
@@ -1041,6 +1057,59 @@ export class PlannerBridge {
   // transcript. Reply text becomes a synthetic agent_message_chunk via
   // hydra's emitExtensionReply path — no decomposition turn, no agent
   // round-trip.
+  private handlePause(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId);
+    if (!board) {
+      this.client.reply(reqId, {
+        text: "planner pause: no active project in this session.",
+      });
+      return;
+    }
+    if (board.state === "paused") {
+      this.client.reply(reqId, {
+        text: `planner pause: ${shortProjectId(board.projectId)} is already paused.`,
+      });
+      return;
+    }
+    if (board.state !== "running") {
+      this.client.reply(reqId, {
+        text: `planner pause: project ${shortProjectId(board.projectId)} is ${board.state}; can only pause a running project.`,
+      });
+      return;
+    }
+    board.state = "paused";
+    saveBoard(board, sessionId);
+    const inFlight = inFlightCount(board);
+    const tail = inFlight > 0
+      ? ` ${inFlight} in-flight worker${inFlight === 1 ? "" : "s"} will run to completion; no new tasks will dispatch until resume.`
+      : " No new tasks will dispatch until resume.";
+    this.client.reply(reqId, {
+      text: `⏸️  Paused ${shortProjectId(board.projectId)}.${tail}`,
+    });
+  }
+
+  private handleResume(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId);
+    if (!board) {
+      this.client.reply(reqId, {
+        text: "planner resume: no active project in this session.",
+      });
+      return;
+    }
+    if (board.state !== "paused") {
+      this.client.reply(reqId, {
+        text: `planner resume: ${shortProjectId(board.projectId)} is ${board.state}, not paused.`,
+      });
+      return;
+    }
+    board.state = "running";
+    saveBoard(board, sessionId);
+    this.client.reply(reqId, {
+      text: `▶️  Resumed ${shortProjectId(board.projectId)}.`,
+    });
+    void this.scheduleEligibleTasks(sessionId, board);
+  }
+
   private handleStatus(reqId: number | string, sessionId: string): void {
     // In-memory first (hot path for active projects). Falls back to
     // disk for done/failed projects, which rehydrateFromDisk skips on
@@ -1481,6 +1550,12 @@ export class PlannerBridge {
     // from in-flight workers still fire after cancel — the guard
     // prevents them from re-arming the scheduler.
     if (board.state === "done" || board.state === "failed") {
+      return;
+    }
+    // Paused: in-flight workers keep running and their completions
+    // still record results, but no new tasks dispatch. Resume flips
+    // state back to "running" and re-invokes the scheduler.
+    if (board.state === "paused") {
       return;
     }
     // Project-complete short-circuit. Emit once, transition state, return.
