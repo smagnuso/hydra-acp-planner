@@ -2,13 +2,13 @@
 // (which execs `hydra-acp-planner ...` from PATH per the git-style
 // fallback), or directly as `hydra-acp-planner ...`.
 //
-// M0 ships --version, --describe, and --help only. Real subcommands
-// (list, show, board, attach, export, import, archive, ...) come in
-// M3.5 once the transformer side actually produces boards.
+// M1 ships `list` and `show` reading directly from disk — no daemon
+// roundtrip required, works even when the daemon is down.
 
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { listProjects, loadBoard } from "./board.js";
 
 function readVersion(): string {
   try {
@@ -28,10 +28,13 @@ function printHelp(): void {
       "hydra-acp-planner — multi-agent project orchestrator for hydra-acp",
       "",
       "Usage:",
-      "  hydra-acp planner [list]              List active projects (TODO M3.5)",
-      "  hydra-acp planner show <projectId>    Show one project's board (TODO M3.5)",
+      "  hydra-acp planner [list]              List active projects",
+      "  hydra-acp planner show <projectId>    Show one project's board",
       "  hydra-acp planner --version",
       "  hydra-acp planner --help",
+      "",
+      "To start a new project, from inside any hydra-acp session type:",
+      "  /hydra planner create <description>",
       "",
       "When invoked by the hydra-acp daemon as a transformer (env var",
       "HYDRA_ACP_TRANSFORMER_NAME set), this binary runs in transformer",
@@ -43,10 +46,85 @@ function printHelp(): void {
   );
 }
 
+function ageString(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "?";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
+function runList(argv: readonly string[]): void {
+  const json = argv.includes("--json");
+  const projects = listProjects();
+  if (json) {
+    process.stdout.write(JSON.stringify(projects, null, 2) + "\n");
+    return;
+  }
+  if (projects.length === 0) {
+    process.stdout.write(
+      "No planner projects yet. Start one with:\n  /hydra planner create <description>\nin any hydra-acp session.\n",
+    );
+    return;
+  }
+  // Compact, scannable. Columns: projectId, state, tasks-done/total,
+  // age, description (truncated).
+  const idW = Math.max(10, ...projects.map((p) => p.projectId.length));
+  const stateW = Math.max(8, ...projects.map((p) => p.state.length));
+  const header = `${"PROJECTID".padEnd(idW)}  ${"STATE".padEnd(stateW)}  TASKS  AGE   DESCRIPTION`;
+  process.stdout.write(header + "\n");
+  for (const p of projects) {
+    const tasks = `${p.tasksDone}/${p.tasksTotal}`.padEnd(5);
+    const age = ageString(p.updatedAt).padEnd(5);
+    const desc = p.description.length > 60
+      ? p.description.slice(0, 57) + "..."
+      : p.description;
+    process.stdout.write(
+      `${p.projectId.padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${desc}\n`,
+    );
+  }
+}
+
+function runShow(projectId: string | undefined, argv: readonly string[]): void {
+  if (!projectId) {
+    process.stderr.write("hydra-acp-planner show: requires a projectId\n");
+    process.exit(2);
+  }
+  const board = loadBoard(projectId);
+  if (!board) {
+    process.stderr.write(`hydra-acp-planner show: no project '${projectId}'\n`);
+    process.exit(1);
+  }
+  if (argv.includes("--json")) {
+    process.stdout.write(JSON.stringify(board, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`${board.projectId}  (${board.state})\n`);
+  process.stdout.write(`${board.description}\n\n`);
+  process.stdout.write(
+    `Tasks: ${board.tasks.length} total, ${board.tasks.filter((t) => t.status === "done").length} done, ${board.tasks.filter((t) => t.status === "assigned").length} in flight\n`,
+  );
+  process.stdout.write(`Concurrency cap: ${board.concurrencyCap}\n\n`);
+  if (board.tasks.length === 0) {
+    process.stdout.write("(no tasks yet)\n");
+    return;
+  }
+  const idW = Math.max(3, ...board.tasks.map((t) => t.id.length));
+  const stateW = Math.max(7, ...board.tasks.map((t) => t.status.length));
+  for (const t of board.tasks) {
+    const deps = t.deps.length === 0 ? "" : `  ← ${t.deps.join(", ")}`;
+    process.stdout.write(
+      `  ${t.id.padEnd(idW)}  ${t.status.padEnd(stateW)}  ${t.title}${deps}\n`,
+    );
+  }
+}
+
 export function runCli(argv: readonly string[]): void {
-  // --describe is the convention the hydra-acp dispatcher reads (when we
-  // wire up the discovery polish) to show a one-line summary in
-  // `hydra-acp --help`. Stable across versions; keep it short.
   if (argv.includes("--describe")) {
     process.stdout.write(
       "multi-agent project orchestrator: decompose, dispatch, coordinate\n",
@@ -57,16 +135,26 @@ export function runCli(argv: readonly string[]): void {
     process.stdout.write(`hydra-acp-planner ${readVersion()}\n`);
     return;
   }
-  if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
+  if (argv.length === 0) {
+    // Default: list — matches `git status` / `hydra-acp session` pattern.
+    runList(argv);
+    return;
+  }
+  if (argv.includes("--help") || argv.includes("-h")) {
     printHelp();
     return;
   }
   const sub = argv[0];
-  // Placeholders for the M3.5 surface — exit non-zero with a hint so
-  // anyone trying these against M0 gets a clear signal.
+  const rest = argv.slice(1);
+  if (sub === "list") {
+    runList(rest);
+    return;
+  }
+  if (sub === "show") {
+    runShow(rest[0], rest.slice(1));
+    return;
+  }
   if (
-    sub === "list" ||
-    sub === "show" ||
     sub === "board" ||
     sub === "attach" ||
     sub === "export" ||
@@ -75,7 +163,7 @@ export function runCli(argv: readonly string[]): void {
     sub === "remove"
   ) {
     process.stderr.write(
-      `hydra-acp-planner: '${sub}' is not implemented yet (planned for M3.5)\n`,
+      `hydra-acp-planner: '${sub}' is not implemented yet (planned for later milestone)\n`,
     );
     process.exit(2);
   }

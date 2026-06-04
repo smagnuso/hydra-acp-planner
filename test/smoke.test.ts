@@ -33,10 +33,15 @@ describe("hydra-acp-planner CLI", () => {
     assert.match(r.stdout, /Usage:/);
   });
 
-  it("no args prints help (exit 0)", () => {
-    const r = spawnSync("node", [bin], { encoding: "utf8" });
+  it("no args defaults to list (exit 0)", () => {
+    // Empty $HOME so we don't read the developer's real boards.
+    const r = spawnSync("node", [bin], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: "/tmp/planner-test-empty-home-do-not-create" },
+    });
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /hydra-acp-planner/);
+    // With no projects, list shows the hint message.
+    assert.match(r.stdout, /No planner projects yet/);
   });
 
   it("unknown subcommand exits 2", () => {
@@ -46,7 +51,7 @@ describe("hydra-acp-planner CLI", () => {
   });
 
   it("placeholder subcommand exits 2 with a useful message", () => {
-    const r = spawnSync("node", [bin, "list"], { encoding: "utf8" });
+    const r = spawnSync("node", [bin, "archive"], { encoding: "utf8" });
     assert.equal(r.status, 2);
     assert.match(r.stderr, /not implemented yet/);
   });

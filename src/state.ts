@@ -1,0 +1,80 @@
+import type { Board } from "./board.js";
+
+// In-memory per-session state. The orchestrator role is implied by
+// presence in `boards`. Decomposition state machines (idle → decomposing
+// → running → done) are carried on the Board itself; OrchestratorState
+// here holds the *transient* bits that don't belong on disk: which
+// decomposition reply text we've accumulated so far, etc.
+
+export interface OrchestratorState {
+  projectId: string;
+  // Accumulator for the agent's reply during a decomposing turn. Built
+  // up as agent_message_chunk notifications stream past. Drained and
+  // parsed when the turn completes.
+  decompositionAccumulator: string;
+  // True between (request:session/prompt intercept for /plan ...) and
+  // the next response:session/prompt with our injected sub-prompt's
+  // result. While true, agent_message_chunk updates are suppressed from
+  // clients and accumulated instead.
+  awaitingDecomposition: boolean;
+}
+
+const sessionStates = new Map<string, OrchestratorState>();
+
+// Mirror map for workers → their orchestrator. Populated when workers
+// are spawned (M2+); currently unused but defined here so cold-start
+// recovery has a single place to seed both maps.
+const workerToOrchestrator = new Map<string, string>();
+
+export function getOrchestratorState(sessionId: string): OrchestratorState | undefined {
+  return sessionStates.get(sessionId);
+}
+
+export function setOrchestratorState(sessionId: string, state: OrchestratorState): void {
+  sessionStates.set(sessionId, state);
+}
+
+export function clearOrchestratorState(sessionId: string): void {
+  sessionStates.delete(sessionId);
+}
+
+export function isOrchestrator(sessionId: string): boolean {
+  return sessionStates.has(sessionId);
+}
+
+export function orchestratorOfWorker(workerSessionId: string): string | undefined {
+  return workerToOrchestrator.get(workerSessionId);
+}
+
+export function registerWorker(workerSessionId: string, orchestratorSessionId: string): void {
+  workerToOrchestrator.set(workerSessionId, orchestratorSessionId);
+}
+
+export function unregisterWorker(workerSessionId: string): void {
+  workerToOrchestrator.delete(workerSessionId);
+}
+
+// Hydrate from disk on startup. The planner is restartable mid-project,
+// so on (re)connect we walk every project's board, repopulate the
+// orchestrator map, and reconstruct the worker map from each board's
+// workers field.
+export function rehydrate(orchestratorSessionByProject: Map<string, string>, boards: Map<string, Board>): void {
+  sessionStates.clear();
+  workerToOrchestrator.clear();
+  for (const [projectId, board] of boards) {
+    const orchestratorSessionId = orchestratorSessionByProject.get(projectId);
+    if (!orchestratorSessionId) continue;
+    sessionStates.set(orchestratorSessionId, {
+      projectId,
+      decompositionAccumulator: "",
+      // If we crashed mid-decomposition, the next agent reply will be
+      // the resumption — but we don't know that until we see traffic.
+      // M5 (resurrection) revisits this; for M1, fresh boot = clean
+      // slate and any partial decomposition is lost.
+      awaitingDecomposition: board.state === "decomposing",
+    });
+    for (const workerId of Object.keys(board.workers)) {
+      workerToOrchestrator.set(workerId, orchestratorSessionId);
+    }
+  }
+}
