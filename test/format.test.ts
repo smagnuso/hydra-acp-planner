@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatBoardContext, formatStatus } from "../src/format.ts";
+import { formatBoardContext, formatSessionsTable, formatStatus } from "../src/format.ts";
 import type { Board, Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -191,5 +191,66 @@ describe("formatStatus", () => {
       true,
     );
     assert.match(out, /\{opus-4-7\}/);
+  });
+
+  it("appends a Sessions table when an orchestrator id is provided", () => {
+    const out = formatStatus(
+      board({
+        workers: {
+          hydra_session_AAAAAAAABBBBBBBB: { currentTaskId: "T1", tasksCompleted: [] },
+        },
+        tasks: [task("T1", { status: "assigned", assignedTo: "hydra_session_AAAAAAAABBBBBBBB" })],
+      }),
+      true,
+      "hydra_session_ORCHESTRATORXXXX",
+    );
+    assert.match(out, /Sessions:/);
+    assert.match(out, /ROLE\s+SESSION\s+TASK\s+STATE\s+AGENT\|MODEL\s+DONE\s+TITLE/);
+    assert.match(out, /orchestrator/);
+    assert.match(out, /worker\s+\S*BBBBBBBB\s+T1/);
+  });
+
+  it("omits the Sessions table when no orchestrator id is given and no workers exist", () => {
+    const out = formatStatus(board(), true);
+    assert.doesNotMatch(out, /Sessions:/);
+  });
+});
+
+describe("formatSessionsTable", () => {
+  it("returns empty string when there's nothing to show", () => {
+    const out = formatSessionsTable(board(), undefined);
+    assert.equal(out, "");
+  });
+
+  it("includes the orchestrator row when an id is given", () => {
+    const out = formatSessionsTable(board({ description: "do a thing" }), "hydra_session_OOOOOOOOPPPPPPPP");
+    assert.match(out, /orchestrator/);
+    assert.match(out, /OOOOOOOOPPPPPPPP/);
+    assert.match(out, /do a thing/);
+  });
+
+  it("rolls up tasksCompleted per worker into a DONE count", () => {
+    const out = formatSessionsTable(
+      board({
+        workers: {
+          hydra_session_WORKER1: { currentTaskId: null, tasksCompleted: ["T1", "T2"] },
+        },
+      }),
+      undefined,
+    );
+    assert.match(out, /worker\s+\S*WORKER1\s+-\s+-\s+-\s+2/);
+  });
+
+  it("surfaces the AGENT|MODEL tag for the worker's current task", () => {
+    const out = formatSessionsTable(
+      board({
+        workers: { hydra_session_WORKER2: { currentTaskId: "T7", tasksCompleted: [] } },
+        tasks: [
+          task("T7", { status: "assigned", assignedTo: "hydra_session_WORKER2", agent: "code-claude", model: "opus" }),
+        ],
+      }),
+      undefined,
+    );
+    assert.match(out, /code-claude \| opus/);
   });
 });

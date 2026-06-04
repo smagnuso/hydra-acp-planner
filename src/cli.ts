@@ -16,6 +16,7 @@ import {
   shortProjectId,
   shortSessionId,
 } from "./board.js";
+import { formatSessionsTable } from "./format.js";
 import { orchestratorPointerPath, projectDir } from "./paths.js";
 
 function readVersion(): string {
@@ -148,23 +149,18 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   } catch {
     orchestratorSessionId = undefined;
   }
-  if (orchestratorSessionId) {
-    process.stdout.write(`Orchestrator: ${shortSessionId(orchestratorSessionId)}\n`);
-  }
-  const workerIds = Object.keys(board.workers);
-  if (workerIds.length > 0) {
-    process.stdout.write(
-      `Workers:      ${workerIds.map(shortSessionId).join(", ")}\n`,
-    );
-  }
-  if (orchestratorSessionId || workerIds.length > 0) {
-    process.stdout.write("\n");
-  }
-
   process.stdout.write(
     `Tasks: ${board.tasks.length} total, ${board.tasks.filter((t) => t.status === "done").length} done, ${board.tasks.filter((t) => t.status === "assigned").length} in flight\n`,
   );
   process.stdout.write(`Concurrency cap: ${board.concurrencyCap}\n\n`);
+
+  const sessionsTable = formatSessionsTable(board, orchestratorSessionId, {
+    indent: "  ",
+  });
+  if (sessionsTable.length > 0) {
+    process.stdout.write("Sessions:\n");
+    process.stdout.write(sessionsTable + "\n\n");
+  }
   if (board.tasks.length === 0) {
     process.stdout.write("(no tasks yet)\n");
     return;

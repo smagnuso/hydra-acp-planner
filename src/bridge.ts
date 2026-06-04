@@ -107,6 +107,12 @@ const PROCESS_NAME = "hydra-acp-planner";
 
 const COMMANDS = [
   {
+    // Bare `/hydra planner` (no verb) routes here. Treated as a
+    // synonym for `status` — see verb dispatch in handleCommandsInvoke.
+    verb: "",
+    description: "Show the board for this session's project (same as `status`).",
+  },
+  {
     verb: "create",
     argsHint: "<description>",
     description: "Plan a new project from a description and spawn workers (M2+).",
@@ -581,7 +587,7 @@ export class PlannerBridge {
       });
       return;
     }
-    if (verb === "status") {
+    if (verb === "status" || verb === "") {
       this.handleStatus(req.id, sessionId);
       return;
     }
@@ -1215,7 +1221,7 @@ export class PlannerBridge {
       return;
     }
     this.client.reply(reqId, {
-      text: formatStatus(board, attachedSessions.has(sessionId)),
+      text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
     });
   }
 
