@@ -1,7 +1,19 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { shortProjectId, shortSessionId, type Board } from "./board.js";
+import { shortProjectId, shortSessionId, type Board, type Task } from "./board.js";
+
+// Inline overrides tag for a task: " {agent-id}", " {agent-id|model}",
+// or "" when neither is set. Same shape in both formatters so a task
+// reads identically across the board-context preamble and the
+// /status view.
+function formatTaskTag(task: Task): string {
+  const a = task.agent;
+  const m = task.model;
+  if (!a && !m) return "";
+  const inner = a && m ? `${a} | ${m}` : (a ?? m);
+  return ` {${inner}}`;
+}
 
 export const TASK_STATUS_GLYPH: Record<string, string> = {
   done: "✓",
@@ -42,7 +54,8 @@ export function formatBoardContext(board: Board): string {
         task.status === "assigned" && task.assignedTo
           ? `, worker: ${shortSessionId(task.assignedTo)}`
           : "";
-      lines.push(`  ${glyph} ${task.id} ${task.title} [${task.status}${deps}${worker}]`);
+      const tag = formatTaskTag(task);
+      lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${task.status}${deps}${worker}]`);
       if (task.what) lines.push(`     what: ${task.what}`);
       if (task.constraints) lines.push(`     constraints: ${task.constraints}`);
       if (task.artifacts?.summary) lines.push(`     result: ${task.artifacts.summary}`);
@@ -96,7 +109,8 @@ export function formatStatus(board: Board, attached: boolean): string {
       task.status === "assigned" && task.assignedTo
         ? `  → ${shortSessionId(task.assignedTo)}`
         : "";
-    lines.push(`   ${glyph} ${task.id}  ${task.title}${deps}${worker}`);
+    const tag = formatTaskTag(task);
+    lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}`);
   }
   return lines.join("\n");
 }

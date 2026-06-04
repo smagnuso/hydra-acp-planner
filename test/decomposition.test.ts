@@ -33,6 +33,31 @@ describe("buildDecompositionPrompt", () => {
     assert.match(p, /```json/);
     assert.match(p, /tasks/);
   });
+
+  it("mentions the optional agent field in the schema", () => {
+    const p = buildDecompositionPrompt("anything");
+    assert.match(p, /agent \(optional\)/);
+  });
+
+  it("mentions the optional model field in the schema", () => {
+    const p = buildDecompositionPrompt("anything");
+    assert.match(p, /model \(optional\)/);
+  });
+
+  it("omits the Available agents block when none provided", () => {
+    const p = buildDecompositionPrompt("anything");
+    assert.doesNotMatch(p, /Available specialist agents/);
+  });
+
+  it("lists provided agents with their descriptions", () => {
+    const p = buildDecompositionPrompt("anything", [
+      { id: "code-claude", description: "Claude coding agent" },
+      { id: "code-codex" },
+    ]);
+    assert.match(p, /Available specialist agents/);
+    assert.match(p, /code-claude — Claude coding agent/);
+    assert.match(p, /code-codex/);
+  });
 });
 
 // ─── extractJsonBlock ────────────────────────────────────────────────────
@@ -97,6 +122,28 @@ describe("normalizeDecomposition", () => {
     assert.equal(got!.tasks.length, 1);
     assert.equal(got!.tasks[0]!.id, "T1");
     assert.equal(got!.warnings.length, 1);
+  });
+
+  it("preserves an optional agent string per task", () => {
+    const got = normalizeDecomposition({
+      tasks: [
+        { id: "T1", title: "ok", deps: [], agent: "code-claude" },
+        { id: "T2", title: "default", deps: [] },
+      ],
+    });
+    assert.equal(got!.tasks[0]!.agent, "code-claude");
+    assert.equal(got!.tasks[1]!.agent, null);
+  });
+
+  it("preserves an optional model string per task", () => {
+    const got = normalizeDecomposition({
+      tasks: [
+        { id: "T1", title: "ok", deps: [], model: "opus-4-7" },
+        { id: "T2", title: "default", deps: [] },
+      ],
+    });
+    assert.equal(got!.tasks[0]!.model, "opus-4-7");
+    assert.equal(got!.tasks[1]!.model, null);
   });
 
   it("drops duplicate ids (keeps first)", () => {

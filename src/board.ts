@@ -49,6 +49,9 @@ export interface Board {
   tasks: Task[];
   workers: Record<string, { currentTaskId: string | null; tasksCompleted: string[] }>;
   concurrencyCap: number;
+  // When true, decomposition won't recompute concurrencyCap from the
+  // DAG shape — the user pinned it explicitly via `--workers N`.
+  concurrencyCapLocked?: boolean;
 }
 
 export const PROJECT_ID_PREFIX = "hydra_plan_";
@@ -99,6 +102,7 @@ export function nowIso(): string {
 export function newBoard(opts: {
   description: string;
   fleetDefaults?: { agent: string | null; model: string | null };
+  concurrencyCap?: number;
 }): Board {
   const now = nowIso();
   return {
@@ -111,7 +115,8 @@ export function newBoard(opts: {
     fleetDefaults: opts.fleetDefaults ?? { agent: null, model: null },
     tasks: [],
     workers: {},
-    concurrencyCap: 1,
+    concurrencyCap: opts.concurrencyCap ?? 1,
+    concurrencyCapLocked: opts.concurrencyCap !== undefined ? true : undefined,
   };
 }
 

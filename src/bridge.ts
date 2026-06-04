@@ -52,6 +52,7 @@ import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
   buildResumeDecompositionPrompt,
+  type AgentChoice,
   extractAddTaskBlock,
   extractJsonBlock,
   formatPlanSummary,
@@ -213,6 +214,36 @@ function orchestratorSessionForProject(projectId: string): string | undefined {
 
 export class PlannerBridge {
   private client: TransformerClient;
+  // Cached list of installed specialist agents, populated lazily on
+  // first prompt-building call. Refreshed at startup. Decomposition and
+  // add-task prompts splice this in so the planner agent only suggests
+  // agents that actually exist.
+  private agentChoices: AgentChoice[] | undefined;
+
+  private async ensureAgentChoices(): Promise<AgentChoice[] | undefined> {
+    if (this.agentChoices !== undefined) return this.agentChoices;
+    try {
+      const result = await this.client.request<{
+        agents?: Array<{ id?: unknown; description?: unknown; installed?: unknown }>;
+      }>("hydra-acp/agents/list", {});
+      const out: AgentChoice[] = [];
+      for (const a of result?.agents ?? []) {
+        if (typeof a.id !== "string") continue;
+        if (a.installed !== "yes") continue;
+        out.push({
+          id: a.id,
+          description: typeof a.description === "string" ? a.description : undefined,
+        });
+      }
+      this.agentChoices = out;
+      log.info(`fetched ${out.length} installed agent choice(s) for prompts`);
+      return out;
+    } catch (err) {
+      log.warn(`agents/list failed; decomposition prompt will omit agent options: ${(err as Error).message}`);
+      this.agentChoices = [];
+      return this.agentChoices;
+    }
+  }
 
   constructor(opts: BridgeOptions) {
     this.client = new TransformerClient({
@@ -764,7 +795,7 @@ export class PlannerBridge {
         method: "session/prompt",
         envelope: buildTextPromptEnvelope({
           sessionId: orchestratorSessionId,
-          text: buildAddTaskPrompt(description, board),
+          text: buildAddTaskPrompt(description, board, await this.ensureAgentChoices()),
         }),
         route: "chain",
       });
@@ -1198,7 +1229,48 @@ export class PlannerBridge {
       return;
     }
 
-    const board = newBoard({ description });
+    // Parse leading fleet-override flags off the description string.
+    // Recognized: --workers N, --agent <id>, --model <id>. Unknown flags
+    // are left in the description — the user probably meant them as
+    // prose; the orchestrator agent will see them.
+    let descRemaining = description;
+    let fleetWorkers: number | undefined;
+    let fleetAgent: string | null = null;
+    let fleetModel: string | null = null;
+    const flagRe = /^--(workers|agent|model)\s+(\S+)\s*/;
+    while (true) {
+      const m = descRemaining.match(flagRe);
+      if (!m) break;
+      const [, key, value] = m as unknown as [string, string, string];
+      if (key === "workers") {
+        const n = Number.parseInt(value, 10);
+        if (Number.isFinite(n) && n > 0) fleetWorkers = n;
+      } else if (key === "agent") {
+        fleetAgent = value;
+      } else if (key === "model") {
+        fleetModel = value;
+      }
+      descRemaining = descRemaining.slice(m[0].length);
+    }
+    if (!descRemaining) {
+      this.client.reply(reqId, {
+        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] <description>`",
+      });
+      return;
+    }
+    if (fleetAgent) {
+      const choices = await this.ensureAgentChoices();
+      const known = (choices ?? []).some((a) => a.id === fleetAgent);
+      if (!known) {
+        log.warn(`--agent "${fleetAgent}" not in installed agent list; workers will spawn with default unless a per-task agent is set`);
+      }
+    }
+
+    const board = newBoard({
+      description: descRemaining,
+      concurrencyCap: fleetWorkers,
+      fleetDefaults: { agent: fleetAgent, model: fleetModel },
+    });
     boards.set(sessionId, board);
     saveBoard(board, sessionId);
     setOrchestratorState(sessionId, {
@@ -1210,7 +1282,10 @@ export class PlannerBridge {
     });
 
     log.info(
-      `decomposing project ${board.projectId} for session …${sessionId.slice(-8)}: ${description.slice(0, 80)}`,
+      `decomposing project ${board.projectId} for session …${sessionId.slice(-8)}: ${descRemaining.slice(0, 80)}` +
+        (fleetWorkers ? ` [workers=${fleetWorkers}]` : "") +
+        (fleetAgent ? ` [agent=${fleetAgent}]` : "") +
+        (fleetModel ? ` [model=${fleetModel}]` : ""),
     );
 
     // Surface the initial status immediately so the user sees something
@@ -1273,7 +1348,7 @@ export class PlannerBridge {
         method: "session/prompt",
         envelope: buildTextPromptEnvelope({
           sessionId,
-          text: buildDecompositionPrompt(description),
+          text: buildDecompositionPrompt(descRemaining, await this.ensureAgentChoices()),
         }),
         route: "chain",
       });
@@ -1559,7 +1634,9 @@ export class PlannerBridge {
     }
 
     board.tasks = result.tasks;
-    board.concurrencyCap = sweepLineConcurrencyCap(result.tasks);
+    if (!board.concurrencyCapLocked) {
+      board.concurrencyCap = sweepLineConcurrencyCap(result.tasks);
+    }
     board.state = "running";
     saveBoard(board, sessionId);
     state.awaitingDecomposition = false;
@@ -1647,13 +1724,27 @@ export class PlannerBridge {
   ): Promise<void> {
     let childSessionId: string;
     try {
+      const spawnParams: Record<string, unknown> = {
+        parentSessionId: orchestratorSessionId,
+        // cwd omitted → inherits from parent
+      };
+      // Pick the effective agent: per-task override beats fleet default
+      // beats daemon default. Validate against the cached choice list;
+      // unknown ids fall back to the daemon's default with a warning.
+      const effectiveAgent = task.agent ?? board.fleetDefaults?.agent ?? null;
+      if (effectiveAgent) {
+        const known = (this.agentChoices ?? []).some((a) => a.id === effectiveAgent);
+        if (known) {
+          spawnParams.agentId = effectiveAgent;
+        } else {
+          log.warn(
+            `task ${task.id} requested unknown agent "${effectiveAgent}"; spawning with default`,
+          );
+        }
+      }
       const spawnResult = await this.client.request<{ childSessionId: string }>(
         "hydra-acp/child_session/spawn",
-        {
-          parentSessionId: orchestratorSessionId,
-          // cwd omitted → inherits from parent
-          // agentId omitted → daemon uses defaultAgent. M6 honors per-task overrides.
-        },
+        spawnParams,
       );
       childSessionId = spawnResult.childSessionId;
     } catch (err) {
@@ -1684,6 +1775,25 @@ export class PlannerBridge {
       task.attemptCount += 1;
       saveBoard(board, orchestratorSessionId);
       return;
+    }
+
+    // Per-task model override (M6.2). The child_session/spawn protocol
+    // doesn't take a model param — the model is applied via
+    // session/set_model on the live session. Fire-and-forget: if the
+    // worker's agent doesn't accept the model, log a warning and let
+    // the task run on the agent's default model.
+    const effectiveModel = task.model ?? board.fleetDefaults?.model ?? null;
+    if (effectiveModel) {
+      this.client
+        .request("session/set_model", {
+          sessionId: childSessionId,
+          modelId: effectiveModel,
+        })
+        .catch((err) => {
+          log.warn(
+            `task ${task.id} set_model "${effectiveModel}" failed; worker will run on default: ${(err as Error).message}`,
+          );
+        });
     }
 
     // Claim the task: mark assigned + persist BEFORE the outer

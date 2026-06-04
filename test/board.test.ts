@@ -106,6 +106,27 @@ describe("newBoard", () => {
     const b = newBoard({ description: "build a todo app" });
     assert.equal(b.description, "build a todo app");
   });
+
+  it("default cap is unlocked so decomposition can recompute it", () => {
+    const b = newBoard({ description: "x" });
+    assert.equal(b.concurrencyCap, 1);
+    assert.equal(b.concurrencyCapLocked, undefined);
+  });
+
+  it("explicit concurrencyCap locks the cap", () => {
+    const b = newBoard({ description: "x", concurrencyCap: 4 });
+    assert.equal(b.concurrencyCap, 4);
+    assert.equal(b.concurrencyCapLocked, true);
+  });
+
+  it("fleet defaults are stored", () => {
+    const b = newBoard({
+      description: "x",
+      fleetDefaults: { agent: "code-claude", model: "opus" },
+    });
+    assert.equal(b.fleetDefaults.agent, "code-claude");
+    assert.equal(b.fleetDefaults.model, "opus");
+  });
 });
 
 describe("saveBoard / loadBoard", () => {

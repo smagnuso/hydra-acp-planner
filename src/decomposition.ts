@@ -8,6 +8,11 @@ import { formatBoardContext } from "./format.js";
 // mechanisms. Two workers handed the same task should be able to
 // produce legitimately different implementations.
 
+export interface AgentChoice {
+  id: string;
+  description?: string | undefined;
+}
+
 const DECOMPOSITION_SYSTEM = `You are helping plan a software project that will be executed by parallel coding agents. Your job is to break the project into a minimal task DAG and respond with structured JSON.
 
 For each task specify:
@@ -18,6 +23,10 @@ For each task specify:
   - constraints: hard requirements (compatibility, performance, security, file boundaries)
                  that bound the solution space without dictating one implementation
   - deps: array of task ids that must complete before this one can start
+  - agent (optional): id of a specialist agent that should execute this task, drawn
+                      from the list below. Omit (or set null) when the default agent fits.
+  - model (optional): model id to apply on the worker session at bootstrap (e.g. a
+                      stronger model for harder tasks). Omit when the default model fits.
 
 Do NOT specify:
   - library, framework, or algorithm choices
@@ -40,14 +49,34 @@ Reply with ONLY a fenced JSON block matching this schema, and no other prose:
       "why": "...",
       "what": "...",
       "constraints": "...",
-      "deps": []
+      "deps": [],
+      "agent": null,
+      "model": null
     }
   ]
 }
 \`\`\``;
 
-export function buildDecompositionPrompt(description: string): string {
-  return `${DECOMPOSITION_SYSTEM}\n\nProject to decompose:\n${description}`;
+// Render an "Available agents:" block to splice into a prompt. Returns
+// an empty string when no agents are known so the prompt can be built
+// either way.
+export function formatAgentChoices(agents: AgentChoice[] | undefined): string {
+  if (!agents || agents.length === 0) return "";
+  const lines = ["Available specialist agents (pick by id, or omit for default):"];
+  for (const a of agents) {
+    const desc = a.description ? ` — ${a.description}` : "";
+    lines.push(`  - ${a.id}${desc}`);
+  }
+  return lines.join("\n");
+}
+
+export function buildDecompositionPrompt(
+  description: string,
+  agents?: AgentChoice[],
+): string {
+  const agentsBlock = formatAgentChoices(agents);
+  const tail = agentsBlock ? `\n\n${agentsBlock}` : "";
+  return `${DECOMPOSITION_SYSTEM}${tail}\n\nProject to decompose:\n${description}`;
 }
 
 // Prompt sent on planner startup when a project board was in the
@@ -106,9 +135,14 @@ export interface DecompositionResult {
 // hydra-add-task block describing one or more new tasks to slot into
 // the DAG. The agent is instructed not to modify existing tasks — only
 // to ADD.
-export function buildAddTaskPrompt(description: string, board: Board): string {
+export function buildAddTaskPrompt(
+  description: string,
+  board: Board,
+  agents?: AgentChoice[],
+): string {
   const existingIds = board.tasks.map((t) => t.id).join(", ");
   const nextN = nextTaskNumber(board);
+  const agentsBlock = formatAgentChoices(agents);
   return [
     `You are extending an in-flight multi-agent project plan. The user wants to add work to it.`,
     ``,
@@ -121,13 +155,15 @@ export function buildAddTaskPrompt(description: string, board: Board): string {
     `  1. Does this add one task or several?`,
     `  2. Where does it fit in the dependency graph? (\`deps\` may reference existing task ids: ${existingIds || "(none)"}.)`,
     `  3. What id(s) to use? Continue the existing T-numbering — next free id is T${nextN}.`,
+    `  4. Does any task warrant a specialist \`agent\` or a non-default \`model\`? Omit (or null) for the defaults.`,
     ``,
-    `Reply with ONLY a fenced JSON block — same task schema as the original decomposition (id, title, why, what, constraints, deps). Do NOT modify any existing task. Do NOT specify implementation mechanism (libraries, algorithms, file structure). Keep the WHAT/WHY/CONSTRAINTS discipline.`,
+    `Reply with ONLY a fenced JSON block — same task schema as the original decomposition (id, title, why, what, constraints, deps, optional agent). Do NOT modify any existing task. Do NOT specify implementation mechanism (libraries, algorithms, file structure). Keep the WHAT/WHY/CONSTRAINTS discipline.`,
+    ...(agentsBlock ? ["", agentsBlock] : []),
     ``,
     "```hydra-add-task",
     `{`,
     `  "tasks": [`,
-    `    { "id": "T${nextN}", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [] }`,
+    `    { "id": "T${nextN}", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null }`,
     `  ]`,
     `}`,
     "```",

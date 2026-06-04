@@ -168,4 +168,28 @@ describe("formatStatus", () => {
     assert.match(out, /xyz/);
     assert.doesNotMatch(out, /hydra_plan_xyz/);
   });
+
+  it("renders an agent-only tag inline on the task line", () => {
+    const out = formatStatus(
+      board({ tasks: [task("T1", { agent: "code-claude" })] }),
+      true,
+    );
+    assert.match(out, /T1\s+Task T1\s+\{code-claude\}/);
+  });
+
+  it("renders an agent|model tag when both are set", () => {
+    const out = formatStatus(
+      board({ tasks: [task("T1", { agent: "code-claude", model: "opus-4-7" })] }),
+      true,
+    );
+    assert.match(out, /\{code-claude \| opus-4-7\}/);
+  });
+
+  it("renders a model-only tag when only model is set", () => {
+    const out = formatStatus(
+      board({ tasks: [task("T1", { model: "opus-4-7" })] }),
+      true,
+    );
+    assert.match(out, /\{opus-4-7\}/);
+  });
 });
