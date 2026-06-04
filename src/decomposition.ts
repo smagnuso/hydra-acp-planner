@@ -50,6 +50,30 @@ export function buildDecompositionPrompt(description: string): string {
   return `${DECOMPOSITION_SYSTEM}\n\nProject to decompose:\n${description}`;
 }
 
+// Prompt sent on planner startup when a project board was in the
+// `decomposing` state at the time of the last shutdown. Hydra
+// auto-resurrects the orchestrator session and seeds the prior
+// transcript as takeover; this prompt tells the agent to either
+// re-emit the decomposition it already produced (if it had finished)
+// or continue from where it left off.
+export function buildResumeDecompositionPrompt(description: string): string {
+  return [
+    `[hydra-acp-planner: resuming decomposition after restart]`,
+    ``,
+    `You were in the middle of decomposing this project:`,
+    ``,
+    `  ${description}`,
+    ``,
+    `If you already emitted a JSON task DAG, re-emit it verbatim now (don't redo the planning). Otherwise, continue from where you left off.`,
+    ``,
+    `Reply with ONLY a fenced \`\`\`json block matching the schema:`,
+    ``,
+    "```json",
+    `{ "tasks": [{ "id": "T1", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [] }] }`,
+    "```",
+  ].join("\n");
+}
+
 // Parse a fenced ```json block out of the agent's reply. The agent is
 // instructed to emit only the JSON block, but models sometimes wrap it
 // in introductory prose anyway, so we tolerate that. Returns undefined

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
+  buildResumeDecompositionPrompt,
   extractAddTaskBlock,
   extractJsonBlock,
   formatPlanSummary,
@@ -205,6 +206,31 @@ describe("sweepLineConcurrencyCap", () => {
 });
 
 // ─── formatPlanSummary ───────────────────────────────────────────────────
+
+// ─── buildResumeDecompositionPrompt ─────────────────────────────────────
+
+describe("buildResumeDecompositionPrompt", () => {
+  it("embeds the project description", () => {
+    const p = buildResumeDecompositionPrompt("build a todo app");
+    assert.match(p, /build a todo app/);
+  });
+
+  it("identifies as a restart resumption", () => {
+    const p = buildResumeDecompositionPrompt("anything");
+    assert.match(p, /resuming decomposition after restart/);
+  });
+
+  it("tells the agent to re-emit verbatim if already done", () => {
+    const p = buildResumeDecompositionPrompt("x");
+    assert.match(p, /re-emit it verbatim/);
+  });
+
+  it("asks for the same JSON schema as fresh decomposition", () => {
+    const p = buildResumeDecompositionPrompt("x");
+    assert.match(p, /tasks/);
+    assert.match(p, /```json/);
+  });
+});
 
 // ─── buildAddTaskPrompt + extractAddTaskBlock + normalizeAddedTasks ──────
 

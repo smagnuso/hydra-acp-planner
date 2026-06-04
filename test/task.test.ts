@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildRepromptForResultPrompt,
+  buildResumeTaskPrompt,
   buildTaskPrompt,
   extractResultBlock,
   normalizeResult,
@@ -101,6 +103,49 @@ describe("buildTaskPrompt", () => {
     assert.match(p, /summary/);
     assert.match(p, /files_changed/);
     assert.match(p, /MUST appear at the very end/);
+  });
+});
+
+// ─── buildResumeTaskPrompt ──────────────────────────────────────────────
+
+describe("buildResumeTaskPrompt", () => {
+  it("identifies the task by id and title", () => {
+    const p = buildResumeTaskPrompt(task("T3", { title: "Implement signup" }));
+    assert.match(p, /T3 — Implement signup/);
+  });
+
+  it("calls out the resumption context", () => {
+    const p = buildResumeTaskPrompt(task("T1"));
+    assert.match(p, /resuming after restart/);
+  });
+
+  it("tells the agent not to redo the work if already done", () => {
+    const p = buildResumeTaskPrompt(task("T1"));
+    assert.match(p, /don't redo the work/);
+  });
+
+  it("still asks for the hydra-result block at end-of-message", () => {
+    const p = buildResumeTaskPrompt(task("T1"));
+    assert.match(p, /```hydra-result/);
+  });
+});
+
+// ─── buildRepromptForResultPrompt ───────────────────────────────────────
+
+describe("buildRepromptForResultPrompt", () => {
+  it("identifies the task that's missing its result", () => {
+    const p = buildRepromptForResultPrompt(task("T5"));
+    assert.match(p, /T5 didn't end with the required `hydra-result` block/);
+  });
+
+  it("explicitly says don't redo the work", () => {
+    const p = buildRepromptForResultPrompt(task("T1"));
+    assert.match(p, /do NOT redo the work/);
+  });
+
+  it("covers the failed-task case", () => {
+    const p = buildRepromptForResultPrompt(task("T1"));
+    assert.match(p, /If the task itself failed/);
   });
 });
 

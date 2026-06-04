@@ -51,6 +51,7 @@ import { projectDir } from "./paths.js";
 import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
+  buildResumeDecompositionPrompt,
   extractAddTaskBlock,
   extractJsonBlock,
   formatPlanSummary,
@@ -59,6 +60,8 @@ import {
   sweepLineConcurrencyCap,
 } from "./decomposition.js";
 import {
+  buildRepromptForResultPrompt,
+  buildResumeTaskPrompt,
   buildTaskPrompt,
   extractResultBlock,
   normalizeResult,
@@ -160,6 +163,16 @@ const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
 // believe we're observing the session.
 const attachedSessions = new Set<string>();
 
+// Boards rehydrated from disk that we haven't yet been able to attach
+// to because their orchestrator session is still cold. The polling
+// loop probes these every few seconds via `hydra-acp/transformer/attach`
+// — when the user reopens the TUI or fires a slash command, the
+// session goes live, attach succeeds, and we activate (waking workers
+// and resuming tasks).
+const pendingActivation = new Set<string>(); // orchestratorSessionId
+
+const ACTIVATION_POLL_INTERVAL_MS = 3000;
+
 // Walk projects on disk and find the board owned by `orchestratorSessionId`.
 // Cheap fallback for `/hydra planner status` queries on done/failed
 // projects that rehydrateFromDisk leaves out of the in-memory boards map.
@@ -216,7 +229,37 @@ export class PlannerBridge {
   }
 
   stop(): void {
+    // Mark shutdown so in-flight emit catches don't mark tasks failed.
+    // The work continues on the daemon's side; we want it to stay
+    // "assigned" on disk so the next planner startup resumes it via
+    // rehydrate.
+    this.shuttingDown = true;
+    if (this.activationTimer) {
+      clearInterval(this.activationTimer);
+      this.activationTimer = null;
+    }
     this.client.stop();
+  }
+
+  private activationTimer: NodeJS.Timeout | null = null;
+
+  // True between PlannerBridge.stop() and process exit. Used to
+  // distinguish "ws closed because we're shutting down" from "ws
+  // closed because of some other failure" in task-turn catch
+  // handlers. When true, do not call handleTaskFailure — let the
+  // on-disk task state stay "assigned" so the next process startup
+  // picks it up.
+  private shuttingDown = false;
+
+  // Recognise errors that are really about our connection going down
+  // (own shutdown, daemon dying out from under us, network blip)
+  // rather than a real agent / work failure. Tasks affected by these
+  // errors should be left in their on-disk state so the next startup
+  // resumes them, instead of being marked failed.
+  private isShutdownError(err: unknown): boolean {
+    if (this.shuttingDown) return true;
+    const msg = (err as Error)?.message ?? "";
+    return msg.includes("ws closed") || msg.includes("ws is closed");
   }
 
   private async registerCommands(): Promise<void> {
@@ -254,8 +297,6 @@ export class PlannerBridge {
       return;
     }
     let activeBoards = 0;
-    let attachedOrchestrators = 0;
-    let attachedWorkers = 0;
 
     for (const entry of entries) {
       if (entry.state === "done" || entry.state === "failed") {
@@ -274,20 +315,19 @@ export class PlannerBridge {
       boards.set(orchestratorId, board);
       activeBoards += 1;
 
-      if (board.state === "decomposing") {
-        setOrchestratorState(orchestratorId, {
-          projectId: board.projectId,
-          decompositionAccumulator: "",
-          awaitingDecomposition: true,
-          addAccumulator: "",
-          awaitingAdd: false,
-        });
-        if (await this.tryAttach(orchestratorId, `orchestrator for ${shortProjectId(board.projectId)}`)) {
-          attachedOrchestrators += 1;
-        }
-      }
+      // Populate in-memory state so intercepts and slash commands have
+      // a handle, but do NOT attempt to attach yet. Orchestrators come
+      // back to life naturally when the user reopens the TUI or fires
+      // a slash command; the polling loop below detects that and
+      // activates the board (attach + wake workers + resume).
+      setOrchestratorState(orchestratorId, {
+        projectId: board.projectId,
+        decompositionAccumulator: "",
+        awaitingDecomposition: board.state === "decomposing",
+        addAccumulator: "",
+        awaitingAdd: false,
+      });
 
-      // Workers mid-task: restore state + reattach.
       for (const task of board.tasks) {
         if (task.status !== "assigned" || !task.assignedTo) continue;
         const workerId = task.assignedTo;
@@ -295,29 +335,134 @@ export class PlannerBridge {
           orchestratorSessionId: orchestratorId,
           taskId: task.id,
           resultAccumulator: "",
+          repromptCount: 0,
         });
         registerWorker(workerId, orchestratorId);
-        if (await this.tryAttach(workerId, `worker ${task.id} on ${shortProjectId(board.projectId)}`)) {
-          attachedWorkers += 1;
-        }
       }
+
+      pendingActivation.add(orchestratorId);
     }
 
     if (activeBoards > 0) {
       log.info(
-        `rehydrated ${activeBoards} active board(s); reattached ${attachedOrchestrators} orchestrator(s), ${attachedWorkers} worker(s)`,
+        `rehydrated ${activeBoards} active board(s); ${pendingActivation.size} awaiting activation`,
       );
+      this.ensureActivationTimer();
     }
   }
 
-  private async tryAttach(sessionId: string, label: string): Promise<boolean> {
+  // Probe pending boards for a live orchestrator. The orchestrator
+  // session goes live whenever the user reopens the TUI on it or
+  // fires a slash command — we just retry transformer/attach until
+  // it stops returning SessionNotFound.
+  private ensureActivationTimer(): void {
+    if (this.activationTimer || pendingActivation.size === 0) return;
+    this.activationTimer = setInterval(() => {
+      void this.tickActivation();
+    }, ACTIVATION_POLL_INTERVAL_MS);
+  }
+
+  private async tickActivation(): Promise<void> {
+    if (this.shuttingDown) return;
+    if (pendingActivation.size === 0) {
+      if (this.activationTimer) {
+        clearInterval(this.activationTimer);
+        this.activationTimer = null;
+      }
+      return;
+    }
+    for (const orchestratorId of [...pendingActivation]) {
+      const board = boards.get(orchestratorId);
+      if (!board) {
+        pendingActivation.delete(orchestratorId);
+        continue;
+      }
+      await this.tryActivateBoard(orchestratorId, board);
+    }
+  }
+
+  // Attempt to bring `board` live: attach orchestrator, wake any
+  // assigned workers, resume their tasks. Best-effort — leaves the
+  // board in `pendingActivation` if the orchestrator is still cold.
+  private async tryActivateBoard(
+    orchestratorId: string,
+    board: Board,
+  ): Promise<void> {
     try {
-      await this.client.request("hydra-acp/transformer/attach", { sessionId });
-      attachedSessions.add(sessionId);
+      await this.client.request("hydra-acp/transformer/attach", {
+        sessionId: orchestratorId,
+      });
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      // SessionNotFound is the expected "still cold" outcome; quiet.
+      if (!msg.includes("not found")) {
+        log.warn(
+          `activate: orchestrator attach failed for ${shortProjectId(board.projectId)}: ${msg}`,
+        );
+      }
+      return;
+    }
+    attachedSessions.add(orchestratorId);
+    pendingActivation.delete(orchestratorId);
+    log.info(
+      `activated board ${shortProjectId(board.projectId)} (orchestrator …${orchestratorId.slice(-8)})`,
+    );
+
+    if (board.state === "decomposing") {
+      this.resumeDecomposition(orchestratorId, board);
+    }
+
+    for (const task of board.tasks) {
+      if (task.status !== "assigned" || !task.assignedTo) continue;
+      const workerId = task.assignedTo;
+      const ok = await this.wakeAndAttachWorker(workerId, task.id, board.projectId);
+      if (ok) {
+        void this.resumeTask(orchestratorId, board, task, workerId);
+      }
+    }
+  }
+
+  // Resurrect a cold worker session, then join its chain as a
+  // transformer. Returns true on full success.
+  //
+  // Important: we do NOT call session/detach after session/load even
+  // though session/load implicitly attached us as a client. Workers
+  // are spawned `interactive:false` and resume prompts are tagged
+  // `ancillary:true`, so the worker never promotes to interactive.
+  // If we detached, the daemon's `reapIfOrphanedNonInteractive` would
+  // fire (attachedCount hits 0, interactive !== true) and immediately
+  // kill the freshly-resurrected agent — the next session/prompt
+  // would fail with "connection is closed". Staying attached as a
+  // client keeps attachedCount at 1, blocking the reaper.
+  //
+  // Side effect: the planner's WS receives session/update
+  // notifications as a client in addition to its chain intercepts.
+  // The intercept-side state machine is the source of truth; the
+  // duplicate client-side notifications are routed to
+  // handleNotification which ignores anything it doesn't care about.
+  private async wakeAndAttachWorker(
+    workerId: string,
+    taskId: string,
+    projectId: string,
+  ): Promise<boolean> {
+    const label = `worker ${taskId} on ${shortProjectId(projectId)}`;
+    try {
+      await this.client.request("session/load", { sessionId: workerId });
+    } catch (err) {
+      log.warn(
+        `activate: session/load failed for ${label}: ${(err as Error).message}`,
+      );
+      return false;
+    }
+    try {
+      await this.client.request("hydra-acp/transformer/attach", {
+        sessionId: workerId,
+      });
+      attachedSessions.add(workerId);
       return true;
     } catch (err) {
       log.warn(
-        `rehydrate: could not attach to ${label} (session=…${sessionId.slice(-8)}): ${(err as Error).message}`,
+        `activate: transformer/attach failed for ${label}: ${(err as Error).message}`,
       );
       return false;
     }
@@ -967,6 +1112,11 @@ export class PlannerBridge {
       });
       attachedSessions.add(sessionId);
     } catch (err) {
+      if (this.isShutdownError(err)) {
+        log.info(`create aborted (shutdown) for ${board.projectId}; board left as is`);
+        this.client.reply(reqId, { text: "" });
+        return;
+      }
       log.error(
         `transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
       );
@@ -1009,6 +1159,13 @@ export class PlannerBridge {
         route: "chain",
       });
     } catch (err) {
+      if (this.isShutdownError(err)) {
+        log.info(
+          `decomposition aborted (shutdown) for ${board.projectId}; left as decomposing for resume`,
+        );
+        this.client.reply(reqId, { text: "" });
+        return;
+      }
       log.error(
         `decomposition turn failed for ${board.projectId}: ${(err as Error).message}`,
       );
@@ -1418,6 +1575,7 @@ export class PlannerBridge {
       orchestratorSessionId,
       taskId: task.id,
       resultAccumulator: "",
+      repromptCount: 0,
     });
     registerWorker(childSessionId, orchestratorSessionId);
 
@@ -1447,6 +1605,12 @@ export class PlannerBridge {
           route: "chain",
         });
       } catch (err) {
+        if (this.isShutdownError(err)) {
+          log.info(
+            `task ${task.id} emit aborted (shutdown); leaving as assigned for next-process resume`,
+          );
+          return;
+        }
         log.error(
           `task turn for ${task.id} on worker ${childSessionId} failed: ${(err as Error).message}`,
         );
@@ -1459,13 +1623,179 @@ export class PlannerBridge {
         );
         return;
       }
+      if (this.shuttingDown) return; // skip completion processing during shutdown
       this.handleTaskComplete(orchestratorSessionId, childSessionId, board, task);
+    })();
+  }
+
+  // Re-prompt an existing in-flight worker session after a daemon
+  // restart. The worker session was already attached during rehydrate
+  // and its state populated; this just sends the continuation prompt
+  // that nudges the agent to pick up. Same emit-then-handleTaskComplete
+  // pattern as a fresh spawn.
+  private resumeTask(
+    orchestratorSessionId: string,
+    board: Board,
+    task: Task,
+    workerSessionId: string,
+  ): void {
+    log.info(
+      `resuming ${task.id} on worker …${workerSessionId.slice(-8)}`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `↻ Resuming ${task.id} on worker ${shortSessionId(workerSessionId)}  (${task.title})`,
+    );
+    void (async () => {
+      try {
+        await this.client.request("hydra-acp/message/emit", {
+          sessionId: workerSessionId,
+          method: "session/prompt",
+          envelope: buildTextPromptEnvelope({
+            sessionId: workerSessionId,
+            text: buildResumeTaskPrompt(task),
+            ancillary: true,
+          }),
+          route: "chain",
+        });
+      } catch (err) {
+        if (this.isShutdownError(err)) {
+          log.info(
+            `resume turn for ${task.id} aborted (shutdown); leaving as assigned`,
+          );
+          return;
+        }
+        log.error(
+          `resume turn for ${task.id} on worker ${workerSessionId} failed: ${(err as Error).message}`,
+        );
+        this.handleTaskFailure(
+          orchestratorSessionId,
+          workerSessionId,
+          board,
+          task,
+          `resume turn failed: ${(err as Error).message}`,
+        );
+        return;
+      }
+      if (this.shuttingDown) return;
+      this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
+    })();
+  }
+
+  // Re-prompt an orchestrator session whose project was mid-decomposition
+  // at the time of the last shutdown. Hydra auto-resurrects the
+  // session (seeding the prior transcript as takeover); this just
+  // tells the agent to either re-emit its previous decomposition or
+  // continue producing one. The flow mirrors handleCreate's tail —
+  // accumulator was already set up during rehydrate, we just need to
+  // drive the emit + finishDecomposition.
+  private resumeDecomposition(
+    orchestratorSessionId: string,
+    board: Board,
+  ): void {
+    log.info(
+      `resuming decomposition of ${board.projectId} on session …${orchestratorSessionId.slice(-8)}`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `↻ Resuming decomposition of ${shortProjectId(board.projectId)} after restart`,
+    );
+    void (async () => {
+      try {
+        await this.client.request("hydra-acp/message/emit", {
+          sessionId: orchestratorSessionId,
+          method: "session/prompt",
+          envelope: buildTextPromptEnvelope({
+            sessionId: orchestratorSessionId,
+            text: buildResumeDecompositionPrompt(board.description),
+          }),
+          route: "chain",
+        });
+      } catch (err) {
+        if (this.isShutdownError(err)) {
+          log.info(
+            `resume decomposition aborted (shutdown) for ${board.projectId}`,
+          );
+          return;
+        }
+        log.error(
+          `resume decomposition turn for ${board.projectId} failed: ${(err as Error).message}`,
+        );
+        const state = getOrchestratorState(orchestratorSessionId);
+        if (state) state.awaitingDecomposition = false;
+        board.state = "failed";
+        saveBoard(board, orchestratorSessionId);
+        await this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `⚠️ Resume of decomposition for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
+        );
+        return;
+      }
+      if (this.shuttingDown) return;
+      const state = getOrchestratorState(orchestratorSessionId);
+      if (state && state.awaitingDecomposition) {
+        this.finishDecomposition(orchestratorSessionId, state);
+      }
+    })();
+  }
+
+  // Send a one-shot reprompt asking the agent to emit the missing
+  // hydra-result block. The worker's accumulator was cleared by the
+  // caller. When the new turn ends, handleTaskComplete fires again;
+  // if parse still fails, repromptCount has hit the cap and it
+  // escalates to handleTaskFailure.
+  private repromptForResultBlock(
+    orchestratorSessionId: string,
+    workerSessionId: string,
+    board: Board,
+    task: Task,
+  ): void {
+    log.info(
+      `reprompting worker …${workerSessionId.slice(-8)} for missing hydra-result block on ${task.id}`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `↻ Asking ${shortSessionId(workerSessionId)} for ${task.id}'s missing hydra-result block`,
+    );
+    void (async () => {
+      try {
+        await this.client.request("hydra-acp/message/emit", {
+          sessionId: workerSessionId,
+          method: "session/prompt",
+          envelope: buildTextPromptEnvelope({
+            sessionId: workerSessionId,
+            text: buildRepromptForResultPrompt(task),
+            ancillary: true,
+          }),
+          route: "chain",
+        });
+      } catch (err) {
+        if (this.isShutdownError(err)) {
+          log.info(
+            `reprompt turn for ${task.id} aborted (shutdown); leaving as assigned`,
+          );
+          return;
+        }
+        log.error(
+          `reprompt turn for ${task.id} on worker ${workerSessionId} failed: ${(err as Error).message}`,
+        );
+        this.handleTaskFailure(
+          orchestratorSessionId,
+          workerSessionId,
+          board,
+          task,
+          `reprompt turn failed: ${(err as Error).message}`,
+        );
+        return;
+      }
+      if (this.shuttingDown) return;
+      this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
     })();
   }
 
   // Called when the worker's session/prompt turn completes. Parses the
   // hydra-result block from the accumulated reply, persists artifacts,
-  // closes the worker session, and (M2: halts; M3+: schedules next).
+  // closes the worker session, and schedules the next task.
   private handleTaskComplete(
     orchestratorSessionId: string,
     workerSessionId: string,
@@ -1483,12 +1813,30 @@ export class PlannerBridge {
     const result = raw === undefined ? undefined : normalizeResult(raw);
 
     if (!result) {
+      // Reprompt once before giving up. Common failure: agent did the
+      // work but forgot to emit the structured block at end-of-message.
+      // Clear the accumulator so the next turn's chunks land in a
+      // fresh slot; bump repromptCount so we don't loop on second miss.
+      if (workerState.repromptCount < 1) {
+        log.warn(
+          `${task.id}: missing hydra-result block on worker …${workerSessionId.slice(-8)} (accumulator length=${workerState.resultAccumulator.length}), reprompting`,
+        );
+        workerState.repromptCount += 1;
+        workerState.resultAccumulator = "";
+        this.repromptForResultBlock(
+          orchestratorSessionId,
+          workerSessionId,
+          board,
+          task,
+        );
+        return;
+      }
       this.handleTaskFailure(
         orchestratorSessionId,
         workerSessionId,
         board,
         task,
-        `worker reply missing or malformed hydra-result block (accumulator length=${workerState.resultAccumulator.length})`,
+        `worker reply missing or malformed hydra-result block after ${workerState.repromptCount + 1} attempts`,
       );
       return;
     }

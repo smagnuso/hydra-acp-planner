@@ -43,6 +43,12 @@ export interface WorkerState {
   // Reply text accumulated from agent_message_chunk intercepts. Drained
   // when handleTaskComplete fires.
   resultAccumulator: string;
+  // Number of times we've already reprompted this worker for a missing
+  // hydra-result block within the current attempt. Reset to 0 on fresh
+  // task spawn or task resume (after restart); incremented each time
+  // handleTaskComplete fires without a parseable block. Cap of 1
+  // reprompt before we hand off to handleTaskFailure.
+  repromptCount: number;
 }
 
 const workerStates = new Map<string, WorkerState>();

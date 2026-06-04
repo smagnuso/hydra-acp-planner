@@ -47,6 +47,46 @@ function formatDependencyContext(task: Task, board: Board): string {
   return blocks.join("\n\n");
 }
 
+// Prompt sent when the planner is resuming an in-flight task after a
+// daemon restart. The worker session is cold-resurrected by hydra
+// (which seeds the prior transcript as a takeover prompt), so the
+// agent already has its own conversational memory of what it was
+// doing. This continuation prompt just tells it to pick up — and to
+// be sure to emit the structured result block when done.
+export function buildResumeTaskPrompt(task: Task): string {
+  return [
+    `[hydra-acp-planner: resuming after restart]`,
+    ``,
+    `You were previously working on **${task.id} — ${task.title}**.`,
+    ``,
+    `Continue from where you left off. If you were mid-write, finish that file. If you were already done but never emitted your hydra-result block, emit it now (don't redo the work).`,
+    ``,
+    `When finished, end your message with the same fenced \`\`\`hydra-result block format described earlier:`,
+    ``,
+    "```hydra-result",
+    `{ "summary": "...", "files_changed": [...], "decisions": [...] }`,
+    "```",
+  ].join("\n");
+}
+
+// Prompt sent when the planner sees an agent reply that's missing the
+// expected hydra-result block. The worker likely finished the work but
+// forgot the format. One reprompt is allowed per attempt; a second
+// miss escalates to failure.
+export function buildRepromptForResultPrompt(task: Task): string {
+  return [
+    `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block.`,
+    ``,
+    `Please emit it now — do NOT redo the work, just emit a structured summary of what you accomplished:`,
+    ``,
+    "```hydra-result",
+    `{ "summary": "<one-line description of what you did>", "files_changed": [...], "decisions": [...], "assumptions": [...] }`,
+    "```",
+    ``,
+    `If the task itself failed or you couldn't complete it, still emit the block — set "summary" to describe what blocked you.`,
+  ].join("\n");
+}
+
 export function buildTaskPrompt(task: Task, board: Board): string {
   const parts: string[] = [];
   parts.push(TASK_SYSTEM);
