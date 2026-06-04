@@ -1,0 +1,42 @@
+{
+  "name": "@hydra-acp/planner",
+  "version": "0.0.1",
+  "description": "Multi-agent project orchestrator for hydra-acp — decomposes a goal into a task DAG, spawns worker sessions, coordinates via prompts.",
+  "license": "MIT",
+  "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "dist/index.js",
+  "bin": {
+    "hydra-acp-planner": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "watch": "tsup --watch",
+    "start": "node dist/index.js",
+    "dev": "tsup && node dist/index.js",
+    "test": "node --test --import tsx 'test/**/*.test.ts'",
+    "lint": "tsc -p . --noEmit",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.5.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.6.3"
+  }
+}
