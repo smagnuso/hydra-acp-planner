@@ -26,9 +26,11 @@ import { logger } from "./util/log.js";
 import {
   buildAgentMessageChunkEnvelope,
   buildTextPromptEnvelope,
+  extractPromptText,
   extractUpdateText,
   updateKind,
 } from "./util/text.js";
+import { formatBoardContext, formatStatus } from "./format.js";
 import { rmSync } from "node:fs";
 import {
   allTerminal,
@@ -47,9 +49,12 @@ import {
 } from "./board.js";
 import { projectDir } from "./paths.js";
 import {
+  buildAddTaskPrompt,
   buildDecompositionPrompt,
+  extractAddTaskBlock,
   extractJsonBlock,
   formatPlanSummary,
+  normalizeAddedTasks,
   normalizeDecomposition,
   sweepLineConcurrencyCap,
 } from "./decomposition.js";
@@ -63,6 +68,7 @@ import {
   clearWorkerState,
   getOrchestratorState,
   getWorkerState,
+  orchestratorOfWorker,
   registerWorker,
   setOrchestratorState,
   setWorkerState,
@@ -72,6 +78,13 @@ import {
 const log = logger("planner");
 
 const INTERCEPTS = [
+  // User-typed non-slash prompts to an orchestrator session get
+  // rewritten to include a board-context preamble, so the agent can
+  // answer natural-language questions about the project ("what's
+  // left?", "why bcrypt cost 12?") without needing MCP tools. Slash
+  // commands (`/hydra ...`) are intercepted by hydra before the chain
+  // runs, so they don't reach this handler.
+  "request:session/prompt",
   // Only response:session/update fires in the response chain — hydra's
   // runResponseChain is session/update-only. We use the embedded
   // sessionUpdate kind ("agent_message_chunk", "turn_complete", ...)
@@ -101,6 +114,26 @@ const COMMANDS = [
     verb: "cancel",
     argsHint: "[<projectId>]",
     description: "Stop this session's project (or another by id). Cancels in-flight workers; pending tasks stay frozen on the board.",
+  },
+  {
+    verb: "add",
+    argsHint: "<description>",
+    description: "Slot a new task into this session's project. Asks the orchestrator agent where it fits and schedules it.",
+  },
+  {
+    verb: "retask",
+    argsHint: "<taskId>",
+    description: "Reset a task to pending. Closes its current worker (if any), bumps attemptCount, schedules next.",
+  },
+  {
+    verb: "skip",
+    argsHint: "<taskId>",
+    description: "Mark a task done without running it. Use to bypass a task whose intent is no longer needed.",
+  },
+  {
+    verb: "kill",
+    argsHint: "<workerId>",
+    description: "Close a specific worker session. Requeues its current task as pending.",
   },
   {
     verb: "remove",
@@ -154,52 +187,8 @@ function orchestratorSessionForProject(projectId: string): string | undefined {
   return undefined;
 }
 
-const TASK_STATUS_GLYPH: Record<string, string> = {
-  done: "✓",
-  assigned: "▶",
-  failed: "⨯",
-  blocked: "⊘",
-  pending: "·",
-};
-
-// Render a board as the body of a `/hydra planner status` reply.
-// Multi-line plain text; gets emitted as a synthetic agent_message_chunk
-// by hydra's emitExtensionReply, so it lands cleanly in any client's
-// transcript renderer. The `attached` flag is the planner's
-// best-effort belief about whether it's currently in this session's
-// transformer chain — true if we've called transformer/attach this
-// process lifetime and haven't dropped it.
-function formatStatus(board: Board, attached: boolean): string {
-  const lines: string[] = [];
-  const done = board.tasks.filter((t) => t.status === "done").length;
-  const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
-  const failed = board.tasks.filter((t) => t.status === "failed").length;
-  lines.push(`📋 ${shortProjectId(board.projectId)}  (${board.state})`);
-  lines.push(`   ${board.description}`);
-  lines.push("");
-  const counts = [`${board.tasks.length} total`, `${done} done`];
-  if (inFlight > 0) counts.push(`${inFlight} in flight`);
-  if (failed > 0) counts.push(`${failed} failed`);
-  lines.push(`   Tasks: ${counts.join(", ")}`);
-  lines.push(`   Concurrency cap: ${board.concurrencyCap}`);
-  lines.push(
-    `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`,
-  );
-  if (board.tasks.length === 0) {
-    return lines.join("\n");
-  }
-  lines.push("");
-  for (const task of board.tasks) {
-    const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
-    const deps = task.deps.length === 0 ? "" : `  ← ${task.deps.join(", ")}`;
-    const worker =
-      task.status === "assigned" && task.assignedTo
-        ? `  → ${shortSessionId(task.assignedTo)}`
-        : "";
-    lines.push(`   ${glyph} ${task.id}  ${task.title}${deps}${worker}`);
-  }
-  return lines.join("\n");
-}
+// Formatters moved to ./format.ts for unit-testability without
+// dragging in the PlannerBridge constructor and its WS connection.
 
 export class PlannerBridge {
   private client: TransformerClient;
@@ -290,6 +279,8 @@ export class PlannerBridge {
           projectId: board.projectId,
           decompositionAccumulator: "",
           awaitingDecomposition: true,
+          addAccumulator: "",
+          awaitingAdd: false,
         });
         if (await this.tryAttach(orchestratorId, `orchestrator for ${shortProjectId(board.projectId)}`)) {
           attachedOrchestrators += 1;
@@ -376,6 +367,27 @@ export class PlannerBridge {
     }
     if (verb === "cancel") {
       this.handleCancel(req.id, sessionId, args);
+      return;
+    }
+    if (verb === "add") {
+      void this.handleAdd(req.id, sessionId, args).catch((err) => {
+        log.error(`handleAdd threw: ${(err as Error).message}`);
+        this.client.reply(req.id, {
+          text: `⚠️ Internal error: ${(err as Error).message}`,
+        });
+      });
+      return;
+    }
+    if (verb === "retask") {
+      this.handleRetask(req.id, sessionId, args);
+      return;
+    }
+    if (verb === "skip") {
+      this.handleSkip(req.id, sessionId, args);
+      return;
+    }
+    if (verb === "kill") {
+      this.handleKill(req.id, sessionId, args);
       return;
     }
     if (verb === "remove") {
@@ -470,6 +482,343 @@ export class PlannerBridge {
     );
     this.client.reply(reqId, {
       text: `Cancelled project ${shortProjectId(canonical)}${tail}.`,
+    });
+  }
+
+  // ── Plan mutations ────────────────────────────────────────────────
+
+  // Look up the current session's board, with a friendly reply if no
+  // project is owned by this session. Shared by the mutation verbs.
+  private requireBoard(
+    reqId: number | string,
+    sessionId: string,
+  ): { board: Board; orchestratorSessionId: string } | undefined {
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    if (!board) {
+      this.client.reply(reqId, {
+        text: "No plan in this session yet. Start one with `/hydra planner create <description>`.",
+      });
+      return undefined;
+    }
+    if (board.state === "done" || board.state === "failed") {
+      this.client.reply(reqId, {
+        text: `Project ${shortProjectId(board.projectId)} is ${board.state}. Use \`/hydra planner create\` to start a new one.`,
+      });
+      return undefined;
+    }
+    // The session this verb came from may not be the same as the
+    // session that originally owned the board on disk (e.g. attached
+    // via a different client). For mutations we want to use the
+    // session the slash arrived on as the orchestratorSessionId so
+    // saveBoard updates the right pointer.
+    return { board, orchestratorSessionId: sessionId };
+  }
+
+  // /hydra planner add <description>
+  //
+  // Ask the orchestrator agent to slot the user's request into the
+  // existing DAG. Uses the same suppress+accumulate pattern as
+  // decomposition but with the hydra-add-task block schema. New tasks
+  // are appended to board.tasks; the scheduler picks them up.
+  private async handleAdd(
+    reqId: number | string,
+    sessionId: string,
+    description: string,
+  ): Promise<void> {
+    if (description.length === 0) {
+      this.client.reply(reqId, {
+        text: "planner add: usage `/hydra planner add <description>`",
+      });
+      return;
+    }
+    const ctx = this.requireBoard(reqId, sessionId);
+    if (!ctx) return;
+    const { board, orchestratorSessionId } = ctx;
+
+    // Best-effort attach (in case this session never invoked us before).
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(
+        `add: transformer/attach failed: ${(err as Error).message}`,
+      );
+    }
+
+    // Set the awaiting flag BEFORE we emit so the response intercept
+    // accumulates this turn's chunks rather than passing them through.
+    let state = getOrchestratorState(orchestratorSessionId);
+    if (!state) {
+      state = {
+        projectId: board.projectId,
+        decompositionAccumulator: "",
+        awaitingDecomposition: false,
+        addAccumulator: "",
+        awaitingAdd: false,
+      };
+      setOrchestratorState(orchestratorSessionId, state);
+    }
+    state.addAccumulator = "";
+    state.awaitingAdd = true;
+
+    await this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `📝 Asking the agent to slot in: "${description}"`,
+    );
+
+    try {
+      await this.client.request("hydra-acp/message/emit", {
+        sessionId: orchestratorSessionId,
+        method: "session/prompt",
+        envelope: buildTextPromptEnvelope({
+          sessionId: orchestratorSessionId,
+          text: buildAddTaskPrompt(description, board),
+        }),
+        route: "chain",
+      });
+    } catch (err) {
+      state.awaitingAdd = false;
+      log.error(`add: emit failed: ${(err as Error).message}`);
+      await this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `⚠️ Couldn't ask the agent to plan the addition: ${(err as Error).message}`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
+
+    // Parse the accumulated reply.
+    const existingIds = new Set(board.tasks.map((t) => t.id));
+    const rawBlock = extractAddTaskBlock(state.addAccumulator);
+    const result = rawBlock === undefined
+      ? undefined
+      : normalizeAddedTasks(rawBlock, existingIds);
+    state.awaitingAdd = false;
+    state.addAccumulator = "";
+
+    if (!result) {
+      log.warn(`add: parse failed for ${board.projectId}`);
+      await this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `⚠️ Couldn't parse a hydra-add-task block from the agent's reply. Try \`/hydra planner add <description>\` again with a clearer description.`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
+
+    // Merge the new tasks into the board and bump the concurrency cap
+    // to reflect the (potentially wider) DAG. Persist before
+    // scheduling so an immediate restart picks up the new tasks.
+    board.tasks.push(...result.tasks);
+    board.concurrencyCap = sweepLineConcurrencyCap(board.tasks);
+    saveBoard(board, orchestratorSessionId);
+    boards.set(orchestratorSessionId, board);
+
+    log.info(
+      `added ${result.tasks.length} task(s) to ${board.projectId}: ${result.tasks.map((t) => t.id).join(", ")}`,
+    );
+
+    const idsList = result.tasks.map((t) => `${t.id} ${t.title}`).join(", ");
+    const warningsBlock =
+      result.warnings.length > 0
+        ? `\n⚠️ ${result.warnings.length} parse warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}\n`
+        : "";
+    await this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `+ Added ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"}: ${idsList}${warningsBlock}`,
+    );
+
+    // Kick off the scheduler — newly-added tasks with all-deps-met are
+    // eligible immediately, otherwise they wait for the dep chain to
+    // catch up.
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
+
+    this.client.reply(reqId, { text: "" });
+  }
+
+  // /hydra planner skip <taskId>
+  //
+  // Mark a task done with empty artifacts. Closes its worker if one
+  // was assigned. Useful for bypassing tasks the user has decided
+  // aren't needed after all without re-decomposing.
+  private handleSkip(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): void {
+    const taskId = args.split(/\s+/)[0]?.trim() ?? "";
+    if (!taskId) {
+      this.client.reply(reqId, {
+        text: "planner skip: usage `/hydra planner skip <taskId>` (e.g. `/hydra planner skip T3`)",
+      });
+      return;
+    }
+    const ctx = this.requireBoard(reqId, sessionId);
+    if (!ctx) return;
+    const { board, orchestratorSessionId } = ctx;
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task) {
+      this.client.reply(reqId, { text: `No task '${taskId}' in this project.` });
+      return;
+    }
+    if (task.status === "done") {
+      this.client.reply(reqId, { text: `${taskId} is already done.` });
+      return;
+    }
+    if (task.status === "failed") {
+      this.client.reply(reqId, {
+        text: `${taskId} is in failed state — use \`/hydra planner retask ${taskId}\` to retry or accept it as is.`,
+      });
+      return;
+    }
+
+    // If a worker is currently on this task, free it up.
+    const workerId = task.assignedTo;
+    if (task.status === "assigned" && workerId) {
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      delete board.workers[workerId];
+      void this.closeWorker(workerId);
+    }
+
+    task.status = "done";
+    task.finishedAt = nowIso();
+    task.artifacts = { summary: "skipped by user" };
+    task.assignedTo = null;
+    saveBoard(board, orchestratorSessionId);
+    log.info(`skipped ${taskId} in ${board.projectId}`);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `✓ ${taskId} skipped (marked done with no work).`,
+    );
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
+    this.client.reply(reqId, { text: `Skipped ${taskId}.` });
+  }
+
+  // /hydra planner retask <taskId>
+  //
+  // Reset a task to pending. If it's currently assigned, close its
+  // worker first (the work is discarded). Useful when a task got into a
+  // bad state and the user wants to try fresh.
+  private handleRetask(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): void {
+    const taskId = args.split(/\s+/)[0]?.trim() ?? "";
+    if (!taskId) {
+      this.client.reply(reqId, {
+        text: "planner retask: usage `/hydra planner retask <taskId>` (e.g. `/hydra planner retask T3`)",
+      });
+      return;
+    }
+    const ctx = this.requireBoard(reqId, sessionId);
+    if (!ctx) return;
+    const { board, orchestratorSessionId } = ctx;
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task) {
+      this.client.reply(reqId, { text: `No task '${taskId}' in this project.` });
+      return;
+    }
+
+    // If a worker is currently on this task, free it.
+    const workerId = task.assignedTo;
+    if (task.status === "assigned" && workerId) {
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      delete board.workers[workerId];
+      void this.closeWorker(workerId);
+    }
+
+    task.status = "pending";
+    task.assignedTo = null;
+    task.startedAt = null;
+    task.finishedAt = null;
+    task.artifacts = null;
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(`retask ${taskId} in ${board.projectId} (attemptCount=${task.attemptCount})`);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `↻ ${taskId} reset to pending (attempt #${task.attemptCount + 1} next).`,
+    );
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
+    this.client.reply(reqId, { text: `Reset ${taskId} to pending.` });
+  }
+
+  // /hydra planner kill <workerId>
+  //
+  // Close a specific worker session, requeueing its current task as
+  // pending. Use to force-stop a misbehaving worker without resetting
+  // the whole task or cancelling the whole project.
+  private handleKill(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): void {
+    const rawWorkerId = args.split(/\s+/)[0]?.trim() ?? "";
+    if (!rawWorkerId) {
+      this.client.reply(reqId, {
+        text: "planner kill: usage `/hydra planner kill <workerId>`",
+      });
+      return;
+    }
+    // Accept short or full worker session id.
+    const workerId = rawWorkerId.startsWith("hydra_session_")
+      ? rawWorkerId
+      : `hydra_session_${rawWorkerId}`;
+
+    const orchestratorId = orchestratorOfWorker(workerId);
+    if (!orchestratorId) {
+      this.client.reply(reqId, {
+        text: `No active worker '${rawWorkerId}' tracked by planner.`,
+      });
+      return;
+    }
+    const board = boards.get(orchestratorId);
+    if (!board) {
+      this.client.reply(reqId, {
+        text: `Worker '${rawWorkerId}' has no board in memory (project may have been removed).`,
+      });
+      return;
+    }
+
+    // Find the task this worker is on (if any).
+    const task = board.tasks.find(
+      (t) => t.status === "assigned" && t.assignedTo === workerId,
+    );
+
+    // Close + clean up regardless of whether we found a task.
+    clearWorkerState(workerId);
+    unregisterWorker(workerId);
+    delete board.workers[workerId];
+    void this.closeWorker(workerId);
+
+    if (task) {
+      task.status = "pending";
+      task.assignedTo = null;
+      task.startedAt = null;
+      saveBoard(board, orchestratorId);
+      log.info(`killed worker ${workerId}; requeued ${task.id}`);
+      void this.emitSyntheticMessage(
+        orchestratorId,
+        `⨯ Worker ${shortSessionId(workerId)} killed; ${task.id} requeued.`,
+      );
+      void this.scheduleEligibleTasks(orchestratorId, board);
+      this.client.reply(reqId, {
+        text: `Killed worker ${shortSessionId(workerId)} and requeued ${task.id}.`,
+      });
+      return;
+    }
+
+    saveBoard(board, orchestratorId);
+    log.info(`killed worker ${workerId} (no in-flight task)`);
+    void this.emitSyntheticMessage(
+      orchestratorId,
+      `⨯ Worker ${shortSessionId(workerId)} killed.`,
+    );
+    this.client.reply(reqId, {
+      text: `Killed worker ${shortSessionId(workerId)}.`,
     });
   }
 
@@ -591,6 +940,8 @@ export class PlannerBridge {
     setOrchestratorState(sessionId, {
       projectId: board.projectId,
       decompositionAccumulator: "",
+      addAccumulator: "",
+      awaitingAdd: false,
       awaitingDecomposition: true,
     });
 
@@ -696,17 +1047,145 @@ export class PlannerBridge {
       method?: string;
       sessionId?: string;
       envelope?: unknown;
+      token?: string;
     };
     const sessionId = params.sessionId ?? "";
     const phase = params.phase ?? "";
     const method = params.method ?? "";
 
+    if (phase === "request" && method === "session/prompt") {
+      this.handlePromptRequest(
+        req.id,
+        sessionId,
+        params.envelope,
+        params.token ?? "",
+      );
+      return;
+    }
     if (phase === "response" && method === "session/update") {
       this.handleUpdateResponse(req.id, sessionId, params.envelope);
       return;
     }
     // Anything else we declared an interest in: pass through.
     this.client.reply(req.id, { action: "continue" });
+  }
+
+  // Inject board context into user prompts to the orchestrator agent.
+  // Only acts when:
+  //   - The session is one we have a board for in memory (i.e. an
+  //     orchestrator we're actively driving), AND
+  //   - The board has tasks (no point injecting an empty board).
+  //
+  // Pass through unchanged for: worker sessions, sessions with no
+  // board, decomposition-in-progress orchestrators (we already own the
+  // turn there), and slash-command prompts (filtered by hydra before
+  // the chain runs, but defensive).
+  //
+  // Uses the modify-and-continue pattern via `action: "processing"`:
+  // park the user's original request with the chain token, emit the
+  // rewritten prompt via route:"chain" and capture the agent's
+  // response, then discharge the parked claim with that response. The
+  // user's wire-level session/prompt stays in flight throughout — one
+  // prompt_received, one turn_complete, clean turn boundary for the
+  // TUI (vs. stop+emit which severs the boundary and confuses the
+  // TUI's echo flushing).
+  private handlePromptRequest(
+    reqId: number | string,
+    sessionId: string,
+    envelope: unknown,
+    token: string,
+  ): void {
+    const board = boards.get(sessionId);
+    if (!board || board.tasks.length === 0) {
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
+    const orchState = getOrchestratorState(sessionId);
+    if (orchState?.awaitingDecomposition) {
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
+
+    const params = (envelope as { params?: unknown })?.params ?? envelope;
+    const originalPrompt = (params as { prompt?: unknown })?.prompt;
+    const userText = extractPromptText(originalPrompt);
+    if (userText.startsWith("/hydra")) {
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
+
+    // Build the rewritten envelope: context preamble as a new leading
+    // text block, then everything the user actually sent.
+    const preamble = formatBoardContext(board);
+    const originalBlocks: Array<{ type?: string; text?: string }> = Array.isArray(
+      originalPrompt,
+    )
+      ? (originalPrompt as Array<{ type?: string; text?: string }>)
+      : [{ type: "text", text: typeof originalPrompt === "string" ? originalPrompt : "" }];
+    const rewrittenPrompt = [
+      { type: "text", text: preamble + "\n" },
+      ...originalBlocks,
+    ];
+    const rewrittenEnvelope: Record<string, unknown> = {
+      sessionId,
+      prompt: rewrittenPrompt,
+    };
+    const originalMeta = (params as { _meta?: unknown })?._meta;
+    if (originalMeta !== undefined) {
+      rewrittenEnvelope._meta = originalMeta;
+    }
+
+    // Park the original. The daemon now holds the user's session/prompt
+    // call open until we discharge `token`.
+    this.client.reply(reqId, { action: "processing" });
+
+    void (async () => {
+      try {
+        // Emit the rewritten prompt down the rest of the chain to the
+        // agent. With the daemon's chain-response support, this returns
+        // the agent's actual session/prompt response (containing
+        // stopReason etc.) — which is exactly what the user's parked
+        // call should resolve to.
+        const result = await this.client.request<{
+          ok: boolean;
+          response?: unknown;
+        }>("hydra-acp/message/emit", {
+          sessionId,
+          method: "session/prompt",
+          envelope: rewrittenEnvelope,
+          route: "chain",
+        });
+        const response = result?.response ?? { stopReason: "end_turn" };
+        // Discharge the parked claim with the agent's response. This
+        // resolves the daemon's pending forwardRequest, which returns
+        // up through runQueueEntry and triggers broadcastTurnComplete
+        // with the agent's actual stopReason.
+        await this.client.request("hydra-acp/message/emit", {
+          sessionId,
+          method: "session/prompt",
+          envelope: response,
+          respondsTo: token,
+        });
+      } catch (err) {
+        log.warn(
+          `context-injection turn for session …${sessionId.slice(-8)} failed: ${(err as Error).message}`,
+        );
+        // Best-effort: try to discharge with a synthetic stop so the
+        // user's call doesn't hang indefinitely. If discharge also
+        // fails, the daemon's claim timeout will eventually fail-open
+        // (resume the chain from after our position with the original
+        // envelope, which will then hit the agent unmodified — degraded
+        // but not broken).
+        await this.client
+          .request("hydra-acp/message/emit", {
+            sessionId,
+            method: "session/prompt",
+            envelope: { stopReason: "cancelled" },
+            respondsTo: token,
+          })
+          .catch(() => {});
+      }
+    })();
   }
 
   // Response-side session/update intercept. Demuxes on the embedded
@@ -729,7 +1208,23 @@ export class PlannerBridge {
         if (text.length > 0) {
           orchState.decompositionAccumulator += text;
         }
-        // Suppress: client never sees the raw JSON streaming by.
+        this.client.reply(reqId, { action: "stop" });
+        return;
+      }
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
+
+    // Same suppress+accumulate pattern for /hydra planner add. The
+    // agent's reply contains a hydra-add-task JSON block we'll parse
+    // when the turn completes; the user shouldn't see the raw JSON.
+    if (orchState && orchState.awaitingAdd) {
+      const kind = updateKind(envelope);
+      if (kind === "agent_message_chunk") {
+        const text = extractUpdateText(envelope);
+        if (text.length > 0) {
+          orchState.addAccumulator += text;
+        }
         this.client.reply(reqId, { action: "stop" });
         return;
       }

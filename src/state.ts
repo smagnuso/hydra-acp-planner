@@ -12,11 +12,18 @@ export interface OrchestratorState {
   // up as agent_message_chunk notifications stream past. Drained and
   // parsed when the turn completes.
   decompositionAccumulator: string;
-  // True between (request:session/prompt intercept for /plan ...) and
-  // the next response:session/prompt with our injected sub-prompt's
-  // result. While true, agent_message_chunk updates are suppressed from
-  // clients and accumulated instead.
+  // True between (commands/invoke for `create`) and the moment the
+  // injected decomposition sub-prompt's turn completes. While true,
+  // agent_message_chunk updates are suppressed from clients and
+  // accumulated instead.
   awaitingDecomposition: boolean;
+  // Accumulator + flag for `/hydra planner add <description>` sub-prompts.
+  // Same shape as decomposition — when the user explicitly asks to slot a
+  // new task into the DAG, the planner sends a sub-prompt asking the
+  // orchestrator agent for a hydra-add-task block. We accumulate the
+  // reply, parse it, then merge into the board.
+  addAccumulator: string;
+  awaitingAdd: boolean;
 }
 
 const sessionStates = new Map<string, OrchestratorState>();
@@ -95,9 +102,11 @@ export function rehydrate(orchestratorSessionByProject: Map<string, string>, boa
       decompositionAccumulator: "",
       // If we crashed mid-decomposition, the next agent reply will be
       // the resumption — but we don't know that until we see traffic.
-      // M5 (resurrection) revisits this; for M1, fresh boot = clean
+      // M5 (resurrection) revisits this; for now, fresh boot = clean
       // slate and any partial decomposition is lost.
       awaitingDecomposition: board.state === "decomposing",
+      addAccumulator: "",
+      awaitingAdd: false,
     });
     for (const workerId of Object.keys(board.workers)) {
       workerToOrchestrator.set(workerId, orchestratorSessionId);

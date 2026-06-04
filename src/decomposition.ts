@@ -1,4 +1,5 @@
-import type { Task } from "./board.js";
+import type { Board, Task } from "./board.js";
+import { formatBoardContext } from "./format.js";
 
 // The decomposition prompt is the single most product-defining piece of
 // text in the planner. It needs to elicit a JSON DAG that's executable
@@ -73,6 +74,154 @@ export function extractJsonBlock(text: string): unknown {
 export interface DecompositionResult {
   tasks: Task[];
   warnings: string[];
+}
+
+// Build the prompt sent to the orchestrator agent when the user invokes
+// `/hydra planner add <description>`. Gives the agent the current board
+// context plus the user's add request and asks for a fenced
+// hydra-add-task block describing one or more new tasks to slot into
+// the DAG. The agent is instructed not to modify existing tasks — only
+// to ADD.
+export function buildAddTaskPrompt(description: string, board: Board): string {
+  const existingIds = board.tasks.map((t) => t.id).join(", ");
+  const nextN = nextTaskNumber(board);
+  return [
+    `You are extending an in-flight multi-agent project plan. The user wants to add work to it.`,
+    ``,
+    `User's request:`,
+    `  "${description}"`,
+    ``,
+    formatBoardContext(board),
+    ``,
+    `Decide:`,
+    `  1. Does this add one task or several?`,
+    `  2. Where does it fit in the dependency graph? (\`deps\` may reference existing task ids: ${existingIds || "(none)"}.)`,
+    `  3. What id(s) to use? Continue the existing T-numbering — next free id is T${nextN}.`,
+    ``,
+    `Reply with ONLY a fenced JSON block — same task schema as the original decomposition (id, title, why, what, constraints, deps). Do NOT modify any existing task. Do NOT specify implementation mechanism (libraries, algorithms, file structure). Keep the WHAT/WHY/CONSTRAINTS discipline.`,
+    ``,
+    "```hydra-add-task",
+    `{`,
+    `  "tasks": [`,
+    `    { "id": "T${nextN}", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [] }`,
+    `  ]`,
+    `}`,
+    "```",
+  ].join("\n");
+}
+
+// Compute the next sequential task number for new tasks. Looks at all
+// existing task ids of the shape "T<n>" and returns max+1, defaulting
+// to 1 for empty boards.
+function nextTaskNumber(board: Board): number {
+  let max = 0;
+  for (const t of board.tasks) {
+    const m = t.id.match(/^T(\d+)$/);
+    if (m && m[1]) {
+      const n = Number.parseInt(m[1], 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max + 1;
+}
+
+// Pull a fenced ```hydra-add-task block from the agent's reply. Falls
+// back to any other fenced block so we still parse when the agent
+// ignores the label hint. Returns undefined if no parsable block found.
+export function extractAddTaskBlock(text: string): unknown {
+  const labelled = /```hydra-add-task\s*\n([\s\S]*?)\n```/;
+  const m = text.match(labelled);
+  if (m && m[1] !== undefined) {
+    try {
+      return JSON.parse(m[1]);
+    } catch {
+      // fall through
+    }
+  }
+  // Fallback: pick the LAST fenced block (instructions say end-of-message).
+  const fallback = /```(?:[a-zA-Z-]*)?\s*\n([\s\S]*?)\n```/g;
+  let last: string | undefined;
+  for (const match of text.matchAll(fallback)) {
+    if (match[1] !== undefined) last = match[1];
+  }
+  if (last === undefined) return undefined;
+  try {
+    return JSON.parse(last);
+  } catch {
+    return undefined;
+  }
+}
+
+// Normalize the agent's add-task emission. Like normalizeDecomposition
+// but with awareness of existing task ids — new tasks must NOT collide,
+// and their deps may reference existing OR newly-added tasks. Returns
+// the new tasks plus warnings.
+export function normalizeAddedTasks(
+  raw: unknown,
+  existingIds: Set<string>,
+): DecompositionResult | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const tasksRaw = (raw as { tasks?: unknown }).tasks;
+  if (!Array.isArray(tasksRaw) || tasksRaw.length === 0) return undefined;
+
+  const warnings: string[] = [];
+  const newIds = new Set<string>();
+  const tasks: Task[] = [];
+
+  for (const rawTask of tasksRaw) {
+    if (!rawTask || typeof rawTask !== "object") continue;
+    const t = rawTask as Record<string, unknown>;
+    const id = typeof t.id === "string" ? t.id.trim() : "";
+    const title = typeof t.title === "string" ? t.title.trim() : "";
+    if (!id) {
+      warnings.push(`skipped task with no id (title="${title}")`);
+      continue;
+    }
+    if (existingIds.has(id)) {
+      warnings.push(`skipped task ${id}: collides with an existing task id`);
+      continue;
+    }
+    if (newIds.has(id)) {
+      warnings.push(`skipped duplicate new task id ${id}`);
+      continue;
+    }
+    if (!title) {
+      warnings.push(`task ${id} has no title`);
+    }
+    const deps = Array.isArray(t.deps)
+      ? t.deps.filter((d): d is string => typeof d === "string")
+      : [];
+    newIds.add(id);
+    tasks.push({
+      id,
+      title: title || `Task ${id}`,
+      why: typeof t.why === "string" ? t.why : undefined,
+      what: typeof t.what === "string" ? t.what : undefined,
+      constraints: typeof t.constraints === "string" ? t.constraints : undefined,
+      deps,
+      agent: typeof t.agent === "string" ? t.agent : null,
+      model: typeof t.model === "string" ? t.model : null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+    });
+  }
+
+  // Drop deps that don't resolve to existing or newly-added tasks.
+  const allKnown = new Set([...existingIds, ...newIds]);
+  for (const t of tasks) {
+    const bad = t.deps.filter((d) => !allKnown.has(d));
+    if (bad.length > 0) {
+      warnings.push(`task ${t.id} had unknown deps: ${bad.join(", ")}`);
+      t.deps = t.deps.filter((d) => allKnown.has(d));
+    }
+  }
+
+  if (tasks.length === 0) return undefined;
+  return { tasks, warnings };
 }
 
 // Validate and normalize the parsed JSON into Task records. The agent

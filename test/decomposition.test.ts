@@ -1,13 +1,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildAddTaskPrompt,
   buildDecompositionPrompt,
+  extractAddTaskBlock,
   extractJsonBlock,
   formatPlanSummary,
+  normalizeAddedTasks,
   normalizeDecomposition,
   sweepLineConcurrencyCap,
 } from "../src/decomposition.ts";
-import type { Task } from "../src/board.ts";
+import type { Board, Task } from "../src/board.ts";
 
 // ─── prompt builder ──────────────────────────────────────────────────────
 
@@ -202,6 +205,145 @@ describe("sweepLineConcurrencyCap", () => {
 });
 
 // ─── formatPlanSummary ───────────────────────────────────────────────────
+
+// ─── buildAddTaskPrompt + extractAddTaskBlock + normalizeAddedTasks ──────
+
+function board(tasks: Task[]): Board {
+  return {
+    version: 1,
+    projectId: "hydra_plan_t",
+    description: "test",
+    state: "running",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    fleetDefaults: { agent: null, model: null },
+    tasks,
+    workers: {},
+    concurrencyCap: 1,
+  };
+}
+
+describe("buildAddTaskPrompt", () => {
+  it("embeds the user's add description", () => {
+    const p = buildAddTaskPrompt("rate limiting on login", board([]));
+    assert.match(p, /rate limiting on login/);
+  });
+
+  it("suggests the next free T-number", () => {
+    const p = buildAddTaskPrompt("anything", board([task("T1"), task("T2"), task("T3")]));
+    assert.match(p, /next free id is T4/);
+  });
+
+  it("starts T-numbering at T1 for empty boards", () => {
+    const p = buildAddTaskPrompt("first task", board([]));
+    assert.match(p, /next free id is T1/);
+  });
+
+  it("includes existing task ids in the deps hint", () => {
+    const p = buildAddTaskPrompt("x", board([task("T1"), task("T2")]));
+    assert.match(p, /existing task ids: T1, T2/);
+  });
+
+  it("asks for a fenced hydra-add-task block", () => {
+    const p = buildAddTaskPrompt("x", board([]));
+    assert.match(p, /```hydra-add-task/);
+  });
+
+  it("warns the agent not to specify HOW", () => {
+    const p = buildAddTaskPrompt("x", board([]));
+    assert.match(p, /Do NOT specify implementation mechanism/);
+  });
+});
+
+describe("extractAddTaskBlock", () => {
+  it("returns parsed JSON for a labelled hydra-add-task block", () => {
+    const text = "ok\n```hydra-add-task\n{\"tasks\":[{\"id\":\"T8\"}]}\n```";
+    const r = extractAddTaskBlock(text) as { tasks: Array<{ id: string }> };
+    assert.equal(r.tasks[0]?.id, "T8");
+  });
+
+  it("falls back to plain ```json block", () => {
+    const text = "no label this time\n```json\n{\"tasks\":[]}\n```";
+    const r = extractAddTaskBlock(text) as { tasks: unknown[] };
+    assert.deepEqual(r.tasks, []);
+  });
+
+  it("picks the LAST block when multiple unlabelled ones exist", () => {
+    const text =
+      "first\n```\n{\"tasks\":[{\"id\":\"first\"}]}\n```\nlast\n```\n{\"tasks\":[{\"id\":\"last\"}]}\n```";
+    const r = extractAddTaskBlock(text) as { tasks: Array<{ id: string }> };
+    assert.equal(r.tasks[0]?.id, "last");
+  });
+
+  it("returns undefined when there's no parseable block", () => {
+    assert.equal(extractAddTaskBlock("just prose"), undefined);
+    assert.equal(extractAddTaskBlock("```hydra-add-task\nnot valid\n```"), undefined);
+  });
+});
+
+describe("normalizeAddedTasks", () => {
+  it("returns tasks not colliding with existing ids", () => {
+    const r = normalizeAddedTasks(
+      { tasks: [{ id: "T3", title: "new" }] },
+      new Set(["T1", "T2"]),
+    );
+    assert.ok(r);
+    assert.equal(r!.tasks.length, 1);
+    assert.equal(r!.tasks[0]!.id, "T3");
+  });
+
+  it("drops new tasks that collide with existing ids and warns", () => {
+    const r = normalizeAddedTasks(
+      { tasks: [{ id: "T1", title: "collision" }] },
+      new Set(["T1", "T2"]),
+    );
+    assert.equal(r, undefined); // all dropped
+  });
+
+  it("drops duplicate new ids within the same emission", () => {
+    const r = normalizeAddedTasks(
+      {
+        tasks: [
+          { id: "T3", title: "first" },
+          { id: "T3", title: "dup" },
+        ],
+      },
+      new Set(["T1"]),
+    );
+    assert.equal(r!.tasks.length, 1);
+    assert.match(r!.warnings.join(" "), /duplicate/);
+  });
+
+  it("allows deps referring to existing or new tasks", () => {
+    const r = normalizeAddedTasks(
+      {
+        tasks: [
+          { id: "T3", title: "a", deps: ["T1"] },
+          { id: "T4", title: "b", deps: ["T3"] },
+        ],
+      },
+      new Set(["T1", "T2"]),
+    );
+    assert.deepEqual(r!.tasks[0]!.deps, ["T1"]);
+    assert.deepEqual(r!.tasks[1]!.deps, ["T3"]);
+    assert.equal(r!.warnings.length, 0);
+  });
+
+  it("strips deps that don't resolve", () => {
+    const r = normalizeAddedTasks(
+      { tasks: [{ id: "T3", title: "a", deps: ["T1", "Tnope"] }] },
+      new Set(["T1"]),
+    );
+    assert.deepEqual(r!.tasks[0]!.deps, ["T1"]);
+    assert.match(r!.warnings.join(" "), /unknown deps: Tnope/);
+  });
+
+  it("returns undefined for empty/non-array tasks", () => {
+    assert.equal(normalizeAddedTasks({}, new Set()), undefined);
+    assert.equal(normalizeAddedTasks({ tasks: [] }, new Set()), undefined);
+    assert.equal(normalizeAddedTasks(null, new Set()), undefined);
+  });
+});
 
 describe("formatPlanSummary", () => {
   it("renders task count, cap, and each task line", () => {
