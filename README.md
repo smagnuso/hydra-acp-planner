@@ -107,7 +107,7 @@ npm run build
 If installed via npm:
 
 ```sh
-hydra-acp transformer add hydra-acp-planner --command hydra-acp-planner
+hydra-acp transformer add hydra-acp-planner
 hydra-acp daemon restart
 ```
 
