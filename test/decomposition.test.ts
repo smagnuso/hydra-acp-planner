@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
+  buildExecuteDecompositionPrompt,
   buildResumeDecompositionPrompt,
   extractAddTaskBlock,
   extractJsonBlock,
@@ -57,6 +58,33 @@ describe("buildDecompositionPrompt", () => {
     assert.match(p, /Available specialist agents/);
     assert.match(p, /code-claude — Claude coding agent/);
     assert.match(p, /code-codex/);
+  });
+});
+
+describe("buildExecuteDecompositionPrompt", () => {
+  it("instructs the agent to decompose what was discussed in this conversation", () => {
+    const p = buildExecuteDecompositionPrompt();
+    assert.match(p, /discussing a software project/);
+    assert.match(p, /Decompose THAT project/);
+  });
+
+  it("asks for a top-level description field in the JSON", () => {
+    const p = buildExecuteDecompositionPrompt();
+    assert.match(p, /"description": "\.\.\."/);
+    assert.match(p, /summary of the project/);
+  });
+
+  it("carries the agent-list block when one is provided", () => {
+    const p = buildExecuteDecompositionPrompt([
+      { id: "code-claude", description: "Claude" },
+    ]);
+    assert.match(p, /Available specialist agents/);
+    assert.match(p, /code-claude/);
+  });
+
+  it("omits the agent-list block when none provided", () => {
+    const p = buildExecuteDecompositionPrompt();
+    assert.doesNotMatch(p, /Available specialist agents/);
   });
 });
 
@@ -144,6 +172,23 @@ describe("normalizeDecomposition", () => {
     });
     assert.equal(got!.tasks[0]!.model, "opus-4-7");
     assert.equal(got!.tasks[1]!.model, null);
+  });
+
+  it("surfaces a top-level description (trimmed) when present", () => {
+    const got = normalizeDecomposition({
+      description: "  build a todo app  ",
+      tasks: [{ id: "T1", title: "ok", deps: [] }],
+    });
+    assert.equal(got!.description, "build a todo app");
+  });
+
+  it("leaves description undefined when missing, blank, or non-string", () => {
+    const a = normalizeDecomposition({ tasks: [{ id: "T1", title: "ok" }] });
+    assert.equal(a!.description, undefined);
+    const b = normalizeDecomposition({ description: "   ", tasks: [{ id: "T1", title: "ok" }] });
+    assert.equal(b!.description, undefined);
+    const c = normalizeDecomposition({ description: 42, tasks: [{ id: "T1", title: "ok" }] });
+    assert.equal(c!.description, undefined);
   });
 
   it("drops duplicate ids (keeps first)", () => {

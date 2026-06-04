@@ -51,6 +51,7 @@ import { projectDir } from "./paths.js";
 import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
+  buildExecuteDecompositionPrompt,
   buildResumeDecompositionPrompt,
   type AgentChoice,
   extractAddTaskBlock,
@@ -138,6 +139,11 @@ const COMMANDS = [
     verb: "kill",
     argsHint: "<workerId>",
     description: "Close a specific worker session. Requeues its current task as pending.",
+  },
+  {
+    verb: "execute",
+    argsHint: "[--workers N] [--agent ID] [--model ID]",
+    description: "Plan from the conversation so far. Asks the orchestrator agent to decompose what you've been discussing into a task DAG and spawns workers.",
   },
   {
     verb: "pause",
@@ -560,6 +566,15 @@ export class PlannerBridge {
         log.error(`handleCreate threw: ${(err as Error).message}`);
         // The slash command's commands/invoke is still pending —
         // dispatch a reply so it doesn't hang forever.
+        this.client.reply(req.id, {
+          text: `⚠️ Internal error: ${(err as Error).message}`,
+        });
+      });
+      return;
+    }
+    if (verb === "execute") {
+      void this.handleExecute(req.id, sessionId, args).catch((err) => {
+        log.error(`handleExecute threw: ${(err as Error).message}`);
         this.client.reply(req.id, {
           text: `⚠️ Internal error: ${(err as Error).message}`,
         });
@@ -1390,6 +1405,162 @@ export class PlannerBridge {
     this.client.reply(reqId, { text: "" });
   }
 
+  // Conversation-driven planning: instead of taking a description
+  // string, asks the orchestrator agent to decompose the project the
+  // user has been discussing with it in the current conversation. The
+  // board's `description` is seeded with a placeholder and overwritten
+  // from the agent's JSON response (which carries a `description`
+  // field per buildExecuteDecompositionPrompt).
+  private async handleExecute(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): Promise<void> {
+    if (!sessionId) {
+      this.client.reply(reqId, { text: "planner execute: missing sessionId" });
+      return;
+    }
+    if (getOrchestratorState(sessionId)?.awaitingDecomposition) {
+      this.client.reply(reqId, {
+        text: "planner execute: a decomposition is already in flight for this session — wait for it to finish.",
+      });
+      return;
+    }
+    const existing = boards.get(sessionId);
+    if (existing && existing.state !== "done" && existing.state !== "failed") {
+      this.client.reply(reqId, {
+        text: `planner execute: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner cancel\` or \`/hydra planner remove\` it first, or run execute from a different session.`,
+      });
+      return;
+    }
+
+    // Parse fleet-override flags. Unlike `create`, anything remaining
+    // after flag parsing is an error — there's no description string
+    // here, the conversation is the input.
+    let argsRemaining = args;
+    let fleetWorkers: number | undefined;
+    let fleetAgent: string | null = null;
+    let fleetModel: string | null = null;
+    const flagRe = /^--(workers|agent|model)\s+(\S+)\s*/;
+    while (true) {
+      const m = argsRemaining.match(flagRe);
+      if (!m) break;
+      const [, key, value] = m as unknown as [string, string, string];
+      if (key === "workers") {
+        const n = Number.parseInt(value, 10);
+        if (Number.isFinite(n) && n > 0) fleetWorkers = n;
+      } else if (key === "agent") {
+        fleetAgent = value;
+      } else if (key === "model") {
+        fleetModel = value;
+      }
+      argsRemaining = argsRemaining.slice(m[0].length);
+    }
+    if (argsRemaining.trim().length > 0) {
+      this.client.reply(reqId, {
+        text: `planner execute: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner execute [--workers N] [--agent ID] [--model ID]\` (no description — uses the conversation).`,
+      });
+      return;
+    }
+    if (fleetAgent) {
+      const choices = await this.ensureAgentChoices();
+      const known = (choices ?? []).some((a) => a.id === fleetAgent);
+      if (!known) {
+        log.warn(`--agent "${fleetAgent}" not in installed agent list; workers will spawn with default unless a per-task agent is set`);
+      }
+    }
+
+    const board = newBoard({
+      description: "(from conversation)",
+      concurrencyCap: fleetWorkers,
+      fleetDefaults: { agent: fleetAgent, model: fleetModel },
+    });
+    boards.set(sessionId, board);
+    saveBoard(board, sessionId);
+    setOrchestratorState(sessionId, {
+      projectId: board.projectId,
+      decompositionAccumulator: "",
+      addAccumulator: "",
+      awaitingAdd: false,
+      awaitingDecomposition: true,
+    });
+
+    log.info(
+      `executing project ${board.projectId} for session …${sessionId.slice(-8)} (from conversation)` +
+        (fleetWorkers ? ` [workers=${fleetWorkers}]` : "") +
+        (fleetAgent ? ` [agent=${fleetAgent}]` : "") +
+        (fleetModel ? ` [model=${fleetModel}]` : ""),
+    );
+
+    await this.emitSyntheticMessage(
+      sessionId,
+      `🧩 Planning project ${shortProjectId(board.projectId)} from this conversation — asking the agent to decompose.`,
+    );
+
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      if (this.isShutdownError(err)) {
+        log.info(`execute aborted (shutdown) for ${board.projectId}; board left as is`);
+        this.client.reply(reqId, { text: "" });
+        return;
+      }
+      log.error(
+        `transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
+      );
+      board.state = "failed";
+      saveBoard(board, sessionId);
+      const errState = getOrchestratorState(sessionId);
+      if (errState) errState.awaitingDecomposition = false;
+      await this.emitSyntheticMessage(
+        sessionId,
+        `⚠️ Could not attach to this session: ${(err as Error).message}`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
+
+    try {
+      await this.client.request("hydra-acp/message/emit", {
+        sessionId,
+        method: "session/prompt",
+        envelope: buildTextPromptEnvelope({
+          sessionId,
+          text: buildExecuteDecompositionPrompt(await this.ensureAgentChoices()),
+        }),
+        route: "chain",
+      });
+    } catch (err) {
+      if (this.isShutdownError(err)) {
+        log.info(
+          `decomposition aborted (shutdown) for ${board.projectId}; left as decomposing for resume`,
+        );
+        this.client.reply(reqId, { text: "" });
+        return;
+      }
+      log.error(
+        `decomposition turn failed for ${board.projectId}: ${(err as Error).message}`,
+      );
+      const failedState = getOrchestratorState(sessionId);
+      if (failedState) failedState.awaitingDecomposition = false;
+      board.state = "failed";
+      saveBoard(board, sessionId);
+      await this.emitSyntheticMessage(
+        sessionId,
+        `⚠️ Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
+
+    const doneState = getOrchestratorState(sessionId);
+    if (doneState && doneState.awaitingDecomposition) {
+      this.finishDecomposition(sessionId, doneState);
+    }
+    this.client.reply(reqId, { text: "" });
+  }
+
   // ── Transformer message intercepts ─────────────────────────────────
 
   private handleTransformerMessage(req: JsonRpcRequest): void {
@@ -1636,6 +1807,14 @@ export class PlannerBridge {
     board.tasks = result.tasks;
     if (!board.concurrencyCapLocked) {
       board.concurrencyCap = sweepLineConcurrencyCap(result.tasks);
+    }
+    // `execute` seeds the board with a placeholder description and
+    // asks the agent to summarize the conversation-driven project in
+    // its response. When that summary comes back, replace the
+    // placeholder so /status and the context preamble show something
+    // meaningful.
+    if (result.description) {
+      board.description = result.description;
     }
     board.state = "running";
     saveBoard(board, sessionId);

@@ -79,6 +79,35 @@ export function buildDecompositionPrompt(
   return `${DECOMPOSITION_SYSTEM}${tail}\n\nProject to decompose:\n${description}`;
 }
 
+// Variant of buildDecompositionPrompt used by `/hydra planner execute`:
+// instead of taking a verbatim project description, asks the agent to
+// decompose the project it has been discussing with the user in the
+// current conversation, and to include a `description` field
+// summarizing that project in the response. The board's description
+// field is filled in from that summary after parsing.
+export function buildExecuteDecompositionPrompt(
+  agents?: AgentChoice[],
+): string {
+  const agentsBlock = formatAgentChoices(agents);
+  const tail = agentsBlock ? `\n\n${agentsBlock}` : "";
+  return [
+    `${DECOMPOSITION_SYSTEM}${tail}`,
+    ``,
+    `You and the user have been discussing a software project in this conversation. Decompose THAT project — what you have been planning together — into the task DAG.`,
+    ``,
+    `Additionally, include a top-level "description" field in the JSON block: a one-sentence summary of the project we've been planning, suitable for showing alongside the project id in status displays.`,
+    ``,
+    "```json",
+    `{`,
+    `  "description": "...",`,
+    `  "tasks": [`,
+    `    { "id": "T1", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null }`,
+    `  ]`,
+    `}`,
+    "```",
+  ].join("\n");
+}
+
 // Prompt sent on planner startup when a project board was in the
 // `decomposing` state at the time of the last shutdown. Hydra
 // auto-resurrects the orchestrator session and seeds the prior
@@ -127,6 +156,11 @@ export function extractJsonBlock(text: string): unknown {
 export interface DecompositionResult {
   tasks: Task[];
   warnings: string[];
+  // Optional summary of the project the agent decomposed. Populated only
+  // by the `execute` path, where the user didn't supply a description
+  // up front — the agent emits one in the JSON block and we use it as
+  // the board's description.
+  description?: string;
 }
 
 // Build the prompt sent to the orchestrator agent when the user invokes
@@ -346,7 +380,12 @@ export function normalizeDecomposition(raw: unknown): DecompositionResult | unde
   }
 
   if (tasks.length === 0) return undefined;
-  return { tasks, warnings };
+  const rawDesc = (raw as { description?: unknown }).description;
+  const description =
+    typeof rawDesc === "string" && rawDesc.trim().length > 0
+      ? rawDesc.trim()
+      : undefined;
+  return { tasks, warnings, ...(description ? { description } : {}) };
 }
 
 // Compute the maximum number of tasks that can run concurrently at any
