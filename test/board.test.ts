@@ -4,11 +4,17 @@ import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync } from "nod
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
+  allTerminal,
+  canonicalProjectId,
   listProjects,
   loadBoard,
   newBoard,
   newProjectId,
+  pickEligible,
   saveBoard,
+  shortProjectId,
+  type Board,
+  type Task,
 } from "../src/board.ts";
 
 // board.ts derives all paths from $HOME/.hydra-acp/planner — to avoid
@@ -30,14 +36,44 @@ afterEach(() => {
 });
 
 describe("newProjectId", () => {
-  it("produces a proj_-prefixed identifier", () => {
+  it("produces a hydra_plan_-prefixed identifier", () => {
     const id = newProjectId();
-    assert.match(id, /^proj_[0-9a-f]+$/);
+    assert.match(id, /^hydra_plan_[0-9a-f]+$/);
   });
 
   it("returns distinct ids", () => {
     const ids = new Set(Array.from({ length: 50 }, () => newProjectId()));
     assert.equal(ids.size, 50);
+  });
+});
+
+describe("canonicalProjectId", () => {
+  it("leaves a fully-prefixed id alone", () => {
+    assert.equal(canonicalProjectId("hydra_plan_abc123"), "hydra_plan_abc123");
+  });
+
+  it("prepends the prefix to a bare suffix", () => {
+    assert.equal(canonicalProjectId("abc123"), "hydra_plan_abc123");
+  });
+
+  it("does not double-prefix when called twice", () => {
+    const once = canonicalProjectId("abc");
+    assert.equal(canonicalProjectId(once), once);
+  });
+});
+
+describe("shortProjectId", () => {
+  it("strips the prefix when present", () => {
+    assert.equal(shortProjectId("hydra_plan_abc123"), "abc123");
+  });
+
+  it("leaves a bare id alone", () => {
+    assert.equal(shortProjectId("abc123"), "abc123");
+  });
+
+  it("is the inverse of canonicalProjectId", () => {
+    assert.equal(shortProjectId(canonicalProjectId("xyz")), "xyz");
+    assert.equal(canonicalProjectId(shortProjectId("hydra_plan_xyz")), "hydra_plan_xyz");
   });
 });
 
@@ -97,7 +133,7 @@ describe("saveBoard / loadBoard", () => {
   });
 
   it("returns undefined for an unknown projectId", () => {
-    assert.equal(loadBoard("proj_nonexistent"), undefined);
+    assert.equal(loadBoard("hydra_plan_nonexistent"), undefined);
   });
 
   it("is crash-safe — partial temp files don't break loadBoard", () => {
@@ -112,6 +148,133 @@ describe("saveBoard / loadBoard", () => {
     writeFileSync(join(projDir, "board.json.tmp.99999"), "garbage");
     const loaded = loadBoard(b.projectId);
     assert.ok(loaded);
+  });
+});
+
+describe("pickEligible", () => {
+  function makeTask(id: string, opts: Partial<Task> = {}): Task {
+    return {
+      id,
+      title: id,
+      deps: opts.deps ?? [],
+      status: opts.status ?? "pending",
+      attemptCount: 0,
+      ...opts,
+    };
+  }
+  function makeBoard(tasks: Task[]): Board {
+    return {
+      version: 1,
+      projectId: "proj_pe",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks,
+      workers: {},
+      concurrencyCap: 1,
+    };
+  }
+
+  it("returns undefined for an empty board", () => {
+    assert.equal(pickEligible(makeBoard([])), undefined);
+  });
+
+  it("returns the first pending task with no deps", () => {
+    const b = makeBoard([makeTask("T1"), makeTask("T2")]);
+    assert.equal(pickEligible(b)?.id, "T1");
+  });
+
+  it("skips tasks whose deps aren't all done", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "assigned" }),
+      makeTask("T2", { deps: ["T1"] }),
+    ]);
+    assert.equal(pickEligible(b), undefined);
+  });
+
+  it("returns the dependent once its prereq is done", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "done" }),
+      makeTask("T2", { deps: ["T1"] }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "T2");
+  });
+
+  it("returns the first eligible by declaration order, not by dep-depth", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "done" }),
+      makeTask("T2", { status: "done" }),
+      makeTask("T3", { deps: ["T1", "T2"] }),
+      makeTask("T4"),
+    ]);
+    // Both T3 and T4 are eligible; T3 wins on declaration order.
+    assert.equal(pickEligible(b)?.id, "T3");
+  });
+
+  it("skips assigned, done, failed, blocked", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "done" }),
+      makeTask("T2", { status: "assigned" }),
+      makeTask("T3", { status: "failed" }),
+      makeTask("T4", { status: "blocked" }),
+      makeTask("T5", { status: "pending" }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "T5");
+  });
+});
+
+describe("allTerminal", () => {
+  function makeTask(id: string, status: Task["status"]): Task {
+    return { id, title: id, deps: [], status, attemptCount: 0 };
+  }
+  function makeBoard(tasks: Task[]): Board {
+    return {
+      version: 1,
+      projectId: "proj_at",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks,
+      workers: {},
+      concurrencyCap: 1,
+    };
+  }
+
+  it("returns false for empty board", () => {
+    assert.equal(allTerminal(makeBoard([])), false);
+  });
+
+  it("returns true when every task is done", () => {
+    assert.equal(
+      allTerminal(makeBoard([makeTask("T1", "done"), makeTask("T2", "done")])),
+      true,
+    );
+  });
+
+  it("returns true when mix of done and failed", () => {
+    assert.equal(
+      allTerminal(makeBoard([makeTask("T1", "done"), makeTask("T2", "failed")])),
+      true,
+    );
+  });
+
+  it("returns false when any task is pending/assigned/blocked", () => {
+    assert.equal(
+      allTerminal(makeBoard([makeTask("T1", "done"), makeTask("T2", "pending")])),
+      false,
+    );
+    assert.equal(
+      allTerminal(makeBoard([makeTask("T1", "done"), makeTask("T2", "assigned")])),
+      false,
+    );
+    assert.equal(
+      allTerminal(makeBoard([makeTask("T1", "done"), makeTask("T2", "blocked")])),
+      false,
+    );
   });
 });
 

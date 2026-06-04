@@ -51,12 +51,32 @@ export interface Board {
   concurrencyCap: number;
 }
 
-// Project identifiers prefix with `proj_` so they sort/scan distinct
-// from session ids (`hydra_session_…`). A short random suffix avoids
-// human-name collisions; we don't slugify the description because the
-// description may contain anything and slugification is lossy.
+export const PROJECT_ID_PREFIX = "hydra_plan_";
+
+// Project identifiers prefix with `hydra_plan_` to match the sibling
+// `hydra_session_` convention. A short random suffix avoids human-name
+// collisions; we don't slugify the description because the description
+// may contain anything and slugification is lossy.
 export function newProjectId(): string {
-  return `proj_${randomBytes(6).toString("hex")}`;
+  return `${PROJECT_ID_PREFIX}${randomBytes(6).toString("hex")}`;
+}
+
+// Accept either the full id (`hydra_plan_abc123`) or the bare suffix
+// (`abc123`) and return the full form. Mirrors how `hydra-acp session
+// <id>` accepts both forms.
+export function canonicalProjectId(input: string): string {
+  return input.startsWith(PROJECT_ID_PREFIX)
+    ? input
+    : `${PROJECT_ID_PREFIX}${input}`;
+}
+
+// Render a project id for user-visible output (CLI lists, agent
+// messages) by stripping the prefix. Symmetric with hydra's session
+// listings which show the short form.
+export function shortProjectId(id: string): string {
+  return id.startsWith(PROJECT_ID_PREFIX)
+    ? id.slice(PROJECT_ID_PREFIX.length)
+    : id;
 }
 
 export function nowIso(): string {
@@ -124,6 +144,28 @@ export interface ProjectIndexEntry {
 // CLI `list` verb and by transformer cold-start recovery. Returns
 // nothing about archived projects — those live under archive/ and have
 // their own walk routine when needed.
+// Pick the next task that's ready to be assigned: status === "pending"
+// AND every dep is "done". Returns undefined when nothing is eligible
+// (could be because everything's done, blocked, or in flight). Walks in
+// declaration order — first eligible wins, which is deterministic.
+export function pickEligible(board: Board): Task | undefined {
+  const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+  for (const task of board.tasks) {
+    if (task.status !== "pending") continue;
+    const blocked = task.deps.some((d) => byId.get(d)?.status !== "done");
+    if (blocked) continue;
+    return task;
+  }
+  return undefined;
+}
+
+// All tasks are terminal (done or failed). Used to decide when to emit
+// the project-complete message and (M3+) to stop spawning workers.
+export function allTerminal(board: Board): boolean {
+  if (board.tasks.length === 0) return false;
+  return board.tasks.every((t) => t.status === "done" || t.status === "failed");
+}
+
 export function listProjects(): ProjectIndexEntry[] {
   const dir = projectsDir();
   let entries: string[] = [];

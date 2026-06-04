@@ -22,9 +22,35 @@ export interface OrchestratorState {
 const sessionStates = new Map<string, OrchestratorState>();
 
 // Mirror map for workers → their orchestrator. Populated when workers
-// are spawned (M2+); currently unused but defined here so cold-start
-// recovery has a single place to seed both maps.
+// are spawned by the planner; consulted by the response intercept to
+// route incoming chunks to the right per-worker accumulator.
 const workerToOrchestrator = new Map<string, string>();
+
+// Per-worker in-memory state. A worker exists between
+// `assignNextTask(...)` and `handleTaskComplete(...)`. We accumulate the
+// agent's reply chunks here and parse the structured hydra-result block
+// once the message/emit promise resolves (end of turn).
+export interface WorkerState {
+  orchestratorSessionId: string;
+  taskId: string;
+  // Reply text accumulated from agent_message_chunk intercepts. Drained
+  // when handleTaskComplete fires.
+  resultAccumulator: string;
+}
+
+const workerStates = new Map<string, WorkerState>();
+
+export function getWorkerState(workerSessionId: string): WorkerState | undefined {
+  return workerStates.get(workerSessionId);
+}
+
+export function setWorkerState(workerSessionId: string, state: WorkerState): void {
+  workerStates.set(workerSessionId, state);
+}
+
+export function clearWorkerState(workerSessionId: string): void {
+  workerStates.delete(workerSessionId);
+}
 
 export function getOrchestratorState(sessionId: string): OrchestratorState | undefined {
   return sessionStates.get(sessionId);

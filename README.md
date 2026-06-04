@@ -96,7 +96,8 @@ Then in any hydra-acp session:
 
 ```text
 hydra-acp planner                     # default: list projects (TODO M3.5)
-hydra-acp planner show <id>           # board summary (TODO M3.5)
+hydra-acp planner info <id>           # board summary
+hydra-acp planner remove <id>         # delete a project (closes worker sessions)
 hydra-acp planner --version
 hydra-acp planner --help
 ```
@@ -115,7 +116,7 @@ This release ships:
   project, drives decomposition, persists board.json.
 - ✅ Plan summary surfaced in transcript via synthetic
   agent_message_chunk.
-- ✅ CLI: `hydra-acp planner` (list), `hydra-acp planner show <id>`.
+- ✅ CLI: `hydra-acp planner` (list), `hydra-acp planner info <id>`, `hydra-acp planner remove <id>`.
 - ⏳ Worker spawning, dependency-aware scheduling (M2+).
 - ⏳ Status / mutation slash commands: `/hydra planner status`,
   `/hydra planner add`, etc.

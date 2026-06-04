@@ -5,10 +5,17 @@
 // M1 ships `list` and `show` reading directly from disk — no daemon
 // roundtrip required, works even when the daemon is down.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { listProjects, loadBoard } from "./board.js";
+import { spawnSync } from "node:child_process";
+import {
+  canonicalProjectId,
+  listProjects,
+  loadBoard,
+  shortProjectId,
+} from "./board.js";
+import { projectDir } from "./paths.js";
 
 function readVersion(): string {
   try {
@@ -29,7 +36,8 @@ function printHelp(): void {
       "",
       "Usage:",
       "  hydra-acp planner [list]              List active projects",
-      "  hydra-acp planner show <projectId>    Show one project's board",
+      "  hydra-acp planner info <projectId>    Show one project's board",
+      "  hydra-acp planner remove <projectId>  Delete a project (closes worker sessions; orchestrator session untouched)",
       "  hydra-acp planner --version",
       "  hydra-acp planner --help",
       "",
@@ -72,9 +80,10 @@ function runList(argv: readonly string[]): void {
     );
     return;
   }
-  // Compact, scannable. Columns: projectId, state, tasks-done/total,
-  // age, description (truncated).
-  const idW = Math.max(10, ...projects.map((p) => p.projectId.length));
+  // Compact, scannable. Columns: short projectId, state, tasks-done/total,
+  // age, description (truncated). Prefix is stripped for display; the
+  // full id can be re-derived from the bare suffix in CLI args.
+  const idW = Math.max(10, ...projects.map((p) => shortProjectId(p.projectId).length));
   const stateW = Math.max(8, ...projects.map((p) => p.state.length));
   const header = `${"PROJECTID".padEnd(idW)}  ${"STATE".padEnd(stateW)}  TASKS  AGE   DESCRIPTION`;
   process.stdout.write(header + "\n");
@@ -85,26 +94,27 @@ function runList(argv: readonly string[]): void {
       ? p.description.slice(0, 57) + "..."
       : p.description;
     process.stdout.write(
-      `${p.projectId.padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${desc}\n`,
+      `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${desc}\n`,
     );
   }
 }
 
-function runShow(projectId: string | undefined, argv: readonly string[]): void {
+function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   if (!projectId) {
-    process.stderr.write("hydra-acp-planner show: requires a projectId\n");
+    process.stderr.write("hydra-acp-planner info: requires a projectId\n");
     process.exit(2);
   }
-  const board = loadBoard(projectId);
+  const canonical = canonicalProjectId(projectId);
+  const board = loadBoard(canonical);
   if (!board) {
-    process.stderr.write(`hydra-acp-planner show: no project '${projectId}'\n`);
+    process.stderr.write(`hydra-acp-planner info: no project '${projectId}'\n`);
     process.exit(1);
   }
   if (argv.includes("--json")) {
     process.stdout.write(JSON.stringify(board, null, 2) + "\n");
     return;
   }
-  process.stdout.write(`${board.projectId}  (${board.state})\n`);
+  process.stdout.write(`${shortProjectId(board.projectId)}  (${board.state})\n`);
   process.stdout.write(`${board.description}\n\n`);
   process.stdout.write(
     `Tasks: ${board.tasks.length} total, ${board.tasks.filter((t) => t.status === "done").length} done, ${board.tasks.filter((t) => t.status === "assigned").length} in flight\n`,
@@ -122,6 +132,27 @@ function runShow(projectId: string | undefined, argv: readonly string[]): void {
       `  ${t.id.padEnd(idW)}  ${t.status.padEnd(stateW)}  ${t.title}${deps}\n`,
     );
   }
+}
+
+function runRemove(projectId: string | undefined): void {
+  if (!projectId) {
+    process.stderr.write("hydra-acp-planner remove: requires a projectId\n");
+    process.exit(2);
+  }
+  const canonical = canonicalProjectId(projectId);
+  const board = loadBoard(canonical);
+  if (!board) {
+    process.stderr.write(`hydra-acp-planner remove: no project '${projectId}'\n`);
+    process.exit(1);
+  }
+  // Close each worker session via the daemon CLI. Best-effort —
+  // if a worker is already gone we still want to drop the planner record.
+  for (const workerId of Object.keys(board.workers)) {
+    spawnSync("hydra-acp", ["session", "remove", workerId], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+  }
+  rmSync(projectDir(canonical), { recursive: true, force: true });
 }
 
 export function runCli(argv: readonly string[]): void {
@@ -150,8 +181,12 @@ export function runCli(argv: readonly string[]): void {
     runList(rest);
     return;
   }
-  if (sub === "show") {
-    runShow(rest[0], rest.slice(1));
+  if (sub === "info") {
+    runInfo(rest[0], rest.slice(1));
+    return;
+  }
+  if (sub === "remove") {
+    runRemove(rest[0]);
     return;
   }
   if (
@@ -159,8 +194,7 @@ export function runCli(argv: readonly string[]): void {
     sub === "attach" ||
     sub === "export" ||
     sub === "import" ||
-    sub === "archive" ||
-    sub === "remove"
+    sub === "archive"
   ) {
     process.stderr.write(
       `hydra-acp-planner: '${sub}' is not implemented yet (planned for later milestone)\n`,
