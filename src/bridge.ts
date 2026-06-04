@@ -306,10 +306,15 @@ export class PlannerBridge {
     }
     let activeBoards = 0;
 
+    // Group non-terminal boards by their owning orchestrator session
+    // and pick a single canonical board per orchestrator (newest by
+    // createdAt). Orphaned older boards get retired to `failed` on
+    // disk — they pre-date the one-active-per-session rule
+    // `handleCreate` now enforces. One-time cleanup for sessions
+    // polluted by earlier runs.
+    const byOrchestrator = new Map<string, Board[]>();
     for (const entry of entries) {
-      if (entry.state === "done" || entry.state === "failed") {
-        continue;
-      }
+      if (entry.state === "done" || entry.state === "failed") continue;
       const board = loadBoard(entry.projectId);
       if (!board) continue;
       const orchestratorId = entry.orchestratorSessionId;
@@ -318,6 +323,22 @@ export class PlannerBridge {
           `project ${shortProjectId(board.projectId)} has no orchestrator pointer; skipping rehydrate`,
         );
         continue;
+      }
+      const arr = byOrchestrator.get(orchestratorId) ?? [];
+      arr.push(board);
+      byOrchestrator.set(orchestratorId, arr);
+    }
+
+    for (const [orchestratorId, group] of byOrchestrator) {
+      group.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+      const [board, ...orphans] = group;
+      if (!board) continue;
+      for (const orphan of orphans) {
+        log.warn(
+          `retiring orphaned board ${shortProjectId(orphan.projectId)} (orchestrator …${orchestratorId.slice(-8)} already has newer board ${shortProjectId(board.projectId)})`,
+        );
+        orphan.state = "failed";
+        saveBoard(orphan, orchestratorId);
       }
 
       boards.set(orchestratorId, board);
@@ -576,9 +597,15 @@ export class PlannerBridge {
     let orchestratorSessionId: string | undefined;
     if (args.length > 0) {
       const canonical = canonicalProjectId(args.split(/\s+/)[0]!);
-      board = loadBoard(canonical);
-      if (board) {
-        orchestratorSessionId = orchestratorSessionForProject(canonical);
+      orchestratorSessionId = orchestratorSessionForProject(canonical);
+      // Prefer the in-memory board so the mutation is observed by
+      // subsequent status/scheduling calls; only fall back to a fresh
+      // disk read when we don't have it cached.
+      if (orchestratorSessionId) {
+        board = boards.get(orchestratorSessionId);
+      }
+      if (!board) {
+        board = loadBoard(canonical);
       }
     } else {
       board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
@@ -654,7 +681,11 @@ export class PlannerBridge {
     reqId: number | string,
     sessionId: string,
   ): { board: Board; orchestratorSessionId: string } | undefined {
-    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    // In-memory only: mutations on a disk-loaded copy would not be
+    // observed by `/status` (which checks the cache first) or by the
+    // scheduler. If the board isn't in the cache, it's either terminal
+    // (rehydrate skips those) or this session doesn't own one.
+    const board = boards.get(sessionId);
     if (!board) {
       this.client.reply(reqId, {
         text: "No plan in this session yet. Start one with `/hydra planner create <description>`.",
@@ -996,9 +1027,16 @@ export class PlannerBridge {
   ): void {
     let board: Board | undefined;
     let canonical: string | undefined;
+    let orchestratorSessionId: string | undefined;
     if (args.length > 0) {
       canonical = canonicalProjectId(args.split(/\s+/)[0]!);
-      board = loadBoard(canonical);
+      orchestratorSessionId = orchestratorSessionForProject(canonical);
+      if (orchestratorSessionId) {
+        board = boards.get(orchestratorSessionId);
+      }
+      if (!board) {
+        board = loadBoard(canonical);
+      }
       if (!board) {
         this.client.reply(reqId, {
           text: `No project '${args}' found.`,
@@ -1014,6 +1052,7 @@ export class PlannerBridge {
         return;
       }
       canonical = board.projectId;
+      orchestratorSessionId = sessionId;
     }
 
     const workerIds = Object.keys(board.workers);
@@ -1032,10 +1071,14 @@ export class PlannerBridge {
     })();
 
     // Drop in-memory state for the orchestrator (so /hydra planner
-    // create in this session starts cleanly).
-    if (boards.get(sessionId)?.projectId === canonical) {
-      boards.delete(sessionId);
-      clearOrchestratorState(sessionId);
+    // create in this session starts cleanly). Use the resolved
+    // orchestratorSessionId — when the user removes a project from
+    // a different session via `/hydra planner remove <projectId>`,
+    // the in-memory entry is keyed by the owning orchestrator, not
+    // the session that ran the command.
+    if (orchestratorSessionId && boards.get(orchestratorSessionId)?.projectId === canonical) {
+      boards.delete(orchestratorSessionId);
+      clearOrchestratorState(orchestratorSessionId);
     }
     // And worker state.
     for (const workerId of workerIds) {
@@ -1144,6 +1187,13 @@ export class PlannerBridge {
     if (getOrchestratorState(sessionId)?.awaitingDecomposition) {
       this.client.reply(reqId, {
         text: "planner create: a decomposition is already in flight for this session — wait for it to finish.",
+      });
+      return;
+    }
+    const existing = boards.get(sessionId);
+    if (existing && existing.state !== "done" && existing.state !== "failed") {
+      this.client.reply(reqId, {
+        text: `planner create: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner cancel\` or \`/hydra planner remove\` it first, or run create from a different session.`,
       });
       return;
     }
