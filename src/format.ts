@@ -112,11 +112,11 @@ export function formatSessionsTable(
 }
 
 export const TASK_STATUS_GLYPH: Record<string, string> = {
-  done: "✓",
-  assigned: "▶",
-  failed: "⨯",
-  blocked: "⊘",
-  pending: "·",
+  done: "[x]",
+  assigned: "[~]",
+  failed: "[!]",
+  blocked: "[-]",
+  pending: "[ ]",
 };
 
 // Render a board as a context preamble injected into the user's prompts
@@ -187,7 +187,7 @@ export function formatStatus(
   const done = board.tasks.filter((t) => t.status === "done").length;
   const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
   const failed = board.tasks.filter((t) => t.status === "failed").length;
-  lines.push(`📋 ${shortProjectId(board.projectId)}  (${board.state})`);
+  lines.push(`${shortProjectId(board.projectId)}  (${board.state})`);
   lines.push(`   ${board.description}`);
   lines.push("");
   const counts = [`${board.tasks.length} total`, `${done} done`];

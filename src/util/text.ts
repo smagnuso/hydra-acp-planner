@@ -73,16 +73,27 @@ export function buildTextPromptEnvelope(opts: {
 // and plan summaries to attached clients without involving the agent
 // process — the agent's own conversation memory is unaffected because
 // session/update flows outward only.
+//
+// Optional `meta` rides under the update's `_meta` field per the ACP
+// extensibility convention. Used by the planner to stamp
+// `hydra-acp.planner.{taskId,event}` on event-class synthetic messages
+// (task-completed, task-failed, …) so clients can render attribution
+// from metadata rather than from ASCII prefixes in the text.
 export function buildAgentMessageChunkEnvelope(opts: {
   sessionId: string;
   text: string;
+  meta?: Record<string, unknown>;
 }): UpdateEnvelope {
+  const update: UpdateEnvelope["update"] = {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: opts.text },
+  };
+  if (opts.meta) {
+    update._meta = opts.meta;
+  }
   return {
     sessionId: opts.sessionId,
-    update: {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: opts.text },
-    },
+    update,
   };
 }
 

@@ -441,7 +441,7 @@ export function sweepLineConcurrencyCap(tasks: Task[], cap = 6): number {
 // successful decomposition. Keep it readable in a TUI line-wrap.
 export function formatPlanSummary(tasks: Task[], concurrencyCap: number): string {
   const lines: string[] = [];
-  lines.push(`🧩 Decomposed into ${tasks.length} task${tasks.length === 1 ? "" : "s"} (concurrency cap ${concurrencyCap}).`);
+  lines.push(`Decomposed into ${tasks.length} task${tasks.length === 1 ? "" : "s"} (concurrency cap ${concurrencyCap}).`);
   lines.push("");
   for (const t of tasks) {
     const depStr = t.deps.length === 0 ? "no deps" : `depends on ${t.deps.join(", ")}`;

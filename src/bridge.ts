@@ -31,6 +31,19 @@ import {
   updateKind,
 } from "./util/text.js";
 import { formatBoardContext, formatStatus } from "./format.js";
+import {
+  buildAsciiPlanEnvelope,
+  buildPlanUpdateEnvelope,
+  getPlanRenderMode,
+} from "./plan-update.js";
+import {
+  clearHeldTurn,
+  createHeldTurn,
+  getHeldTurn,
+  resolveHeldTurn,
+  type HeldTurnReason,
+} from "./held-turn.js";
+import { WorkerForwarder } from "./worker-forward.js";
 import { rmSync } from "node:fs";
 import {
   allTerminal,
@@ -90,6 +103,12 @@ const INTERCEPTS = [
   // commands (`/hydra ...`) are intercepted by hydra before the chain
   // runs, so they don't reach this handler.
   "request:session/prompt",
+  // ^C / Esc on the held orchestrator turn routes through here. We
+  // park the cancel (or stop the chain) and run the project-cancel
+  // cleanup that force-cancels workers and resolves the held turn
+  // with a cancelled summary. For non-orchestrator sessions we
+  // continue the chain (worker sessions still get cancelled normally).
+  "request:session/cancel",
   // Only response:session/update fires in the response chain — hydra's
   // runResponseChain is session/update-only. We use the embedded
   // sessionUpdate kind ("agent_message_chunk", "turn_complete", ...)
@@ -99,6 +118,22 @@ const INTERCEPTS = [
   "lifecycle:session.idle",
   "lifecycle:session.closed",
 ];
+
+// Worker session_update kinds we forward into the orchestrator's
+// held turn, preserving the original sessionUpdate kind so the TUI
+// renders them with the correct affordance (thought blocks, tool-call
+// panels, message chunks). All text streams (agent_message_chunk +
+// agent_thought_chunk) go through WorkerForwarder's buffer-and-flush
+// (idle debounce + max-hold ceiling) so a worker's prose appears as
+// cohesive chunks rather than per-token fragments with `[Tn] `
+// re-injected mid-word. Tool calls are atomic and forwarded inline,
+// after first flushing pending text so order reads naturally.
+//
+// `plan` updates from worker sessions are NOT forwarded — the
+// orchestrator has its own plan panel managed by emitPlanUpdate, and
+// worker plans would either collide with it or duplicate it.
+
+
 
 // The advertised name. Hydra-acp's slash-command convention is
 // `/hydra <name> <verb>`, and the prefix elision lets users type the
@@ -191,6 +226,12 @@ const attachedSessions = new Set<string>();
 // session goes live, attach succeeds, and we activate (waking workers
 // and resuming tasks).
 const pendingActivation = new Set<string>(); // orchestratorSessionId
+
+// Per-worker forwarders that buffer streaming agent_message_chunk /
+// agent_thought_chunk text from the worker and flush it as a single
+// cohesive emit on natural boundaries. See worker-forward.ts for
+// rationale (avoids `[Tn] ` injection mid-sentence).
+const workerForwarders = new Map<string, WorkerForwarder>();
 
 const ACTIVATION_POLL_INTERVAL_MS = 3000;
 
@@ -410,6 +451,15 @@ export class PlannerBridge {
           repromptCount: 0,
         });
         registerWorker(workerId, orchestratorId);
+        workerForwarders.set(
+          workerId,
+          new WorkerForwarder({
+            workerSessionId: workerId,
+            orchestratorSessionId: orchestratorId,
+            taskId: task.id,
+            emit: this.makeWorkerEmit(workerId),
+          }),
+        );
       }
 
       pendingActivation.add(orchestratorId);
@@ -573,7 +623,7 @@ export class PlannerBridge {
         // The slash command's commands/invoke is still pending —
         // dispatch a reply so it doesn't hang forever.
         this.client.reply(req.id, {
-          text: `⚠️ Internal error: ${(err as Error).message}`,
+          text: `Internal error: ${(err as Error).message}`,
         });
       });
       return;
@@ -582,7 +632,7 @@ export class PlannerBridge {
       void this.handleExecute(req.id, sessionId, args).catch((err) => {
         log.error(`handleExecute threw: ${(err as Error).message}`);
         this.client.reply(req.id, {
-          text: `⚠️ Internal error: ${(err as Error).message}`,
+          text: `Internal error: ${(err as Error).message}`,
         });
       });
       return;
@@ -599,7 +649,7 @@ export class PlannerBridge {
       void this.handleAdd(req.id, sessionId, args).catch((err) => {
         log.error(`handleAdd threw: ${(err as Error).message}`);
         this.client.reply(req.id, {
-          text: `⚠️ Internal error: ${(err as Error).message}`,
+          text: `Internal error: ${(err as Error).message}`,
         });
       });
       return;
@@ -679,47 +729,20 @@ export class PlannerBridge {
       });
       return;
     }
-
-    // Snapshot in-flight workers before mutating, then mark each as
-    // failed. The actual force_cancel happens async; we don't await
-    // because the user's reply should be immediate.
-    const inFlight: Array<{ workerId: string; taskId: string }> = [];
-    for (const task of board.tasks) {
-      if (task.status === "assigned" && task.assignedTo) {
-        inFlight.push({ workerId: task.assignedTo, taskId: task.id });
-        task.status = "failed";
-        task.finishedAt = nowIso();
-      }
-    }
-    board.state = "failed";
-    saveBoard(board, orchestratorSessionId);
-
-    // Force-cancel each in-flight worker. force_cancel is a request
-    // that aggressively halts the agent's current turn — more decisive
-    // than the notification-shaped session/cancel. We swallow errors:
-    // a worker that's already done/closed won't accept the cancel, and
-    // that's fine because the goal is "stop running, drop state."
-    log.info(
-      `cancelling project ${shortProjectId(canonical)} — ${inFlight.length} in-flight worker${inFlight.length === 1 ? "" : "s"}`,
-    );
-    for (const { workerId } of inFlight) {
-      void this.client
-        .request("hydra-acp/session/force_cancel", { sessionId: workerId })
-        .catch((err) => {
-          log.warn(
-            `force_cancel of worker ${workerId} failed: ${(err as Error).message}`,
-          );
-        });
-    }
-
+    const inFlight = board.tasks.filter(
+      (t) => t.status === "assigned" && t.assignedTo,
+    ).length;
+    // Shared cleanup path. Resolves the held turn if one exists,
+    // which makes the orchestrator's held commands/invoke reply with
+    // the cancelled summary. When invoked from a non-orchestrator
+    // session (cancel by project id), there's no held turn for the
+    // caller's session, so we reply to the caller's commands/invoke
+    // separately with a short ack.
+    void this.runProjectCancel(orchestratorSessionId, board, "slash");
     const tail =
-      inFlight.length > 0
-        ? `; ${inFlight.length} in-flight task${inFlight.length === 1 ? "" : "s"} cancelled`
+      inFlight > 0
+        ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} cancelled`
         : "";
-    void this.emitSyntheticMessage(
-      orchestratorSessionId,
-      `⨯ Project ${shortProjectId(canonical)} cancelled${tail}.`,
-    );
     this.client.reply(reqId, {
       text: `Cancelled project ${shortProjectId(canonical)}${tail}.`,
     });
@@ -807,7 +830,7 @@ export class PlannerBridge {
 
     await this.emitSyntheticMessage(
       orchestratorSessionId,
-      `📝 Asking the agent to slot in: "${description}"`,
+      `Asking the agent to slot in: "${description}"`,
     );
 
     try {
@@ -825,7 +848,7 @@ export class PlannerBridge {
       log.error(`add: emit failed: ${(err as Error).message}`);
       await this.emitSyntheticMessage(
         orchestratorSessionId,
-        `⚠️ Couldn't ask the agent to plan the addition: ${(err as Error).message}`,
+        `Couldn't ask the agent to plan the addition: ${(err as Error).message}`,
       );
       this.client.reply(reqId, { text: "" });
       return;
@@ -844,7 +867,7 @@ export class PlannerBridge {
       log.warn(`add: parse failed for ${board.projectId}`);
       await this.emitSyntheticMessage(
         orchestratorSessionId,
-        `⚠️ Couldn't parse a hydra-add-task block from the agent's reply. Try \`/hydra planner add <description>\` again with a clearer description.`,
+        `Couldn't parse a hydra-add-task block from the agent's reply. Try \`/hydra planner add <description>\` again with a clearer description.`,
       );
       this.client.reply(reqId, { text: "" });
       return;
@@ -861,11 +884,12 @@ export class PlannerBridge {
     log.info(
       `added ${result.tasks.length} task(s) to ${board.projectId}: ${result.tasks.map((t) => t.id).join(", ")}`,
     );
+    this.emitPlanUpdate(orchestratorSessionId, board);
 
     const idsList = result.tasks.map((t) => `${t.id} ${t.title}`).join(", ");
     const warningsBlock =
       result.warnings.length > 0
-        ? `\n⚠️ ${result.warnings.length} parse warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}\n`
+        ? `\n${result.warnings.length} parse warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}\n`
         : "";
     await this.emitSyntheticMessage(
       orchestratorSessionId,
@@ -919,6 +943,7 @@ export class PlannerBridge {
     // If a worker is currently on this task, free it up.
     const workerId = task.assignedTo;
     if (task.status === "assigned" && workerId) {
+      this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
       delete board.workers[workerId];
@@ -931,9 +956,11 @@ export class PlannerBridge {
     task.assignedTo = null;
     saveBoard(board, orchestratorSessionId);
     log.info(`skipped ${taskId} in ${board.projectId}`);
+    this.emitPlanUpdate(orchestratorSessionId, board);
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `✓ ${taskId} skipped (marked done with no work).`,
+      "skipped (marked done with no work)",
+      { event: "task-skipped", taskId },
     );
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
     this.client.reply(reqId, { text: `Skipped ${taskId}.` });
@@ -968,6 +995,7 @@ export class PlannerBridge {
     // If a worker is currently on this task, free it.
     const workerId = task.assignedTo;
     if (task.status === "assigned" && workerId) {
+      this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
       delete board.workers[workerId];
@@ -982,9 +1010,11 @@ export class PlannerBridge {
     saveBoard(board, orchestratorSessionId);
 
     log.info(`retask ${taskId} in ${board.projectId} (attemptCount=${task.attemptCount})`);
+    this.emitPlanUpdate(orchestratorSessionId, board);
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `↻ ${taskId} reset to pending (attempt #${task.attemptCount + 1} next).`,
+      `reset to pending (attempt #${task.attemptCount + 1} next)`,
+      { event: "task-retasked", taskId },
     );
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
     this.client.reply(reqId, { text: `Reset ${taskId} to pending.` });
@@ -1033,6 +1063,7 @@ export class PlannerBridge {
     );
 
     // Close + clean up regardless of whether we found a task.
+    this.endWorkerForward(workerId);
     clearWorkerState(workerId);
     unregisterWorker(workerId);
     delete board.workers[workerId];
@@ -1046,7 +1077,8 @@ export class PlannerBridge {
       log.info(`killed worker ${workerId}; requeued ${task.id}`);
       void this.emitSyntheticMessage(
         orchestratorId,
-        `⨯ Worker ${shortSessionId(workerId)} killed; ${task.id} requeued.`,
+        `Worker ${shortSessionId(workerId)} killed; task requeued`,
+        { event: "worker-killed", taskId: task.id },
       );
       void this.scheduleEligibleTasks(orchestratorId, board);
       this.client.reply(reqId, {
@@ -1059,7 +1091,8 @@ export class PlannerBridge {
     log.info(`killed worker ${workerId} (no in-flight task)`);
     void this.emitSyntheticMessage(
       orchestratorId,
-      `⨯ Worker ${shortSessionId(workerId)} killed.`,
+      `Worker ${shortSessionId(workerId)} killed.`,
+      { event: "worker-killed" },
     );
     this.client.reply(reqId, {
       text: `Killed worker ${shortSessionId(workerId)}.`,
@@ -1131,9 +1164,16 @@ export class PlannerBridge {
     if (orchestratorSessionId && boards.get(orchestratorSessionId)?.projectId === canonical) {
       boards.delete(orchestratorSessionId);
       clearOrchestratorState(orchestratorSessionId);
+      // Release any held turn so the orchestrator's commands/invoke
+      // reply lands instead of hanging forever.
+      resolveHeldTurn(orchestratorSessionId, {
+        reason: "removed",
+        text: `Removed project ${shortProjectId(canonical)}.`,
+      });
     }
     // And worker state.
     for (const workerId of workerIds) {
+      this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
       attachedSessions.delete(workerId);
@@ -1179,7 +1219,7 @@ export class PlannerBridge {
       ? ` ${inFlight} in-flight worker${inFlight === 1 ? "" : "s"} will run to completion; no new tasks will dispatch until resume.`
       : " No new tasks will dispatch until resume.";
     this.client.reply(reqId, {
-      text: `⏸️  Paused ${shortProjectId(board.projectId)}.${tail}`,
+      text: `Paused ${shortProjectId(board.projectId)}.${tail}`,
     });
   }
 
@@ -1200,7 +1240,7 @@ export class PlannerBridge {
     board.state = "running";
     saveBoard(board, sessionId);
     this.client.reply(reqId, {
-      text: `▶️  Resumed ${shortProjectId(board.projectId)}.`,
+      text: `Resumed ${shortProjectId(board.projectId)}.`,
     });
     void this.scheduleEligibleTasks(sessionId, board);
   }
@@ -1309,14 +1349,14 @@ export class PlannerBridge {
         (fleetModel ? ` [model=${fleetModel}]` : ""),
     );
 
-    // Surface the initial status immediately so the user sees something
-    // happen while decomposition runs. Then we hold the commands/invoke
-    // response open until the work completes, which keeps hydra's
-    // in-flight turn (the slash command itself) busy — driving the
-    // busy indicator in the TUI / other clients.
-    await this.emitSyntheticMessage(
+    // Emit a single muted thought to fill the ~10s silent gap during
+    // decomposition. Using thought_chunk (not agent_message_chunk)
+    // keeps it visually subordinate to whatever's happening in the
+    // turn — renders italic/gray and folds under ^T — and doesn't
+    // crowd the TUI's standard "⚙ thinking…" placeholder visually.
+    void this.emitThoughtMessage(
       sessionId,
-      `🧩 Planning project ${shortProjectId(board.projectId)} — asking the agent to decompose.`,
+      `Planning project ${shortProjectId(board.projectId)} — decomposing into tasks…`,
     );
 
     // Self-install into this session's chain so our response intercepts
@@ -1341,7 +1381,7 @@ export class PlannerBridge {
       if (errState) errState.awaitingDecomposition = false;
       await this.emitSyntheticMessage(
         sessionId,
-        `⚠️ Could not attach to this session: ${(err as Error).message}`,
+        `Could not attach to this session: ${(err as Error).message}`,
       );
       this.client.reply(reqId, { text: "" });
       return;
@@ -1390,7 +1430,7 @@ export class PlannerBridge {
       saveBoard(board, sessionId);
       await this.emitSyntheticMessage(
         sessionId,
-        `⚠️ Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
+        `Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
       );
       this.client.reply(reqId, { text: "" });
       return;
@@ -1398,17 +1438,57 @@ export class PlannerBridge {
 
     // Turn complete — parse the accumulated reply and emit the summary.
     // finishDecomposition is synchronous; it also kicks off the first
-    // pass of scheduling via `void this.scheduleEligibleTasks(...)` which
-    // runs in the background after we return (workers don't keep the
-    // orchestrator's slash-command turn busy).
+    // pass of scheduling via `void this.scheduleEligibleTasks(...)`.
     const doneState = getOrchestratorState(sessionId);
     if (doneState && doneState.awaitingDecomposition) {
       this.finishDecomposition(sessionId, doneState);
     }
 
-    // Reply empty so hydra doesn't tack on a redundant synthetic chunk —
-    // we've already emitted everything we wanted to say.
+    // If decomposition succeeded (board transitioned to running), hold
+    // the slash command's commands/invoke open for the whole project.
+    // The held turn keeps the user's turn in flight in hydra's queue —
+    // plan updates emitted via message/emit get grouped under it, ^C
+    // routes through our request:session/cancel intercept, and Enter
+    // defaults to "amend" (per hydra's TUI). The hold is released when
+    // scheduleEligibleTasks finds allTerminal(board), or when the user
+    // cancels / removes the project.
+    if (board.state === "running") {
+      await this.holdAndReply(reqId, sessionId, board);
+      return;
+    }
+    // Decomposition failed (board.state === "failed") or no tasks were
+    // produced. Reply empty — we've already emitted the failure
+    // explanation via finishDecomposition.
     this.client.reply(reqId, { text: "" });
+  }
+
+  // Set up the held turn for `sessionId` (keyed by commands/invoke
+  // reqId), emit the initial plan snapshot, then await terminal
+  // resolution. Replies to commands/invoke with the resolved summary
+  // text. Common tail for handleCreate / handleExecute.
+  private async holdAndReply(
+    reqId: number | string,
+    sessionId: string,
+    board: Board,
+  ): Promise<void> {
+    const held = createHeldTurn({
+      orchestratorSessionId: sessionId,
+      projectId: board.projectId,
+      commandsInvokeReqId: reqId,
+    });
+    log.info(
+      `holding orchestrator turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)}`,
+    );
+    // Initial plan snapshot — the first time the user sees the live
+    // panel. After this, scheduleEligibleTasks / task-state handlers
+    // emit additional plan updates as state evolves.
+    this.emitPlanUpdate(sessionId, board);
+    try {
+      const resolution = await held.promise;
+      this.client.reply(reqId, { text: resolution.text });
+    } finally {
+      clearHeldTurn(sessionId);
+    }
   }
 
   // Conversation-driven planning: instead of taking a description
@@ -1498,9 +1578,9 @@ export class PlannerBridge {
         (fleetModel ? ` [model=${fleetModel}]` : ""),
     );
 
-    await this.emitSyntheticMessage(
+    void this.emitThoughtMessage(
       sessionId,
-      `🧩 Planning project ${shortProjectId(board.projectId)} from this conversation — asking the agent to decompose.`,
+      `Planning project ${shortProjectId(board.projectId)} from this conversation — decomposing into tasks…`,
     );
 
     try {
@@ -1521,7 +1601,7 @@ export class PlannerBridge {
       if (errState) errState.awaitingDecomposition = false;
       await this.emitSyntheticMessage(
         sessionId,
-        `⚠️ Could not attach to this session: ${(err as Error).message}`,
+        `Could not attach to this session: ${(err as Error).message}`,
       );
       this.client.reply(reqId, { text: "" });
       return;
@@ -1554,7 +1634,7 @@ export class PlannerBridge {
       saveBoard(board, sessionId);
       await this.emitSyntheticMessage(
         sessionId,
-        `⚠️ Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
+        `Decomposition turn for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
       );
       this.client.reply(reqId, { text: "" });
       return;
@@ -1563,6 +1643,10 @@ export class PlannerBridge {
     const doneState = getOrchestratorState(sessionId);
     if (doneState && doneState.awaitingDecomposition) {
       this.finishDecomposition(sessionId, doneState);
+    }
+    if (board.state === "running") {
+      await this.holdAndReply(reqId, sessionId, board);
+      return;
     }
     this.client.reply(reqId, { text: "" });
   }
@@ -1590,12 +1674,124 @@ export class PlannerBridge {
       );
       return;
     }
+    if (phase === "request" && method === "session/cancel") {
+      this.handleCancelIntercept(req.id, sessionId);
+      return;
+    }
     if (phase === "response" && method === "session/update") {
       this.handleUpdateResponse(req.id, sessionId, params.envelope);
       return;
     }
     // Anything else we declared an interest in: pass through.
     this.client.reply(req.id, { action: "continue" });
+  }
+
+  // Intercept ^C / Esc / session/cancel on an orchestrator that owns
+  // an active project. The held turn (handleCreate / handleExecute) is
+  // waiting on the project's terminal state; we resolve it with a
+  // cancelled summary, force-cancel in-flight workers, freeze the
+  // board. The session/cancel itself is suppressed from reaching the
+  // agent (`stop`) — the agent never received the held prompt, so
+  // there's no agent-side turn to cancel.
+  //
+  // For sessions without an active project (worker sessions, idle
+  // orchestrators, unrelated sessions) we `continue` the chain so
+  // cancel propagates to the agent normally.
+  private handleCancelIntercept(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId);
+    const held = getHeldTurn(sessionId);
+    if (!board || !held) {
+      // No active project — let cancel through.
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
+    if (board.state === "done" || board.state === "failed") {
+      // Already terminal — held turn will resolve naturally on the
+      // existing path; nothing more to do here. Stop suppresses a
+      // redundant agent notify.
+      this.client.reply(reqId, { action: "stop" });
+      return;
+    }
+    // Suppress the agent-side notify immediately. The held turn won't
+    // end until we resolve it, but the WS-side cancel doesn't need to
+    // wait — the cleanup happens async.
+    this.client.reply(reqId, { action: "stop" });
+    log.info(
+      `cancel intercept fired on ${shortProjectId(board.projectId)} (session …${sessionId.slice(-8)})`,
+    );
+    void this.runProjectCancel(sessionId, board, "user-cancel");
+  }
+
+  // Shared project-cancellation core. Called by both the slash command
+  // (/hydra planner cancel) and the session/cancel intercept. Marks
+  // in-flight tasks failed, force-cancels their workers, transitions
+  // board state to failed, persists, emits a final plan snapshot, and
+  // resolves the held turn (if any) with a cancelled summary.
+  //
+  // `source` is purely informational — included in the resolved text
+  // so the user can tell whether they pressed ^C or typed the slash
+  // command. Both paths produce identical board mutations.
+  private async runProjectCancel(
+    orchestratorSessionId: string,
+    board: Board,
+    source: "user-cancel" | "slash",
+  ): Promise<void> {
+    if (board.state === "done" || board.state === "failed") {
+      // Race: a concurrent /hydra planner cancel or completion already
+      // landed. Idempotent no-op.
+      return;
+    }
+    const inFlight: Array<{ workerId: string; taskId: string }> = [];
+    for (const task of board.tasks) {
+      if (task.status === "assigned" && task.assignedTo) {
+        inFlight.push({ workerId: task.assignedTo, taskId: task.id });
+        task.status = "failed";
+        task.finishedAt = nowIso();
+      }
+    }
+    board.state = "failed";
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(
+      `cancelling project ${shortProjectId(board.projectId)} (${source}) — ${inFlight.length} in-flight worker${inFlight.length === 1 ? "" : "s"}`,
+    );
+    for (const { workerId } of inFlight) {
+      // Abandon any buffered text — flushing post-cancel would surface
+      // the worker's last thoughts after the cancel summary, which
+      // reads as if the work continued.
+      this.endWorkerForward(workerId);
+      // Clear the planner's per-worker bookkeeping NOW so any late
+      // emit-promise resolution from spawnTaskOnNewWorker (force_cancel
+      // doesn't guarantee the agent halts in time — its in-flight turn
+      // can still come back successful) lands on missing state and
+      // bails cleanly via the early-return in handleTaskComplete /
+      // handleTaskFailure. Without this clear, an old worker's
+      // straggler session/update notifications can still find a live
+      // workerState entry pointing at the orchestrator session, and
+      // their tool_calls/thoughts can re-render in a *subsequent*
+      // project's transcript on the same session — the "tools coming
+      // back to life" bug.
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      void this.client
+        .request("hydra-acp/session/force_cancel", { sessionId: workerId })
+        .catch((err) => {
+          log.warn(
+            `force_cancel of worker ${workerId} failed: ${(err as Error).message}`,
+          );
+        });
+    }
+    // Final plan snapshot so the closing turn shows the cancelled state.
+    this.emitPlanUpdate(orchestratorSessionId, board);
+
+    const tail =
+      inFlight.length > 0
+        ? `; ${inFlight.length} in-flight task${inFlight.length === 1 ? "" : "s"} cancelled`
+        : "";
+    resolveHeldTurn(orchestratorSessionId, {
+      reason: "cancelled",
+      text: `Project ${shortProjectId(board.projectId)} cancelled${tail}.`,
+    });
   }
 
   // Inject board context into user prompts to the orchestrator agent.
@@ -1763,16 +1959,62 @@ export class PlannerBridge {
     const workerState = getWorkerState(sessionId);
     if (workerState) {
       const kind = updateKind(envelope);
-      if (kind === "agent_message_chunk") {
-        const text = extractUpdateText(envelope);
-        if (text.length > 0) {
-          workerState.resultAccumulator += text;
+      const forwarder = workerForwarders.get(sessionId);
+      if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
+        // Worker prose — whether the agent labels it message or
+        // thought — is forwarded to the orchestrator as a
+        // thought_chunk so the TUI renders it as muted/italic
+        // narration. In a worker context there's no human user the
+        // agent is "speaking to"; all of its prose is internal
+        // narration, so the thought affordance is semantically
+        // right and gives consistent rendering across agents
+        // (Claude emits thoughts, opencode emits messages, codex
+        // varies — users see them all the same way in the
+        // orchestrator). The original kind is preserved in _meta
+        // by WorkerForwarder so future TUI features can distinguish.
+        //
+        // Message chunks additionally accumulate into the worker's
+        // result buffer (hydra-result block parsing); thought
+        // chunks don't.
+        let text = "";
+        if (kind === "agent_message_chunk") {
+          text = extractUpdateText(envelope);
+          if (text.length > 0) {
+            workerState.resultAccumulator += text;
+          }
+        } else {
+          const content = (envelope as { update?: { content?: { text?: unknown } } } | undefined)
+            ?.update?.content;
+          text = typeof content?.text === "string" ? content.text : "";
         }
-        // Pass through for workers — they're ancillary sessions so
-        // attached clients (if any) opted in to seeing the raw work.
+        // Once the worker's hydra-result fence opens, suppress
+        // further forwarding so the structured result block
+        // doesn't leak into the orchestrator transcript.
+        if (text.length > 0 && forwarder) {
+          const blockOpenerSeen = /```\s*hydra-result/.test(
+            workerState.resultAccumulator,
+          );
+          if (!blockOpenerSeen) {
+            forwarder.ingestText(text, kind);
+          }
+        }
         this.client.reply(reqId, { action: "continue" });
         return;
       }
+      if (kind === "tool_call" || kind === "tool_call_update") {
+        // Tool updates are atomic — flush pending text first so
+        // order reads naturally, then forward the tool envelope
+        // with kind preserved. The TUI renders as a tool-call panel.
+        if (forwarder) {
+          forwarder.ingestToolUpdate(kind, envelope);
+        }
+        this.client.reply(reqId, { action: "continue" });
+        return;
+      }
+      // Other kinds (worker `plan` updates, mode changes, etc.) — not
+      // forwarded. The orchestrator owns the project-level plan
+      // panel; mode changes are session-local and irrelevant outside
+      // the worker.
       this.client.reply(reqId, { action: "continue" });
       return;
     }
@@ -1803,7 +2045,7 @@ export class PlannerBridge {
       saveBoard(board, sessionId);
       void this.emitSyntheticMessage(
         sessionId,
-        `⚠️ Couldn't parse a decomposition out of the agent's reply for ${shortProjectId(board.projectId)}. Try \`/hydra planner create\` again with a clearer description.`,
+        `Couldn't parse a decomposition out of the agent's reply for ${shortProjectId(board.projectId)}. Try \`/hydra planner create\` again with a clearer description.`,
       );
       state.awaitingDecomposition = false;
       state.decompositionAccumulator = "";
@@ -1831,12 +2073,16 @@ export class PlannerBridge {
       `decomposed ${board.projectId}: ${result.tasks.length} tasks, cap=${board.concurrencyCap}, warnings=${result.warnings.length}`,
     );
 
-    const summary = formatPlanSummary(result.tasks, board.concurrencyCap);
-    const warningsBlock =
-      result.warnings.length > 0
-        ? `\n⚠️ ${result.warnings.length} parse warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}\n`
-        : "";
-    void this.emitSyntheticMessage(sessionId, `${summary}${warningsBlock}`);
+    // Surface parse warnings as a synthetic chunk (not part of the
+    // plan panel — they're a one-off advisory about the decomposition
+    // parse, not board state). The plan panel renders the task list.
+    if (result.warnings.length > 0) {
+      const warningsBlock = `${result.warnings.length} decomposition warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}`;
+      void this.emitSyntheticMessage(sessionId, warningsBlock);
+    }
+    // The full plan summary text would duplicate the plan panel — log
+    // it for debugging only.
+    log.debug(formatPlanSummary(result.tasks, board.concurrencyCap));
 
     // Kick off the scheduler: fills up to concurrencyCap workers with
     // initial eligible tasks. Subsequent completions trigger refill.
@@ -1870,14 +2116,27 @@ export class PlannerBridge {
     if (board.state === "paused") {
       return;
     }
-    // Project-complete short-circuit. Emit once, transition state, return.
+    // Project-complete short-circuit. Emit a final plan snapshot,
+    // transition state, resolve the held turn (if any) with a success
+    // summary so handleCreate/Execute replies to commands/invoke.
     if (allTerminal(board)) {
       board.state = "done";
       saveBoard(board, orchestratorSessionId);
-      void this.emitSyntheticMessage(
-        orchestratorSessionId,
-        `🎉 Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`,
-      );
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      const failed = board.tasks.filter((t) => t.status === "failed").length;
+      const done = board.tasks.length - failed;
+      const summary = failed > 0
+        ? `Project ${shortProjectId(board.projectId)} done with ${failed} failure${failed === 1 ? "" : "s"} (${done}/${board.tasks.length} done).`
+        : `Project Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`;
+      if (!resolveHeldTurn(orchestratorSessionId, {
+        reason: failed > 0 ? "failed" : "complete",
+        text: summary,
+      })) {
+        // No held turn (e.g. rehydrated project running in degraded
+        // mode) — fall back to a synthetic chunk so the user still
+        // sees the celebration.
+        void this.emitSyntheticMessage(orchestratorSessionId, summary);
+      }
       return;
     }
 
@@ -1941,7 +2200,8 @@ export class PlannerBridge {
       saveBoard(board, orchestratorSessionId);
       void this.emitSyntheticMessage(
         orchestratorSessionId,
-        `⚠️ ${task.id} failed to spawn a worker: ${(err as Error).message}`,
+        `failed to spawn a worker: ${(err as Error).message}`,
+        { event: "task-spawn-failed", taskId: task.id },
       );
       return;
     }
@@ -1998,14 +2258,25 @@ export class PlannerBridge {
       repromptCount: 0,
     });
     registerWorker(childSessionId, orchestratorSessionId);
+    workerForwarders.set(
+      childSessionId,
+      new WorkerForwarder({
+        orchestratorSessionId,
+        workerSessionId: childSessionId,
+        taskId: task.id,
+        emit: this.makeWorkerEmit(childSessionId),
+      }),
+    );
 
     log.info(
       `assigned ${task.id} (${task.title}) to worker …${childSessionId.slice(-8)}`,
     );
-    void this.emitSyntheticMessage(
-      orchestratorSessionId,
-      `▶ ${task.id} → worker ${shortSessionId(childSessionId)}  (${task.title})`,
-    );
+    // Plan panel update reflects the in_progress transition. The
+    // task-to-worker mapping is visible via the [Tn] prefix on
+    // forwarded worker output (thoughts + tool calls), so a separate
+    // assignment line in the transcript would be redundant noise
+    // crowding the TUI's natural turn-start placeholder.
+    this.emitPlanUpdate(orchestratorSessionId, board);
 
     // Fire the task prompt asynchronously. We're not awaiting the
     // emit promise here because the scheduler needs to return so
@@ -2064,7 +2335,8 @@ export class PlannerBridge {
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `↻ Resuming ${task.id} on worker ${shortSessionId(workerSessionId)}  (${task.title})`,
+      `Resuming on worker ${shortSessionId(workerSessionId)}  (${task.title})`,
+      { event: "task-resumed", taskId: task.id },
     );
     void (async () => {
       try {
@@ -2118,7 +2390,7 @@ export class PlannerBridge {
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `↻ Resuming decomposition of ${shortProjectId(board.projectId)} after restart`,
+      `Resuming decomposition of ${shortProjectId(board.projectId)} after restart`,
     );
     void (async () => {
       try {
@@ -2147,7 +2419,7 @@ export class PlannerBridge {
         saveBoard(board, orchestratorSessionId);
         await this.emitSyntheticMessage(
           orchestratorSessionId,
-          `⚠️ Resume of decomposition for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
+          `Resume of decomposition for ${shortProjectId(board.projectId)} failed: ${(err as Error).message}`,
         );
         return;
       }
@@ -2175,7 +2447,8 @@ export class PlannerBridge {
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `↻ Asking ${shortSessionId(workerSessionId)} for ${task.id}'s missing hydra-result block`,
+      `Asking ${shortSessionId(workerSessionId)} for missing hydra-result block`,
+      { event: "task-result-reprompt", taskId: task.id },
     );
     void (async () => {
       try {
@@ -2222,6 +2495,22 @@ export class PlannerBridge {
     board: Board,
     task: Task,
   ): void {
+    // Cancellation guard: runProjectCancel marks every in-flight task
+    // `failed` and force-cancels its worker. If force_cancel arrived
+    // too late and the agent's turn completed successfully anyway,
+    // this callback still fires — without the guard we'd happily
+    // mark the task done (overwriting the cancel) or reprompt the
+    // (supposedly-dead) worker for a missing hydra-result block,
+    // which spawns a fresh worker turn whose tool_calls and thoughts
+    // can leak into a subsequent project's transcript on the same
+    // session. Quiet bail is correct: cancel already resolved the
+    // held turn and emitted the cancel summary.
+    if (task.status === "failed" || board.state === "failed") {
+      log.debug(
+        `task ${task.id}: ignoring late completion — already cancelled`,
+      );
+      return;
+    }
     const workerState = getWorkerState(workerSessionId);
     if (!workerState) {
       log.warn(
@@ -2275,11 +2564,14 @@ export class PlannerBridge {
     log.info(
       `completed ${task.id} on worker …${workerSessionId.slice(-8)} — ${result.artifacts.summary}`,
     );
+    this.emitPlanUpdate(orchestratorSessionId, board);
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `✓ ${task.id}  ${result.artifacts.summary ?? task.title}`,
+      result.artifacts.summary ?? task.title,
+      { event: "task-completed", taskId: task.id },
     );
 
+    this.endWorkerForward(workerSessionId, { flush: true });
     clearWorkerState(workerSessionId);
     unregisterWorker(workerSessionId);
     void this.closeWorker(workerSessionId);
@@ -2298,6 +2590,24 @@ export class PlannerBridge {
     task: Task,
     reason: string,
   ): void {
+    // Suppress double-report when the task was already marked failed
+    // by an outer cancellation (runProjectCancel marks every in-flight
+    // task `failed` and force-cancels its worker; the worker's emit
+    // promise then rejects with "connection closed" which lands here).
+    // Without this guard the user sees the project's cancel summary
+    // followed by a redundant "Tn failed — task turn failed: -32603"
+    // line for each in-flight worker. Quiet cleanup is the right
+    // behavior — the cancel summary already accounts for these.
+    if (task.status === "failed" || board.state === "failed") {
+      log.debug(
+        `task ${task.id}: ignoring late failure (${reason}) — already accounted for by cancel`,
+      );
+      this.endWorkerForward(workerSessionId);
+      clearWorkerState(workerSessionId);
+      unregisterWorker(workerSessionId);
+      void this.closeWorker(workerSessionId);
+      return;
+    }
     log.warn(`task ${task.id} failed on worker …${workerSessionId.slice(-8)}: ${reason}`);
     task.status = "failed";
     task.assignedTo = null;
@@ -2306,10 +2616,13 @@ export class PlannerBridge {
       workerEntry.currentTaskId = null;
     }
     saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `⨯ ${task.id} failed — ${reason}`,
+      reason,
+      { event: "task-failed", taskId: task.id },
     );
+    this.endWorkerForward(workerSessionId, { flush: true });
     clearWorkerState(workerSessionId);
     unregisterWorker(workerSessionId);
     void this.closeWorker(workerSessionId);
@@ -2347,11 +2660,55 @@ export class PlannerBridge {
 
   // ── Helpers ────────────────────────────────────────────────────────
 
+  // Synthetic thought message: muted/italic rendering, foldable via
+  // ^T. Use for low-priority status that fills awkward silent gaps
+  // (e.g. during the decomposition phase) without claiming the
+  // visual real estate that a regular agent_message_chunk would.
+  // Fire-and-forget — emit failures are non-fatal.
+  private emitThoughtMessage(sessionId: string, text: string): void {
+    void this.client
+      .request("hydra-acp/message/emit", {
+        sessionId,
+        method: "session/update",
+        envelope: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text },
+          },
+        },
+        route: "chain",
+      })
+      .catch((err) => {
+        log.warn(`emit thought message failed: ${(err as Error).message}`);
+      });
+  }
+
   // Synthetic progress messages get wrapped with leading + trailing
   // newlines so successive emissions render with visible separation in
   // the transcript. Mirrors how hydra's own emitExtensionReply formats
   // slash-command replies.
-  private async emitSyntheticMessage(sessionId: string, text: string): Promise<void> {
+  //
+  // Optional `plannerEvent` rides under
+  // `_meta.hydra-acp.planner.{taskId,event}` so clients can render
+  // event-class messages (task-completed, task-failed, etc.) with
+  // proper attribution instead of relying on ASCII prefixes in the
+  // text body. The text itself stays clean.
+  private async emitSyntheticMessage(
+    sessionId: string,
+    text: string,
+    plannerEvent?: { event: string; taskId?: string },
+  ): Promise<void> {
+    const meta = plannerEvent
+      ? {
+          "hydra-acp": {
+            planner: {
+              event: plannerEvent.event,
+              ...(plannerEvent.taskId ? { taskId: plannerEvent.taskId } : {}),
+            },
+          },
+        }
+      : undefined;
     try {
       await this.client.request("hydra-acp/message/emit", {
         sessionId,
@@ -2359,11 +2716,80 @@ export class PlannerBridge {
         envelope: buildAgentMessageChunkEnvelope({
           sessionId,
           text: `\n${text}\n`,
+          meta,
         }),
         route: "chain",
       });
     } catch (err) {
       log.warn(`emit synthetic message failed: ${(err as Error).message}`);
     }
+  }
+
+  // Emit a board snapshot into the orchestrator's held turn as a
+  // self-updating panel. Chooses between ACP `plan` updates (default,
+  // renders as a checkboxed panel in spec-compliant clients) and an
+  // ASCII checklist via agent_message_chunk (fallback for clients
+  // that don't render plan updates well outside of an agent's own
+  // turn). The choice is governed by PLANNER_RENDER=plan|ascii.
+  //
+  // Best-effort: emit failures only warn — a missed plan update isn't
+  // worth failing scheduling for, and the next state change will emit
+  // a fresh snapshot anyway.
+  private emitPlanUpdate(sessionId: string, board: Board): void {
+    const mode = getPlanRenderMode();
+    const envelope =
+      mode === "plan"
+        ? buildPlanUpdateEnvelope({ sessionId, board })
+        : buildAsciiPlanEnvelope({ sessionId, board });
+    void this.client
+      .request("hydra-acp/message/emit", {
+        sessionId,
+        method: "session/update",
+        envelope,
+        route: "chain",
+      })
+      .catch((err) => {
+        log.warn(`emit plan update failed: ${(err as Error).message}`);
+      });
+  }
+
+  // Dispose a worker's forwarder, optionally flushing any pending
+  // buffered text first. Natural-end paths (task complete / task
+  // failed) flush so the user sees whatever the worker was
+  // last thinking; abrupt-end paths (skip / retask / kill / cancel /
+  // remove) dispose without flushing so the abandoned text doesn't
+  // appear after the "task ended" line in the transcript.
+  private endWorkerForward(workerId: string, opts: { flush?: boolean } = {}): void {
+    const forwarder = workerForwarders.get(workerId);
+    if (!forwarder) return;
+    if (opts.flush) {
+      forwarder.flushAll();
+    } else {
+      forwarder.dispose();
+    }
+    workerForwarders.delete(workerId);
+  }
+
+  // Build the emit callback a WorkerForwarder uses when flushing or
+  // forwarding an envelope. Centralized here so the WS-write path
+  // stays in one place. Fire-and-forget — the planner's per-worker
+  // queue inside WorkerForwarder already preserves intra-worker
+  // order; the WS connection serializes writes so envelopes hit the
+  // daemon in the order they were issued from this side.
+  private makeWorkerEmit(workerSessionId: string) {
+    return (env: { sessionId: string; update: Record<string, unknown> }): void => {
+      void this.client
+        .request("hydra-acp/message/emit", {
+          sessionId: env.sessionId,
+          method: "session/update",
+          envelope: env,
+          route: "chain",
+        })
+        .catch((err) => {
+          log.warn(
+            `worker-forward emit (worker …${workerSessionId.slice(-8)}) failed: ${(err as Error).message}`,
+          );
+        });
+    };
   }
 }

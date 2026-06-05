@@ -69,9 +69,9 @@ describe("formatBoardContext", () => {
         ],
       }),
     );
-    assert.match(out, /✓ T1/);
-    assert.match(out, /▶ T2/);
-    assert.match(out, /· T3/);
+    assert.match(out, /\[x\] T1/);
+    assert.match(out, /\[~\] T2/);
+    assert.match(out, /\[ \] T3/);
   });
 
   it("shows done/total counter", () => {
