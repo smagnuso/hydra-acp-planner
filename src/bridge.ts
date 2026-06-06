@@ -103,12 +103,6 @@ const INTERCEPTS = [
   // commands (`/hydra ...`) are intercepted by hydra before the chain
   // runs, so they don't reach this handler.
   "request:session/prompt",
-  // ^C / Esc on the held orchestrator turn routes through here. We
-  // park the cancel (or stop the chain) and run the project-cancel
-  // cleanup that force-cancels workers and resolves the held turn
-  // with a cancelled summary. For non-orchestrator sessions we
-  // continue the chain (worker sessions still get cancelled normally).
-  "request:session/cancel",
   // Only response:session/update fires in the response chain — hydra's
   // runResponseChain is session/update-only. We use the embedded
   // sessionUpdate kind ("agent_message_chunk", "turn_complete", ...)
@@ -232,6 +226,26 @@ const pendingActivation = new Set<string>(); // orchestratorSessionId
 // cohesive emit on natural boundaries. See worker-forward.ts for
 // rationale (avoids `[Tn] ` injection mid-sentence).
 const workerForwarders = new Map<string, WorkerForwarder>();
+
+// Tracks in-flight commands/invoke dispatches keyed by the daemon-
+// assigned messageId. Set when handleCommandsInvoke receives the
+// request, cleared when it finishes. The `cancelled` flag is set by
+// handleCommandsCancel when the daemon's commands/cancel
+// notification fires. handleCreate / handleExecute / handleStatus
+// check this flag at major await boundaries so they can bail out
+// gracefully even when the cancel arrives BEFORE the held turn is
+// opened (e.g. during the ~10s decomposition window). Without this,
+// an early cancel would orphan the dispatch: decomposition would
+// complete, holdAndReply would open a turn that no signal ever
+// resolves, and workers spawned mid-decomposition would run
+// indefinitely.
+interface PendingDispatch {
+  sessionId: string;
+  messageId: string;
+  cancelled: boolean;
+  cancelReason: "amended" | "cancelled" | "abandoned" | "";
+}
+const pendingDispatches = new Map<string, PendingDispatch>(); // by messageId
 
 const ACTIVATION_POLL_INTERVAL_MS = 3000;
 
@@ -619,39 +633,52 @@ export class PlannerBridge {
     const args = (params.args ?? "").trim();
     // messageId is the user-prompt queue entry id the daemon
     // assigned to this slash command (Stage A of the slash-as-user-
-    // prompt refactor). We thread it into the held turn so we can
-    // distinguish amend-against-our-slash from other queue events.
-    // Undefined on older daemons; held-turn behavior degrades to
-    // pre-Stage-A "yield on any queue addition" in that case.
+    // prompt refactor). Track the dispatch from this moment so an
+    // early commands/cancel (Stage B notification) can mark us
+    // before holdAndReply even opens its held turn. Cleanup is per
+    // handler — they wrap their work in try/finally + a call to
+    // clearPendingDispatch(messageId).
     const messageId = params.messageId;
+    if (messageId) {
+      pendingDispatches.set(messageId, {
+        sessionId,
+        messageId,
+        cancelled: false,
+        cancelReason: "",
+      });
+    }
 
     if (verb === "create") {
-      void this.handleCreate(req.id, sessionId, args, messageId).catch((err) => {
-        log.error(`handleCreate threw: ${(err as Error).message}`);
-        // The slash command's commands/invoke is still pending —
-        // dispatch a reply so it doesn't hang forever.
-        this.client.reply(req.id, {
-          text: `Internal error: ${(err as Error).message}`,
-        });
-      });
+      void this.handleCreate(req.id, sessionId, args, messageId)
+        .catch((err) => {
+          log.error(`handleCreate threw: ${(err as Error).message}`);
+          this.client.reply(req.id, {
+            text: `Internal error: ${(err as Error).message}`,
+          });
+        })
+        .finally(() => this.clearPendingDispatch(messageId));
       return;
     }
     if (verb === "execute") {
-      void this.handleExecute(req.id, sessionId, args, messageId).catch((err) => {
-        log.error(`handleExecute threw: ${(err as Error).message}`);
-        this.client.reply(req.id, {
-          text: `Internal error: ${(err as Error).message}`,
-        });
-      });
+      void this.handleExecute(req.id, sessionId, args, messageId)
+        .catch((err) => {
+          log.error(`handleExecute threw: ${(err as Error).message}`);
+          this.client.reply(req.id, {
+            text: `Internal error: ${(err as Error).message}`,
+          });
+        })
+        .finally(() => this.clearPendingDispatch(messageId));
       return;
     }
     if (verb === "status" || verb === "") {
-      void this.handleStatus(req.id, sessionId, messageId).catch((err) => {
-        log.error(`handleStatus threw: ${(err as Error).message}`);
-        this.client.reply(req.id, {
-          text: `Internal error: ${(err as Error).message}`,
-        });
-      });
+      void this.handleStatus(req.id, sessionId, messageId)
+        .catch((err) => {
+          log.error(`handleStatus threw: ${(err as Error).message}`);
+          this.client.reply(req.id, {
+            text: `Internal error: ${(err as Error).message}`,
+          });
+        })
+        .finally(() => this.clearPendingDispatch(messageId));
       return;
     }
     if (verb === "cancel") {
@@ -1539,6 +1566,40 @@ export class PlannerBridge {
     board: Board,
     slashMessageId: string | undefined,
   ): Promise<void> {
+    // If commands/cancel arrived during decomposition (before this
+    // moment), the pending dispatch was flagged. Honor it now
+    // instead of opening a held turn that no signal could resolve.
+    const earlyCancel = this.checkDispatchCancelled(slashMessageId);
+    if (earlyCancel === "cancelled") {
+      // Worker spawning may have already started in the brief window
+      // between finishDecomposition and holdAndReply — run the full
+      // cancel path to kill them and freeze the board.
+      log.info(
+        `commands/cancel arrived during decomposition for ${shortProjectId(board.projectId)} — running project cancel before opening held turn`,
+      );
+      await this.runProjectCancel(sessionId, board, "user-cancel");
+      this.client.reply(reqId, {
+        text: `Cancelled ${shortProjectId(board.projectId)}.`,
+      });
+      this.clearPendingDispatch(slashMessageId);
+      return;
+    }
+    if (earlyCancel === "amended" || earlyCancel === "abandoned") {
+      // Workers may have started; let them keep running. Just close
+      // the slash command turn with a yield/abandon note.
+      log.info(
+        `commands/cancel (${earlyCancel}) arrived during decomposition for ${shortProjectId(board.projectId)} — skipping held turn, project continues in background`,
+      );
+      this.client.reply(reqId, {
+        text:
+          earlyCancel === "abandoned"
+            ? `Session closing — ${shortProjectId(board.projectId)} state preserved on disk.`
+            : `Pausing live view of ${shortProjectId(board.projectId)} — project still running in background.`,
+      });
+      this.clearPendingDispatch(slashMessageId);
+      return;
+    }
+
     const held = createHeldTurn({
       orchestratorSessionId: sessionId,
       projectId: board.projectId,
@@ -1557,6 +1618,7 @@ export class PlannerBridge {
       this.client.reply(reqId, { text: resolution.text });
     } finally {
       clearHeldTurn(sessionId);
+      this.clearPendingDispatch(slashMessageId);
     }
   }
 
@@ -1742,52 +1804,12 @@ export class PlannerBridge {
       );
       return;
     }
-    if (phase === "request" && method === "session/cancel") {
-      this.handleCancelIntercept(req.id, sessionId);
-      return;
-    }
     if (phase === "response" && method === "session/update") {
       this.handleUpdateResponse(req.id, sessionId, params.envelope);
       return;
     }
     // Anything else we declared an interest in: pass through.
     this.client.reply(req.id, { action: "continue" });
-  }
-
-  // Intercept ^C / Esc / session/cancel on an orchestrator that owns
-  // an active project. The held turn (handleCreate / handleExecute) is
-  // waiting on the project's terminal state; we resolve it with a
-  // cancelled summary, force-cancel in-flight workers, freeze the
-  // board. The session/cancel itself is suppressed from reaching the
-  // agent (`stop`) — the agent never received the held prompt, so
-  // there's no agent-side turn to cancel.
-  //
-  // For sessions without an active project (worker sessions, idle
-  // orchestrators, unrelated sessions) we `continue` the chain so
-  // cancel propagates to the agent normally.
-  private handleCancelIntercept(reqId: number | string, sessionId: string): void {
-    const board = boards.get(sessionId);
-    const held = getHeldTurn(sessionId);
-    if (!board || !held) {
-      // No active project — let cancel through.
-      this.client.reply(reqId, { action: "continue" });
-      return;
-    }
-    if (board.state === "done" || board.state === "failed") {
-      // Already terminal — held turn will resolve naturally on the
-      // existing path; nothing more to do here. Stop suppresses a
-      // redundant agent notify.
-      this.client.reply(reqId, { action: "stop" });
-      return;
-    }
-    // Suppress the agent-side notify immediately. The held turn won't
-    // end until we resolve it, but the WS-side cancel doesn't need to
-    // wait — the cleanup happens async.
-    this.client.reply(reqId, { action: "stop" });
-    log.info(
-      `cancel intercept fired on ${shortProjectId(board.projectId)} (session …${sessionId.slice(-8)})`,
-    );
-    void this.runProjectCancel(sessionId, board, "user-cancel");
   }
 
   // Shared project-cancellation core. Called by both the slash command
@@ -2723,152 +2745,129 @@ export class PlannerBridge {
       );
       return;
     }
-    if (note.method === "hydra-acp/prompt_queue/added") {
-      // Distinguish amend vs enqueue, because they're semantically
-      // different user intents:
+    if (note.method === "hydra-acp/commands/cancel") {
+      // Daemon-driven cancel of an in-flight commands/invoke that's
+      // backing one of our held slash command turns. This is the
+      // first-class signal from the daemon — `prompt_queue/added`
+      // and `prompt/amended` only reach attached clients, but the
+      // planner is a transformer, so we never received those. Stage
+      // B added this dedicated notification for extensions.
       //
-      //   * Amend ("Enter" in TUI's default amend mode): user wants
-      //     to redirect — abandon what was running, run this now.
-      //     The yield path: release the held turn so the amended
-      //     prompt runs immediately against the agent. Workers keep
-      //     going in background; user can re-acquire via
-      //     `/hydra planner status`.
-      //
-      //   * Enqueue ("Shift+Enter" in default mode): user explicitly
-      //     accepted that this prompt waits behind the running turn.
-      //     The right behavior is to LEAVE the held turn alone and
-      //     let the enqueued prompt sit at queue position 1. It
-      //     will run naturally when the project completes (or when
-      //     the user later amends / cancels). Yielding here would
-      //     silently override the user's "I'm OK waiting" intent.
-      //
-      // The daemon's `amendOnHead` distinguishes by stamping
-      // `_meta.hydra-acp.amending: <cancelledMessageId>` on the
-      // queue-added notification ([cli session.ts:1727]). Plain
-      // enqueues don't set this meta. We additionally verify the
-      // amend's target matches our held slash command's messageId
-      // — otherwise an unrelated amend (in some future world with
-      // multiple in-flight slash commands) wouldn't trigger our
-      // yield.
+      // Reason semantics:
+      //   - amended    : user wants to redirect; yield the live
+      //                  view so the amended prompt runs against
+      //                  the agent. Project continues in
+      //                  background; workers keep running.
+      //   - cancelled  : ^C / Esc / /hydra planner cancel; full
+      //                  project cancel via runProjectCancel.
+      //   - abandoned  : session is closing; release with a
+      //                  short note. No further worker cleanup
+      //                  needed beyond what markClosed handles
+      //                  daemon-side.
       const params = (note.params ?? {}) as {
         sessionId?: string;
-        prompt?: unknown;
-        _meta?: { "hydra-acp"?: { amending?: string } };
+        messageId?: string;
+        reason?: string;
       };
       const sessionId = params.sessionId;
-      const amending = params._meta?.["hydra-acp"]?.amending;
-      if (typeof sessionId === "string" && typeof amending === "string") {
-        this.maybeYieldHeldTurnOnAmend(sessionId, amending);
-        return;
-      }
-      // Second yield path: a follow-up `/hydra planner <verb>` slash
-      // command landed in the queue. The user explicitly wants to
-      // talk to the planner — cancel, status, pause, etc. — and we
-      // shouldn't make them wait for the project to finish before
-      // the slash dispatches. (Without this, /hydra planner cancel
-      // typed during a running plan would sit in the queue forever
-      // because drainQueue is blocked on our held commands/invoke.)
-      // Other slash commands (/model, /hydra title, etc.) and plain
-      // user prompts via Shift+Enter still queue normally.
-      if (typeof sessionId === "string" && this.isPlannerSlashPrompt(params.prompt)) {
-        this.maybeYieldHeldTurnForFollowupPlannerCommand(sessionId);
-      }
+      const reason = params.reason;
+      if (typeof sessionId !== "string") return;
+      this.handleCommandsCancel(sessionId, reason ?? "");
       return;
     }
     log.debug(`unhandled notification: ${note.method}`);
   }
 
-  // Inspect a prompt_queue_added payload's prompt blocks to see if
-  // the first text content starts with "/hydra planner". Used to
-  // detect follow-up planner slash commands (cancel, status, add,
-  // skip, retask, pause, resume, remove, kill) that the user
-  // expects to dispatch even while a project is held.
-  private isPlannerSlashPrompt(prompt: unknown): boolean {
-    if (!Array.isArray(prompt)) return false;
-    for (const block of prompt) {
-      if (!block || typeof block !== "object") continue;
-      const text = (block as { text?: unknown }).text;
-      if (typeof text !== "string") continue;
-      const trimmed = text.replace(/^\s+/, "");
-      if (
-        trimmed.startsWith("/hydra planner") ||
-        trimmed.startsWith("/hydra hydra-acp-planner")
-      ) {
-        return true;
+  // Handle hydra-acp/commands/cancel — the daemon's signal that an
+  // in-flight commands/invoke (a held slash-command turn) is being
+  // cancelled. Reason determines what we do:
+  //
+  //   - amended:    user wants to redirect their chat to the agent.
+  //                 Yield the live view; project keeps running.
+  //   - cancelled:  user wants to stop the work. Full project
+  //                 cancel — force-cancel workers, freeze board.
+  //   - abandoned:  session is being torn down. Quietly release.
+  //
+  // Two delivery paths:
+  //
+  //   1. If a held turn exists (handleCreate/Execute/Status already
+  //      called holdAndReply), discharge it directly — the held
+  //      promise resolves, commands/invoke replies, drainQueue
+  //      advances.
+  //
+  //   2. If no held turn yet (cancel arrived during decomposition,
+  //      before holdAndReply opened the turn), mark the pending
+  //      dispatch as cancelled. handleCreate / handleExecute /
+  //      handleStatus check the flag at major await boundaries and
+  //      bail out gracefully without opening a held turn that no
+  //      signal could ever resolve.
+  private handleCommandsCancel(sessionId: string, reason: string): void {
+    const normalizedReason: "amended" | "cancelled" | "abandoned" =
+      reason === "cancelled" || reason === "abandoned"
+        ? reason
+        : "amended";
+    // Path 2: flag any pending dispatch on this session so its
+    // handler bails. Find by sessionId since we may not have a
+    // messageId in the notification (or it might not match the
+    // dispatch's stored value if the daemon and planner state are
+    // briefly out of sync during restart).
+    for (const dispatch of pendingDispatches.values()) {
+      if (dispatch.sessionId === sessionId && !dispatch.cancelled) {
+        dispatch.cancelled = true;
+        dispatch.cancelReason = normalizedReason;
       }
-      // Only the leading text block matters for slash detection.
-      break;
     }
-    return false;
-  }
-
-  // Yield path for follow-up `/hydra planner ...` slash commands.
-  // Distinct from the amend path so we can give a different summary
-  // message — here the user is invoking the planner directly, not
-  // chatting with the agent.
-  private maybeYieldHeldTurnForFollowupPlannerCommand(sessionId: string): void {
+    // Path 1: discharge an existing held turn if there is one.
     const held = getHeldTurn(sessionId);
-    if (!held) return;
-    const board = boards.get(sessionId);
-    if (!board || board.state === "done" || board.state === "failed") return;
-    log.info(
-      `yielding held turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)} — follow-up planner slash command queued`,
-    );
-    resolveHeldTurn(sessionId, {
-      reason: "yielded",
-      text:
-        `Pausing live view of ${shortProjectId(board.projectId)} to handle your planner command — project still running in background.`,
-    });
-  }
-
-  // Release the held turn when the user amends our slash command.
-  // The project itself stays running; workers continue and
-  // subsequent plan updates emit via the same session/update channel
-  // (the plan panel re-anchors in the new turn's scrollback). The
-  // user can `/hydra planner status` to re-acquire the live view, or
-  // wait for project completion which still emits its final summary
-  // via the synthetic-message fallback.
-  //
-  // We only yield when the amend specifically targets our held slash
-  // command's messageId — an unrelated amend (e.g. against some
-  // other prompt) wouldn't logically dismiss the live view.
-  //
-  // The "yield on plain enqueue" path is deliberately gone: Shift+
-  // Enter / enqueue is the user explicitly saying "queue this for
-  // later"; yielding would override that. Plain enqueues sit in the
-  // queue at position 1 and run naturally when the project completes
-  // or is cancelled.
-  private maybeYieldHeldTurnOnAmend(
-    sessionId: string,
-    amendedMessageId: string,
-  ): void {
-    const held = getHeldTurn(sessionId);
-    if (!held) return;
-    // Backwards-compat: pre-Stage-A daemons (or planner restarts
-    // mid-project where we lost the messageId tracking) leave
-    // slashMessageId undefined. In that case we conservatively yield
-    // on any amend on this session — matches the previous "yield on
-    // queue addition" behavior. Once everyone's on Stage-A daemons
-    // this becomes a strict match.
-    if (held.slashMessageId && held.slashMessageId !== amendedMessageId) {
-      // Amend on a different prompt — not our slash. Ignore.
+    if (!held) {
+      log.debug(
+        `commands/cancel for session …${sessionId.slice(-8)} (reason=${normalizedReason}) — no held turn yet; pending dispatch flagged`,
+      );
       return;
     }
     const board = boards.get(sessionId);
     if (!board || board.state === "done" || board.state === "failed") {
-      // Project already terminal — let the natural resolution path
-      // close the held turn instead of pre-empting with "yielded".
       return;
     }
     log.info(
-      `yielding held turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)} — slash command amended`,
+      `commands/cancel on ${shortProjectId(board.projectId)} session …${sessionId.slice(-8)} reason=${normalizedReason}`,
     );
+    if (normalizedReason === "cancelled") {
+      void this.runProjectCancel(sessionId, board, "user-cancel");
+      return;
+    }
+    if (normalizedReason === "abandoned") {
+      resolveHeldTurn(sessionId, {
+        reason: "cancelled",
+        text: `Session closing — ${shortProjectId(board.projectId)} state preserved on disk.`,
+      });
+      return;
+    }
     resolveHeldTurn(sessionId, {
       reason: "yielded",
       text:
-        `Pausing live view of ${shortProjectId(board.projectId)} so you can chat — project still running in background.\n` +
+        `Pausing live view of ${shortProjectId(board.projectId)} — project still running in background.\n` +
         "Use `/hydra planner status` to re-open the live view, `/hydra planner cancel` to stop the project.",
     });
+  }
+
+  // Helper: check whether the pending commands/invoke for this
+  // messageId was cancelled. Returns the cancel reason if so, null
+  // otherwise. Handlers call this at major await boundaries (after
+  // decomposition, after attach, etc.) to bail out gracefully when
+  // the daemon already moved on.
+  private checkDispatchCancelled(
+    messageId: string | undefined,
+  ): "amended" | "cancelled" | "abandoned" | null {
+    if (!messageId) return null;
+    const dispatch = pendingDispatches.get(messageId);
+    if (!dispatch || !dispatch.cancelled) return null;
+    return dispatch.cancelReason || "cancelled";
+  }
+
+  private clearPendingDispatch(messageId: string | undefined): void {
+    if (!messageId) return;
+    pendingDispatches.delete(messageId);
   }
 
   // ── Helpers ────────────────────────────────────────────────────────
