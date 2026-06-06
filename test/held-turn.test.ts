@@ -70,6 +70,21 @@ describe("held turn lifecycle", () => {
     // Just confirm the map entry is gone.
   });
 
+  it("can resolve with reason 'yielded' for phase-3 user-prompt detection", async () => {
+    const held = createHeldTurn({
+      orchestratorSessionId: "s1",
+      projectId: "p_abc",
+      commandsInvokeReqId: 1,
+    });
+    resolveHeldTurn("s1", {
+      reason: "yielded",
+      text: "Pausing live view — project still running",
+    });
+    const res = await held.promise;
+    assert.equal(res.reason, "yielded");
+    assert.match(res.text, /Pausing live view/);
+  });
+
   it("separate sessions get independent held turns", async () => {
     const a = createHeldTurn({
       orchestratorSessionId: "s1",

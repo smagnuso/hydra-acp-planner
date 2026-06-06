@@ -612,13 +612,21 @@ export class PlannerBridge {
       sessionId?: string;
       verb?: string;
       args?: string;
+      messageId?: string;
     };
     const sessionId = params.sessionId ?? "";
     const verb = params.verb ?? "";
     const args = (params.args ?? "").trim();
+    // messageId is the user-prompt queue entry id the daemon
+    // assigned to this slash command (Stage A of the slash-as-user-
+    // prompt refactor). We thread it into the held turn so we can
+    // distinguish amend-against-our-slash from other queue events.
+    // Undefined on older daemons; held-turn behavior degrades to
+    // pre-Stage-A "yield on any queue addition" in that case.
+    const messageId = params.messageId;
 
     if (verb === "create") {
-      void this.handleCreate(req.id, sessionId, args).catch((err) => {
+      void this.handleCreate(req.id, sessionId, args, messageId).catch((err) => {
         log.error(`handleCreate threw: ${(err as Error).message}`);
         // The slash command's commands/invoke is still pending —
         // dispatch a reply so it doesn't hang forever.
@@ -629,7 +637,7 @@ export class PlannerBridge {
       return;
     }
     if (verb === "execute") {
-      void this.handleExecute(req.id, sessionId, args).catch((err) => {
+      void this.handleExecute(req.id, sessionId, args, messageId).catch((err) => {
         log.error(`handleExecute threw: ${(err as Error).message}`);
         this.client.reply(req.id, {
           text: `Internal error: ${(err as Error).message}`,
@@ -638,7 +646,12 @@ export class PlannerBridge {
       return;
     }
     if (verb === "status" || verb === "") {
-      this.handleStatus(req.id, sessionId);
+      void this.handleStatus(req.id, sessionId, messageId).catch((err) => {
+        log.error(`handleStatus threw: ${(err as Error).message}`);
+        this.client.reply(req.id, {
+          text: `Internal error: ${(err as Error).message}`,
+        });
+      });
       return;
     }
     if (verb === "cancel") {
@@ -1245,7 +1258,11 @@ export class PlannerBridge {
     void this.scheduleEligibleTasks(sessionId, board);
   }
 
-  private handleStatus(reqId: number | string, sessionId: string): void {
+  private async handleStatus(
+    reqId: number | string,
+    sessionId: string,
+    slashMessageId: string | undefined,
+  ): Promise<void> {
     // In-memory first (hot path for active projects). Falls back to
     // disk for done/failed projects, which rehydrateFromDisk skips on
     // restart to keep the active set lean.
@@ -1260,12 +1277,65 @@ export class PlannerBridge {
       });
       return;
     }
-    this.client.reply(reqId, {
-      text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
-    });
+    // Terminal projects: emit the formatted text and return. No
+    // ongoing activity to hold a turn open for.
+    if (board.state === "done" || board.state === "failed") {
+      this.client.reply(reqId, {
+        text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+      });
+      return;
+    }
+    // Live project: emit the formatted status as a one-shot text
+    // block, then hold the slash command's turn open for ongoing
+    // plan/worker updates. This is the re-acquire path after a
+    // user yield — running `/hydra planner status` while workers
+    // are running re-opens the live view. Held turn naturally
+    // releases on next user input (yield) or project completion.
+    //
+    // Note: requireBoard rejects done/failed but accepts paused —
+    // we use the same in-memory board reference handleStatus
+    // already fetched, since this view should work for ANY session
+    // that owns the project (handleStatus accepts cross-session
+    // status, though the held-turn variant only makes sense for
+    // the orchestrator since the held turn is on commands/invoke
+    // which is per-session).
+    if (boards.get(sessionId) !== board) {
+      // Status request for a project not owned by this session
+      // (e.g. user typed /hydra planner status in a different
+      // session and we found it on disk). Reply with the snapshot
+      // and don't hold — holding a turn here would conflict with
+      // the owning session's state.
+      this.client.reply(reqId, {
+        text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+      });
+      return;
+    }
+    // Best-effort attach (in case this session never invoked us
+    // before in this process lifetime).
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(`status: transformer/attach failed: ${(err as Error).message}`);
+    }
+    // Reject a duplicate hold — if there's already a held turn on
+    // this session, the most recent /hydra planner status is
+    // racing against the existing one. Reply with snapshot only.
+    if (getHeldTurn(sessionId)) {
+      this.client.reply(reqId, {
+        text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+      });
+      return;
+    }
+    await this.holdAndReply(reqId, sessionId, board, slashMessageId);
   }
 
-  private async handleCreate(reqId: number | string, sessionId: string, description: string): Promise<void> {
+  private async handleCreate(
+    reqId: number | string,
+    sessionId: string,
+    description: string,
+    slashMessageId: string | undefined,
+  ): Promise<void> {
     if (!sessionId) {
       this.client.reply(reqId, { text: "planner create: missing sessionId" });
       return;
@@ -1349,16 +1419,13 @@ export class PlannerBridge {
         (fleetModel ? ` [model=${fleetModel}]` : ""),
     );
 
-    // Emit a single muted thought to fill the ~10s silent gap during
-    // decomposition. Using thought_chunk (not agent_message_chunk)
-    // keeps it visually subordinate to whatever's happening in the
-    // turn — renders italic/gray and folds under ^T — and doesn't
-    // crowd the TUI's standard "⚙ thinking…" placeholder visually.
-    void this.emitThoughtMessage(
-      sessionId,
-      `Planning project ${shortProjectId(board.projectId)} — decomposing into tasks…`,
-    );
-
+    // No chrome to fill the decomposition gap — slash commands now
+    // fire user-text in the TUI, which anchors the standard
+    // "⚙ thinking…" placeholder under the user's slash text. The
+    // placeholder is the natural activity indicator while
+    // decomposition runs, and it transitions to "⚙ N tools" once
+    // workers start firing tool calls.
+    //
     // Self-install into this session's chain so our response intercepts
     // fire on the decomposition turn we're about to start. Idempotent.
     try {
@@ -1453,7 +1520,7 @@ export class PlannerBridge {
     // scheduleEligibleTasks finds allTerminal(board), or when the user
     // cancels / removes the project.
     if (board.state === "running") {
-      await this.holdAndReply(reqId, sessionId, board);
+      await this.holdAndReply(reqId, sessionId, board, slashMessageId);
       return;
     }
     // Decomposition failed (board.state === "failed") or no tasks were
@@ -1470,11 +1537,13 @@ export class PlannerBridge {
     reqId: number | string,
     sessionId: string,
     board: Board,
+    slashMessageId: string | undefined,
   ): Promise<void> {
     const held = createHeldTurn({
       orchestratorSessionId: sessionId,
       projectId: board.projectId,
       commandsInvokeReqId: reqId,
+      slashMessageId,
     });
     log.info(
       `holding orchestrator turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)}`,
@@ -1501,6 +1570,7 @@ export class PlannerBridge {
     reqId: number | string,
     sessionId: string,
     args: string,
+    slashMessageId: string | undefined,
   ): Promise<void> {
     if (!sessionId) {
       this.client.reply(reqId, { text: "planner execute: missing sessionId" });
@@ -1578,10 +1648,8 @@ export class PlannerBridge {
         (fleetModel ? ` [model=${fleetModel}]` : ""),
     );
 
-    void this.emitThoughtMessage(
-      sessionId,
-      `Planning project ${shortProjectId(board.projectId)} from this conversation — decomposing into tasks…`,
-    );
+    // TUI's "⚙ thinking…" placeholder fills the decomposition gap
+    // — same rationale as handleCreate.
 
     try {
       await this.client.request("hydra-acp/transformer/attach", { sessionId });
@@ -1645,7 +1713,7 @@ export class PlannerBridge {
       this.finishDecomposition(sessionId, doneState);
     }
     if (board.state === "running") {
-      await this.holdAndReply(reqId, sessionId, board);
+      await this.holdAndReply(reqId, sessionId, board, slashMessageId);
       return;
     }
     this.client.reply(reqId, { text: "" });
@@ -2655,34 +2723,155 @@ export class PlannerBridge {
       );
       return;
     }
+    if (note.method === "hydra-acp/prompt_queue/added") {
+      // Distinguish amend vs enqueue, because they're semantically
+      // different user intents:
+      //
+      //   * Amend ("Enter" in TUI's default amend mode): user wants
+      //     to redirect — abandon what was running, run this now.
+      //     The yield path: release the held turn so the amended
+      //     prompt runs immediately against the agent. Workers keep
+      //     going in background; user can re-acquire via
+      //     `/hydra planner status`.
+      //
+      //   * Enqueue ("Shift+Enter" in default mode): user explicitly
+      //     accepted that this prompt waits behind the running turn.
+      //     The right behavior is to LEAVE the held turn alone and
+      //     let the enqueued prompt sit at queue position 1. It
+      //     will run naturally when the project completes (or when
+      //     the user later amends / cancels). Yielding here would
+      //     silently override the user's "I'm OK waiting" intent.
+      //
+      // The daemon's `amendOnHead` distinguishes by stamping
+      // `_meta.hydra-acp.amending: <cancelledMessageId>` on the
+      // queue-added notification ([cli session.ts:1727]). Plain
+      // enqueues don't set this meta. We additionally verify the
+      // amend's target matches our held slash command's messageId
+      // — otherwise an unrelated amend (in some future world with
+      // multiple in-flight slash commands) wouldn't trigger our
+      // yield.
+      const params = (note.params ?? {}) as {
+        sessionId?: string;
+        prompt?: unknown;
+        _meta?: { "hydra-acp"?: { amending?: string } };
+      };
+      const sessionId = params.sessionId;
+      const amending = params._meta?.["hydra-acp"]?.amending;
+      if (typeof sessionId === "string" && typeof amending === "string") {
+        this.maybeYieldHeldTurnOnAmend(sessionId, amending);
+        return;
+      }
+      // Second yield path: a follow-up `/hydra planner <verb>` slash
+      // command landed in the queue. The user explicitly wants to
+      // talk to the planner — cancel, status, pause, etc. — and we
+      // shouldn't make them wait for the project to finish before
+      // the slash dispatches. (Without this, /hydra planner cancel
+      // typed during a running plan would sit in the queue forever
+      // because drainQueue is blocked on our held commands/invoke.)
+      // Other slash commands (/model, /hydra title, etc.) and plain
+      // user prompts via Shift+Enter still queue normally.
+      if (typeof sessionId === "string" && this.isPlannerSlashPrompt(params.prompt)) {
+        this.maybeYieldHeldTurnForFollowupPlannerCommand(sessionId);
+      }
+      return;
+    }
     log.debug(`unhandled notification: ${note.method}`);
   }
 
-  // ── Helpers ────────────────────────────────────────────────────────
-
-  // Synthetic thought message: muted/italic rendering, foldable via
-  // ^T. Use for low-priority status that fills awkward silent gaps
-  // (e.g. during the decomposition phase) without claiming the
-  // visual real estate that a regular agent_message_chunk would.
-  // Fire-and-forget — emit failures are non-fatal.
-  private emitThoughtMessage(sessionId: string, text: string): void {
-    void this.client
-      .request("hydra-acp/message/emit", {
-        sessionId,
-        method: "session/update",
-        envelope: {
-          sessionId,
-          update: {
-            sessionUpdate: "agent_thought_chunk",
-            content: { type: "text", text },
-          },
-        },
-        route: "chain",
-      })
-      .catch((err) => {
-        log.warn(`emit thought message failed: ${(err as Error).message}`);
-      });
+  // Inspect a prompt_queue_added payload's prompt blocks to see if
+  // the first text content starts with "/hydra planner". Used to
+  // detect follow-up planner slash commands (cancel, status, add,
+  // skip, retask, pause, resume, remove, kill) that the user
+  // expects to dispatch even while a project is held.
+  private isPlannerSlashPrompt(prompt: unknown): boolean {
+    if (!Array.isArray(prompt)) return false;
+    for (const block of prompt) {
+      if (!block || typeof block !== "object") continue;
+      const text = (block as { text?: unknown }).text;
+      if (typeof text !== "string") continue;
+      const trimmed = text.replace(/^\s+/, "");
+      if (
+        trimmed.startsWith("/hydra planner") ||
+        trimmed.startsWith("/hydra hydra-acp-planner")
+      ) {
+        return true;
+      }
+      // Only the leading text block matters for slash detection.
+      break;
+    }
+    return false;
   }
+
+  // Yield path for follow-up `/hydra planner ...` slash commands.
+  // Distinct from the amend path so we can give a different summary
+  // message — here the user is invoking the planner directly, not
+  // chatting with the agent.
+  private maybeYieldHeldTurnForFollowupPlannerCommand(sessionId: string): void {
+    const held = getHeldTurn(sessionId);
+    if (!held) return;
+    const board = boards.get(sessionId);
+    if (!board || board.state === "done" || board.state === "failed") return;
+    log.info(
+      `yielding held turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)} — follow-up planner slash command queued`,
+    );
+    resolveHeldTurn(sessionId, {
+      reason: "yielded",
+      text:
+        `Pausing live view of ${shortProjectId(board.projectId)} to handle your planner command — project still running in background.`,
+    });
+  }
+
+  // Release the held turn when the user amends our slash command.
+  // The project itself stays running; workers continue and
+  // subsequent plan updates emit via the same session/update channel
+  // (the plan panel re-anchors in the new turn's scrollback). The
+  // user can `/hydra planner status` to re-acquire the live view, or
+  // wait for project completion which still emits its final summary
+  // via the synthetic-message fallback.
+  //
+  // We only yield when the amend specifically targets our held slash
+  // command's messageId — an unrelated amend (e.g. against some
+  // other prompt) wouldn't logically dismiss the live view.
+  //
+  // The "yield on plain enqueue" path is deliberately gone: Shift+
+  // Enter / enqueue is the user explicitly saying "queue this for
+  // later"; yielding would override that. Plain enqueues sit in the
+  // queue at position 1 and run naturally when the project completes
+  // or is cancelled.
+  private maybeYieldHeldTurnOnAmend(
+    sessionId: string,
+    amendedMessageId: string,
+  ): void {
+    const held = getHeldTurn(sessionId);
+    if (!held) return;
+    // Backwards-compat: pre-Stage-A daemons (or planner restarts
+    // mid-project where we lost the messageId tracking) leave
+    // slashMessageId undefined. In that case we conservatively yield
+    // on any amend on this session — matches the previous "yield on
+    // queue addition" behavior. Once everyone's on Stage-A daemons
+    // this becomes a strict match.
+    if (held.slashMessageId && held.slashMessageId !== amendedMessageId) {
+      // Amend on a different prompt — not our slash. Ignore.
+      return;
+    }
+    const board = boards.get(sessionId);
+    if (!board || board.state === "done" || board.state === "failed") {
+      // Project already terminal — let the natural resolution path
+      // close the held turn instead of pre-empting with "yielded".
+      return;
+    }
+    log.info(
+      `yielding held turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)} — slash command amended`,
+    );
+    resolveHeldTurn(sessionId, {
+      reason: "yielded",
+      text:
+        `Pausing live view of ${shortProjectId(board.projectId)} so you can chat — project still running in background.\n` +
+        "Use `/hydra planner status` to re-open the live view, `/hydra planner cancel` to stop the project.",
+    });
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────
 
   // Synthetic progress messages get wrapped with leading + trailing
   // newlines so successive emissions render with visible separation in

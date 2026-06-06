@@ -25,7 +25,18 @@
 // interaction, where any subsequent /hydra planner command opens its own
 // short-lived held turn for that op.
 
-export type HeldTurnReason = "complete" | "cancelled" | "removed" | "failed";
+export type HeldTurnReason =
+  | "complete"
+  | "cancelled"
+  | "removed"
+  | "failed"
+  // The held turn was released because the user submitted a non-slash
+  // prompt while it was active — we step aside so they can chat with
+  // the host agent. The project itself keeps running; workers continue
+  // and plan updates still emit. The user can re-acquire the live
+  // view via `/hydra planner status` (which opens a fresh held turn
+  // when the project is still running).
+  | "yielded";
 
 export interface HeldTurnResolution {
   reason: HeldTurnReason;
@@ -38,6 +49,15 @@ export interface HeldTurn {
   // The commands/invoke reqId that handleCreate / handleExecute is
   // holding. We reply to it when the project terminates.
   commandsInvokeReqId: number | string;
+  // The slash command's user-prompt queue entry messageId — passed
+  // through commands/invoke params by the daemon (Stage A). Used to
+  // recognize amend events targeting THIS slash command (the queue
+  // notification's _meta.hydra-acp.amending matches this). Undefined
+  // if the daemon predates Stage A (commands/invoke without
+  // messageId); in that case amend-distinction degrades gracefully
+  // to "yield on any queue-added," matching the pre-Stage-A
+  // behavior.
+  slashMessageId?: string;
   // Promise the handler awaits before replying.
   promise: Promise<HeldTurnResolution>;
   // Resolver. Idempotent: extra calls after the first are no-ops.
@@ -52,6 +72,7 @@ export function createHeldTurn(opts: {
   orchestratorSessionId: string;
   projectId: string;
   commandsInvokeReqId: number | string;
+  slashMessageId?: string;
 }): HeldTurn {
   let resolveFn: (r: HeldTurnResolution) => void = () => undefined;
   const promise = new Promise<HeldTurnResolution>((resolve) => {
@@ -61,6 +82,7 @@ export function createHeldTurn(opts: {
     orchestratorSessionId: opts.orchestratorSessionId,
     projectId: opts.projectId,
     commandsInvokeReqId: opts.commandsInvokeReqId,
+    slashMessageId: opts.slashMessageId,
     promise,
     resolved: false,
     resolve: (r) => {

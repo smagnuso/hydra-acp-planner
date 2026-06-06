@@ -208,6 +208,45 @@ preamble. That means you can ask things like:
 …and the agent answers using the board it can see, without needing
 MCP tools. Slash commands (`/hydra …`) are unaffected.
 
+### Live view, yield, and re-acquire
+
+`/hydra planner create` and `/hydra planner execute` open a **held
+turn** on your session — your slash command stays in flight in
+hydra's queue, plan updates and worker output stream into it, and
+the busy indicator stays on for the project's lifetime.
+
+Your slash command renders as a regular user prompt in the
+transcript (with the standard `⚙ thinking…` placeholder while
+decomposition runs, then a live tools panel as workers fire tool
+calls), so there's no asymmetry between starting a planner project
+and any other agent prompt.
+
+While the live view is held, **^C / Esc** cancels the project
+(force-cancels workers, freezes the board, ends the turn). To chat
+with the agent without killing the project, just type a non-slash
+prompt and hit Enter: the planner **yields** the live view —
+releases the held turn with a "stepping aside" message — and your
+prompt runs against the agent normally. Workers keep going in the
+background; plan updates continue to emit but don't anchor to a
+held turn until you re-acquire.
+
+To re-acquire the live view while a project is running in
+background mode, run `/hydra planner status`. If the project is
+still active, that command opens a fresh held turn carrying the
+current plan panel; subsequent worker output streams under it
+again. When you yield again (type a prompt), the cycle repeats.
+
+The lifecycle in a nutshell:
+
+| Action                                        | Effect on held turn | Effect on project |
+|-----------------------------------------------|---------------------|-------------------|
+| Project completes                             | resolved (`complete`) | done              |
+| `^C` / Esc                                    | resolved (`cancelled`) | force-cancelled, board frozen |
+| `/hydra planner cancel`                       | resolved (`cancelled`) | force-cancelled, board frozen |
+| Typing a non-slash prompt                     | resolved (`yielded`) | continues in background |
+| `/hydra planner status` (with running project) | new held turn opens | unchanged          |
+| `/hydra planner remove`                       | resolved (`removed`) | board deleted     |
+
 ## CLI
 
 The CLI inspects the planner's on-disk state. It works even when the
