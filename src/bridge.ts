@@ -213,6 +213,17 @@ const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
 // believe we're observing the session.
 const attachedSessions = new Set<string>();
 
+// Sessions we've ALSO attached to as a peer client via session/attach
+// (in addition to transformer/attach above). Two roles, one WS
+// connection: transformer-attach plugs us into the chain so we can
+// intercept prompts and updates; session-attach makes us a peer
+// client so we can submit prompts via session/prompt (e.g. to
+// inject /hydra planner status after an amend, restoring the live
+// view at the head of the queue) and receive client broadcasts like
+// hydra-acp/prompt/amended. Mirrors the pattern slack-bridge uses
+// in [slack/src/acp/attach.ts].
+const clientAttachedSessions = new Set<string>();
+
 // Boards rehydrated from disk that we haven't yet been able to attach
 // to because their orchestrator session is still cold. The polling
 // loop probes these every few seconds via `hydra-acp/transformer/attach`
@@ -1594,8 +1605,13 @@ export class PlannerBridge {
         text:
           earlyCancel === "abandoned"
             ? `Session closing — ${shortProjectId(board.projectId)} state preserved on disk.`
-            : `Pausing live view of ${shortProjectId(board.projectId)} — project still running in background.`,
+            : `Pausing live view of ${shortProjectId(board.projectId)} for your prompt — will resume after.`,
       });
+      if (earlyCancel === "amended") {
+        // Same as the late-amend path: inject /hydra planner status
+        // at head so the live view resumes after the amended turn.
+        void this.injectStatusAtHead(sessionId);
+      }
       this.clearPendingDispatch(slashMessageId);
       return;
     }
@@ -2845,10 +2861,17 @@ export class PlannerBridge {
     }
     resolveHeldTurn(sessionId, {
       reason: "yielded",
-      text:
-        `Pausing live view of ${shortProjectId(board.projectId)} — project still running in background.\n` +
-        "Use `/hydra planner status` to re-open the live view, `/hydra planner cancel` to stop the project.",
+      text: `Pausing live view of ${shortProjectId(board.projectId)} for your prompt — will resume after.`,
     });
+    // After the amended prompt's turn completes, the daemon needs
+    // something to keep the project's live view going. Inject
+    // `/hydra planner status` at the queue head so it runs right
+    // after the amended prompt finishes — re-acquiring the held
+    // turn and keeping the session's busy indicator on continuously
+    // through the project's lifetime. The user sees the synthetic
+    // status command in the transcript with originator = planner,
+    // so they know why the live view re-appears.
+    void this.injectStatusAtHead(sessionId);
   }
 
   // Helper: check whether the pending commands/invoke for this
@@ -2871,6 +2894,55 @@ export class PlannerBridge {
   }
 
   // ── Helpers ────────────────────────────────────────────────────────
+
+  // Lazy session/attach to the orchestrator so the planner can act
+  // as a peer client on this session (submit prompts via session/
+  // prompt, receive prompt/amended notifications, etc.) in addition
+  // to its transformer-chain role. Idempotent per session — caches
+  // attached sessions in clientAttachedSessions. historyPolicy:
+  // "none" because we don't need the conversation backfilled; we
+  // just need the WS to be registered as a participant.
+  private async ensureClientAttached(sessionId: string): Promise<void> {
+    if (clientAttachedSessions.has(sessionId)) return;
+    try {
+      await this.client.request("session/attach", {
+        sessionId,
+        historyPolicy: "none",
+      });
+      clientAttachedSessions.add(sessionId);
+      log.debug(`session/attach ok for …${sessionId.slice(-8)}`);
+    } catch (err) {
+      log.warn(
+        `session/attach failed for …${sessionId.slice(-8)}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // Submit a slash command as the planner, queued at the head of
+  // the session's prompt queue. Used after a user amends our held
+  // slash command — once the amended turn ends, the daemon picks
+  // up our injected /hydra planner status which re-acquires the
+  // live view. Visible to the user as a normal-looking prompt in
+  // the transcript (originator.name = "hydra-acp-planner") so they
+  // can see WHY the live view re-appears.
+  //
+  // The injection requires session/attach (lazy via
+  // ensureClientAttached); without it, session/prompt would be
+  // rejected as "not attached to session."
+  private async injectStatusAtHead(sessionId: string): Promise<void> {
+    await this.ensureClientAttached(sessionId);
+    try {
+      await this.client.request("session/prompt", {
+        sessionId,
+        prompt: [{ type: "text", text: "/hydra planner status" }],
+        _meta: { "hydra-acp": { queuePosition: "head" } },
+      });
+    } catch (err) {
+      log.warn(
+        `inject /hydra planner status (head) failed for …${sessionId.slice(-8)}: ${(err as Error).message}`,
+      );
+    }
+  }
 
   // Synthetic progress messages get wrapped with leading + trailing
   // newlines so successive emissions render with visible separation in
