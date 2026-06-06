@@ -43,6 +43,13 @@ export interface HeldTurnResolution {
   text: string;
 }
 
+// Which slash verb opened the held turn. All held-turn verbs share
+// the same post-amend behavior — auto-inject `/hydra planner
+// continue` so the live view re-engages after the user's amended
+// turn finishes. `/hydra planner status` is a one-shot snapshot
+// that doesn't open a held turn, so it's not in this enum.
+export type HeldTurnVerb = "create" | "execute" | "continue";
+
 export interface HeldTurn {
   orchestratorSessionId: string;
   projectId: string;
@@ -58,6 +65,10 @@ export interface HeldTurn {
   // to "yield on any queue-added," matching the pre-Stage-A
   // behavior.
   slashMessageId?: string;
+  // The verb that opened the held turn. Determines whether the
+  // planner auto-injects `/hydra planner status` after the user
+  // amends. See HeldTurnVerb comment above.
+  slashVerb: HeldTurnVerb;
   // Promise the handler awaits before replying.
   promise: Promise<HeldTurnResolution>;
   // Resolver. Idempotent: extra calls after the first are no-ops.
@@ -73,6 +84,7 @@ export function createHeldTurn(opts: {
   projectId: string;
   commandsInvokeReqId: number | string;
   slashMessageId?: string;
+  slashVerb: HeldTurnVerb;
 }): HeldTurn {
   let resolveFn: (r: HeldTurnResolution) => void = () => undefined;
   const promise = new Promise<HeldTurnResolution>((resolve) => {
@@ -83,6 +95,7 @@ export function createHeldTurn(opts: {
     projectId: opts.projectId,
     commandsInvokeReqId: opts.commandsInvokeReqId,
     slashMessageId: opts.slashMessageId,
+    slashVerb: opts.slashVerb,
     promise,
     resolved: false,
     resolve: (r) => {

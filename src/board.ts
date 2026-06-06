@@ -11,7 +11,37 @@ import {
 export const BOARD_SCHEMA_VERSION = 1;
 
 export type TaskStatus = "pending" | "assigned" | "done" | "failed" | "blocked";
-export type BoardState = "decomposing" | "running" | "paused" | "done" | "failed";
+// Board state machine:
+//
+//   decomposing → ready → running → done
+//                     ↘        ↘ ↗ ↓
+//                       running   failed
+//                         ↕
+//                       paused
+//
+//   * decomposing: asked the agent to break the description into a
+//     DAG; awaiting the response.
+//   * ready: decomposition done, plan rendered to the user. No workers
+//     spawned. Awaiting a `/hydra planner execute` call to kick off.
+//     This is the resting state after `create`.
+//   * running: scheduler is dispatching workers and reaping completions.
+//   * paused: scheduling halted by the user; in-flight workers run
+//     to completion but no new tasks dispatch.
+//   * done: every task is in a terminal status, all succeeded.
+//   * failed: every task is in a terminal status, at least one failed
+//     (including user-cancel).
+//
+// `create` produces a `ready` board (decompose + show, no execute).
+// `execute` finds the ready board and transitions it to running, OR
+// decomposes-from-conversation when no board exists and runs in one
+// step (the original execute behavior).
+export type BoardState =
+  | "decomposing"
+  | "ready"
+  | "running"
+  | "paused"
+  | "done"
+  | "failed";
 
 export interface TaskArtifacts {
   files_changed?: string[];
@@ -52,6 +82,20 @@ export interface Board {
   // When true, decomposition won't recompute concurrencyCap from the
   // DAG shape — the user pinned it explicitly via `--workers N`.
   concurrencyCapLocked?: boolean;
+  // Determines what finishDecomposition does once parsing completes:
+  //   - `true`: transition state to `running` and start scheduling
+  //     workers. The execute verb sets this (decompose-from-
+  //     conversation flow), as does anything else that wants the
+  //     project to begin running immediately after decomposition.
+  //   - `false` / unset: transition state to `ready`, emit the plan
+  //     panel and a "run execute to start" message, and stop.
+  //     This is what `create` does: form the plan, show it, and
+  //     wait for the user to opt into kickoff via `/hydra planner
+  //     execute` once they've reviewed (and optionally re-issued
+  //     `/hydra planner create` to revise).
+  // Persisted so a daemon restart mid-decomposition preserves the
+  // user's original intent.
+  pendingExecute?: boolean;
 }
 
 export const PROJECT_ID_PREFIX = "hydra_plan_";

@@ -127,6 +127,24 @@ describe("newBoard", () => {
     assert.equal(b.fleetDefaults.agent, "code-claude");
     assert.equal(b.fleetDefaults.model, "opus");
   });
+
+  it("pendingExecute flag persists across save/load", () => {
+    // create sets pendingExecute=false; execute sets true. The flag
+    // drives whether finishDecomposition kicks off scheduling or
+    // stops at ready. Crash safety: the flag must survive disk
+    // round-trip so a daemon restart mid-decomposition resumes with
+    // the user's original intent.
+    const b = newBoard({ description: "x" });
+    b.pendingExecute = true;
+    saveBoard(b, "hydra_session_pe1");
+    const loaded = loadBoard(b.projectId);
+    assert.equal(loaded?.pendingExecute, true);
+
+    b.pendingExecute = false;
+    saveBoard(b, "hydra_session_pe1");
+    const loadedFalse = loadBoard(b.projectId);
+    assert.equal(loadedFalse?.pendingExecute, false);
+  });
 });
 
 describe("saveBoard / loadBoard", () => {

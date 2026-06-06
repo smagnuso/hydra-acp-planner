@@ -42,6 +42,7 @@ import {
   getHeldTurn,
   resolveHeldTurn,
   type HeldTurnReason,
+  type HeldTurnVerb,
 } from "./held-turn.js";
 import { WorkerForwarder } from "./worker-forward.js";
 import { rmSync } from "node:fs";
@@ -148,7 +149,11 @@ const COMMANDS = [
   },
   {
     verb: "status",
-    description: "Show the board for this session's project.",
+    description: "Show the current board snapshot for this session's project. One-shot — does not open a live view.",
+  },
+  {
+    verb: "continue",
+    description: "Re-open the live view on this session's running project. The plan panel re-renders, worker output streams, banner stays busy until the project completes (or the user amends/cancels).",
   },
   {
     verb: "cancel",
@@ -682,9 +687,20 @@ export class PlannerBridge {
       return;
     }
     if (verb === "status" || verb === "") {
-      void this.handleStatus(req.id, sessionId, messageId)
+      void this.handleStatus(req.id, sessionId)
         .catch((err) => {
           log.error(`handleStatus threw: ${(err as Error).message}`);
+          this.client.reply(req.id, {
+            text: `Internal error: ${(err as Error).message}`,
+          });
+        })
+        .finally(() => this.clearPendingDispatch(messageId));
+      return;
+    }
+    if (verb === "continue") {
+      void this.handleContinue(req.id, sessionId, messageId)
+        .catch((err) => {
+          log.error(`handleContinue threw: ${(err as Error).message}`);
           this.client.reply(req.id, {
             text: `Internal error: ${(err as Error).message}`,
           });
@@ -1296,14 +1312,18 @@ export class PlannerBridge {
     void this.scheduleEligibleTasks(sessionId, board);
   }
 
+  // `/hydra planner status` — snapshot reading. One-shot turn:
+  // emits the formatted board state and ends. Safe to invoke at
+  // any time, on any session (including from a non-orchestrator
+  // session to inspect another session's project) — never affects
+  // the live view's held-turn state.
+  //
+  // For re-opening the live view on a running project, use
+  // `/hydra planner continue` (which opens a held turn).
   private async handleStatus(
     reqId: number | string,
     sessionId: string,
-    slashMessageId: string | undefined,
   ): Promise<void> {
-    // In-memory first (hot path for active projects). Falls back to
-    // disk for done/failed projects, which rehydrateFromDisk skips on
-    // restart to keep the active set lean.
     const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
     if (!board) {
       const attached = attachedSessions.has(sessionId);
@@ -1315,57 +1335,57 @@ export class PlannerBridge {
       });
       return;
     }
-    // Terminal projects: emit the formatted text and return. No
-    // ongoing activity to hold a turn open for.
+    this.client.reply(reqId, {
+      text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+    });
+  }
+
+  // `/hydra planner continue` — open the live view on a running
+  // project owned by this session. Same held-turn machinery as
+  // create/execute, just without a fresh decomposition. Used both
+  // by the user (typed directly to re-acquire after manual yield)
+  // and by the planner itself (auto-injected after amend on
+  // create/execute/continue held turns to keep the live view
+  // engaged through the project's lifetime).
+  //
+  // Errors out (with a friendly message) if the session has no
+  // project or the project is terminal.
+  private async handleContinue(
+    reqId: number | string,
+    sessionId: string,
+    slashMessageId: string | undefined,
+  ): Promise<void> {
+    const board = boards.get(sessionId);
+    if (!board) {
+      this.client.reply(reqId, {
+        text:
+          "No active plan in this session to continue. Use `/hydra planner status` to inspect, or `/hydra planner create <description>` to start a new project.",
+      });
+      return;
+    }
     if (board.state === "done" || board.state === "failed") {
       this.client.reply(reqId, {
-        text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+        text:
+          `Project ${shortProjectId(board.projectId)} is ${board.state} — nothing to continue. Use \`/hydra planner status\` for the final snapshot.`,
       });
       return;
     }
-    // Live project: emit the formatted status as a one-shot text
-    // block, then hold the slash command's turn open for ongoing
-    // plan/worker updates. This is the re-acquire path after a
-    // user yield — running `/hydra planner status` while workers
-    // are running re-opens the live view. Held turn naturally
-    // releases on next user input (yield) or project completion.
-    //
-    // Note: requireBoard rejects done/failed but accepts paused —
-    // we use the same in-memory board reference handleStatus
-    // already fetched, since this view should work for ANY session
-    // that owns the project (handleStatus accepts cross-session
-    // status, though the held-turn variant only makes sense for
-    // the orchestrator since the held turn is on commands/invoke
-    // which is per-session).
-    if (boards.get(sessionId) !== board) {
-      // Status request for a project not owned by this session
-      // (e.g. user typed /hydra planner status in a different
-      // session and we found it on disk). Reply with the snapshot
-      // and don't hold — holding a turn here would conflict with
-      // the owning session's state.
-      this.client.reply(reqId, {
-        text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
-      });
-      return;
-    }
-    // Best-effort attach (in case this session never invoked us
-    // before in this process lifetime).
     try {
       await this.client.request("hydra-acp/transformer/attach", { sessionId });
       attachedSessions.add(sessionId);
     } catch (err) {
-      log.warn(`status: transformer/attach failed: ${(err as Error).message}`);
+      log.warn(`continue: transformer/attach failed: ${(err as Error).message}`);
     }
-    // Reject a duplicate hold — if there's already a held turn on
-    // this session, the most recent /hydra planner status is
-    // racing against the existing one. Reply with snapshot only.
+    // If there's already a held turn, decline politely. The
+    // existing live view is still active; another concurrent hold
+    // would race.
     if (getHeldTurn(sessionId)) {
       this.client.reply(reqId, {
-        text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+        text: `Live view of ${shortProjectId(board.projectId)} is already open.`,
       });
       return;
     }
-    await this.holdAndReply(reqId, sessionId, board, slashMessageId);
+    await this.holdAndReply(reqId, sessionId, board, slashMessageId, "continue");
   }
 
   private async handleCreate(
@@ -1391,11 +1411,42 @@ export class PlannerBridge {
       return;
     }
     const existing = boards.get(sessionId);
-    if (existing && existing.state !== "done" && existing.state !== "failed") {
+    if (
+      existing &&
+      existing.state !== "done" &&
+      existing.state !== "failed" &&
+      existing.state !== "ready"
+    ) {
+      // running / paused / decomposing — refuse. The user needs to
+      // cancel or wait for the in-flight work before forming a new
+      // plan. `ready` boards (formed but not yet executed) are
+      // allowed to be overwritten since the natural workflow is
+      // "create → review → revise (create again) → execute."
       this.client.reply(reqId, {
         text: `planner create: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner cancel\` or \`/hydra planner remove\` it first, or run create from a different session.`,
       });
       return;
+    }
+    // `ready` overwrite: clean up the draft on disk before the new
+    // board claims this session's orchestrator pointer. No workers
+    // were spawned (ready boards have empty board.workers), so this
+    // is purely a disk-cleanup step. For `done` / `failed`
+    // overwrites we deliberately leave the prior directory in place
+    // — those carry the full history (tasks, artifacts) and may be
+    // useful for inspection later.
+    let replacedReadyId: string | undefined;
+    if (existing && existing.state === "ready") {
+      replacedReadyId = existing.projectId;
+      try {
+        rmSync(projectDir(existing.projectId), { recursive: true, force: true });
+        log.info(
+          `replacing prior ready plan ${shortProjectId(existing.projectId)} on session …${sessionId.slice(-8)}`,
+        );
+      } catch (err) {
+        log.warn(
+          `failed to remove prior ready plan ${shortProjectId(existing.projectId)}: ${(err as Error).message}`,
+        );
+      }
     }
 
     // Parse leading fleet-override flags off the description string.
@@ -1440,6 +1491,9 @@ export class PlannerBridge {
       concurrencyCap: fleetWorkers,
       fleetDefaults: { agent: fleetAgent, model: fleetModel },
     });
+    // create's intent: form the plan, show it, stop. No kickoff —
+    // user must run `/hydra planner execute` to start working.
+    board.pendingExecute = false;
     boards.set(sessionId, board);
     saveBoard(board, sessionId);
     setOrchestratorState(sessionId, {
@@ -1451,11 +1505,21 @@ export class PlannerBridge {
     });
 
     log.info(
-      `decomposing project ${board.projectId} for session …${sessionId.slice(-8)}: ${descRemaining.slice(0, 80)}` +
+      `decomposing (plan-only) project ${board.projectId} for session …${sessionId.slice(-8)}: ${descRemaining.slice(0, 80)}` +
         (fleetWorkers ? ` [workers=${fleetWorkers}]` : "") +
         (fleetAgent ? ` [agent=${fleetAgent}]` : "") +
         (fleetModel ? ` [model=${fleetModel}]` : ""),
     );
+    if (replacedReadyId) {
+      // Make the replacement visible in the transcript so the user
+      // knows their previous draft has been retired. No-op visually
+      // when the prior board was done/failed (which we keep on disk
+      // for inspection rather than replace).
+      void this.emitSyntheticMessage(
+        sessionId,
+        `Replacing prior draft plan ${shortProjectId(replacedReadyId)} on this session.`,
+      );
+    }
 
     // No chrome to fill the decomposition gap — slash commands now
     // fire user-text in the TUI, which anchors the standard
@@ -1541,29 +1605,16 @@ export class PlannerBridge {
       return;
     }
 
-    // Turn complete — parse the accumulated reply and emit the summary.
-    // finishDecomposition is synchronous; it also kicks off the first
-    // pass of scheduling via `void this.scheduleEligibleTasks(...)`.
+    // Decomposition is complete (board state is `ready` on success,
+    // `failed` on parse failure — finishDecomposition emitted the
+    // plan panel + "run execute" hint, or the failure explanation,
+    // accordingly). create doesn't hold a turn: the user reviews the
+    // plan in the slash command's natural turn, then runs
+    // `/hydra planner execute` when ready.
     const doneState = getOrchestratorState(sessionId);
     if (doneState && doneState.awaitingDecomposition) {
       this.finishDecomposition(sessionId, doneState);
     }
-
-    // If decomposition succeeded (board transitioned to running), hold
-    // the slash command's commands/invoke open for the whole project.
-    // The held turn keeps the user's turn in flight in hydra's queue —
-    // plan updates emitted via message/emit get grouped under it, ^C
-    // routes through our request:session/cancel intercept, and Enter
-    // defaults to "amend" (per hydra's TUI). The hold is released when
-    // scheduleEligibleTasks finds allTerminal(board), or when the user
-    // cancels / removes the project.
-    if (board.state === "running") {
-      await this.holdAndReply(reqId, sessionId, board, slashMessageId);
-      return;
-    }
-    // Decomposition failed (board.state === "failed") or no tasks were
-    // produced. Reply empty — we've already emitted the failure
-    // explanation via finishDecomposition.
     this.client.reply(reqId, { text: "" });
   }
 
@@ -1576,6 +1627,7 @@ export class PlannerBridge {
     sessionId: string,
     board: Board,
     slashMessageId: string | undefined,
+    slashVerb: HeldTurnVerb,
   ): Promise<void> {
     // If commands/cancel arrived during decomposition (before this
     // moment), the pending dispatch was flagged. Honor it now
@@ -1608,10 +1660,14 @@ export class PlannerBridge {
             : `Pausing live view of ${shortProjectId(board.projectId)} for your prompt — will resume after.`,
       });
       if (earlyCancel === "amended") {
-        // Same as the late-amend path: inject /hydra planner status
-        // at head so the live view resumes after the amended turn.
-        void this.injectStatusAtHead(sessionId);
+        // Same as the late-amend path: inject `/hydra planner
+        // continue` at head so the live view resumes after the
+        // amended turn. slashVerb here is always create / execute /
+        // continue (status doesn't open a held turn), so this is
+        // unconditionally the right behavior.
+        void this.injectContinueAtHead(sessionId);
       }
+      void slashVerb;
       this.clearPendingDispatch(slashMessageId);
       return;
     }
@@ -1621,6 +1677,7 @@ export class PlannerBridge {
       projectId: board.projectId,
       commandsInvokeReqId: reqId,
       slashMessageId,
+      slashVerb,
     });
     log.info(
       `holding orchestrator turn for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)}`,
@@ -1661,10 +1718,39 @@ export class PlannerBridge {
       return;
     }
     const existing = boards.get(sessionId);
-    if (existing && existing.state !== "done" && existing.state !== "failed") {
+    if (
+      existing &&
+      (existing.state === "running" ||
+        existing.state === "paused" ||
+        existing.state === "decomposing")
+    ) {
       this.client.reply(reqId, {
         text: `planner execute: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner cancel\` or \`/hydra planner remove\` it first, or run execute from a different session.`,
       });
+      return;
+    }
+
+    // Fast path: a `ready` board exists from a prior `create`. Kick
+    // it off without re-decomposing — the user already reviewed the
+    // plan, now they want it to start. Schedule workers and hold the
+    // slash command's turn open as the project's live view.
+    if (existing && existing.state === "ready") {
+      log.info(
+        `executing previously-formed plan ${existing.projectId} on session …${sessionId.slice(-8)}`,
+      );
+      existing.state = "running";
+      saveBoard(existing, sessionId);
+      try {
+        await this.client.request("hydra-acp/transformer/attach", { sessionId });
+        attachedSessions.add(sessionId);
+      } catch (err) {
+        log.warn(
+          `execute: transformer/attach failed for ${existing.projectId}: ${(err as Error).message}`,
+        );
+      }
+      // Kick the scheduler so the first batch of workers starts.
+      void this.scheduleEligibleTasks(sessionId, existing);
+      await this.holdAndReply(reqId, sessionId, existing, slashMessageId, "execute");
       return;
     }
 
@@ -1709,6 +1795,10 @@ export class PlannerBridge {
       concurrencyCap: fleetWorkers,
       fleetDefaults: { agent: fleetAgent, model: fleetModel },
     });
+    // execute's intent: decompose + kick off in one step. The flag
+    // tells finishDecomposition to transition state to running and
+    // schedule workers when the agent's decomposition comes back.
+    board.pendingExecute = true;
     boards.set(sessionId, board);
     saveBoard(board, sessionId);
     setOrchestratorState(sessionId, {
@@ -1720,7 +1810,7 @@ export class PlannerBridge {
     });
 
     log.info(
-      `executing project ${board.projectId} for session …${sessionId.slice(-8)} (from conversation)` +
+      `decomposing + executing project ${board.projectId} for session …${sessionId.slice(-8)} (from conversation)` +
         (fleetWorkers ? ` [workers=${fleetWorkers}]` : "") +
         (fleetAgent ? ` [agent=${fleetAgent}]` : "") +
         (fleetModel ? ` [model=${fleetModel}]` : ""),
@@ -1791,7 +1881,7 @@ export class PlannerBridge {
       this.finishDecomposition(sessionId, doneState);
     }
     if (board.state === "running") {
-      await this.holdAndReply(reqId, sessionId, board, slashMessageId);
+      await this.holdAndReply(reqId, sessionId, board, slashMessageId, "execute");
       return;
     }
     this.client.reply(reqId, { text: "" });
@@ -2170,29 +2260,53 @@ export class PlannerBridge {
     if (result.description) {
       board.description = result.description;
     }
-    board.state = "running";
-    saveBoard(board, sessionId);
+    // Two post-decomposition modes, chosen by board.pendingExecute:
+    //
+    //   - kickoff (pendingExecute === true): transition to running
+    //     and start scheduling workers. This is the execute path
+    //     (decompose-from-conversation flow) — caller will open a
+    //     held turn after this returns so plan updates anchor under
+    //     the slash command's turn.
+    //
+    //   - plan-only (pendingExecute false/undefined): transition to
+    //     ready, emit the plan panel and a "run execute to start"
+    //     hint, and stop. This is the create path — caller will
+    //     reply to commands/invoke immediately (no held turn). The
+    //     user reviews the plan and runs `/hydra planner execute`
+    //     when they're ready to kick off.
     state.awaitingDecomposition = false;
     state.decompositionAccumulator = "";
+    const willKickoff = board.pendingExecute === true;
+    board.state = willKickoff ? "running" : "ready";
+    // pendingExecute is consumed — clear it so subsequent operations
+    // (rehydrate after restart, etc.) don't re-trigger kickoff.
+    board.pendingExecute = undefined;
+    saveBoard(board, sessionId);
 
     log.info(
-      `decomposed ${board.projectId}: ${result.tasks.length} tasks, cap=${board.concurrencyCap}, warnings=${result.warnings.length}`,
+      `decomposed ${board.projectId}: ${result.tasks.length} tasks, cap=${board.concurrencyCap}, warnings=${result.warnings.length}, state=${board.state}`,
     );
 
-    // Surface parse warnings as a synthetic chunk (not part of the
-    // plan panel — they're a one-off advisory about the decomposition
-    // parse, not board state). The plan panel renders the task list.
     if (result.warnings.length > 0) {
       const warningsBlock = `${result.warnings.length} decomposition warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}`;
       void this.emitSyntheticMessage(sessionId, warningsBlock);
     }
-    // The full plan summary text would duplicate the plan panel — log
-    // it for debugging only.
     log.debug(formatPlanSummary(result.tasks, board.concurrencyCap));
 
-    // Kick off the scheduler: fills up to concurrencyCap workers with
-    // initial eligible tasks. Subsequent completions trigger refill.
-    void this.scheduleEligibleTasks(sessionId, board);
+    if (willKickoff) {
+      // Kick off the scheduler: fills up to concurrencyCap workers
+      // with initial eligible tasks. Subsequent completions trigger
+      // refill.
+      void this.scheduleEligibleTasks(sessionId, board);
+      return;
+    }
+    // Plan-only mode: emit the plan panel so the user sees what was
+    // formed, then a hint telling them how to start.
+    this.emitPlanUpdate(sessionId, board);
+    void this.emitSyntheticMessage(
+      sessionId,
+      `Plan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner execute\` to start working, or \`/hydra planner create <new description>\` to revise.`,
+    );
   }
 
   // ── Worker scheduling ─────────────────────────────────────────────
@@ -2863,15 +2977,15 @@ export class PlannerBridge {
       reason: "yielded",
       text: `Pausing live view of ${shortProjectId(board.projectId)} for your prompt — will resume after.`,
     });
-    // After the amended prompt's turn completes, the daemon needs
-    // something to keep the project's live view going. Inject
-    // `/hydra planner status` at the queue head so it runs right
-    // after the amended prompt finishes — re-acquiring the held
-    // turn and keeping the session's busy indicator on continuously
-    // through the project's lifetime. The user sees the synthetic
-    // status command in the transcript with originator = planner,
-    // so they know why the live view re-appears.
-    void this.injectStatusAtHead(sessionId);
+    // After the amended prompt's turn completes, inject `/hydra
+    // planner continue` at the queue head so the live view resumes —
+    // keeps the session's busy indicator on continuously through the
+    // project's lifetime, and gives the user visible attribution of
+    // WHY the live view re-appears. All held-turn verbs (create /
+    // execute / continue) share this behavior — there's no held-turn
+    // verb where auto-re-engage would be wrong. (`status` doesn't
+    // open a held turn, so it can never reach this path.)
+    void this.injectContinueAtHead(sessionId);
   }
 
   // Helper: check whether the pending commands/invoke for this
@@ -2918,28 +3032,28 @@ export class PlannerBridge {
     }
   }
 
-  // Submit a slash command as the planner, queued at the head of
-  // the session's prompt queue. Used after a user amends our held
-  // slash command — once the amended turn ends, the daemon picks
-  // up our injected /hydra planner status which re-acquires the
-  // live view. Visible to the user as a normal-looking prompt in
-  // the transcript (originator.name = "hydra-acp-planner") so they
-  // can see WHY the live view re-appears.
+  // Submit `/hydra planner continue` as the planner, queued at the
+  // head of the session's prompt queue. Used after a user amends
+  // our held slash command — once the amended turn ends, the daemon
+  // picks up our injected continue, which re-acquires the live
+  // view. Visible to the user as a normal-looking prompt in the
+  // transcript (originator.name = "hydra-acp-planner") so they can
+  // see WHY the live view re-appears.
   //
   // The injection requires session/attach (lazy via
   // ensureClientAttached); without it, session/prompt would be
   // rejected as "not attached to session."
-  private async injectStatusAtHead(sessionId: string): Promise<void> {
+  private async injectContinueAtHead(sessionId: string): Promise<void> {
     await this.ensureClientAttached(sessionId);
     try {
       await this.client.request("session/prompt", {
         sessionId,
-        prompt: [{ type: "text", text: "/hydra planner status" }],
+        prompt: [{ type: "text", text: "/hydra planner continue" }],
         _meta: { "hydra-acp": { queuePosition: "head" } },
       });
     } catch (err) {
       log.warn(
-        `inject /hydra planner status (head) failed for …${sessionId.slice(-8)}: ${(err as Error).message}`,
+        `inject /hydra planner continue (head) failed for …${sessionId.slice(-8)}: ${(err as Error).message}`,
       );
     }
   }

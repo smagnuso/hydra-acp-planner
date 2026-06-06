@@ -162,9 +162,10 @@ daemon connect time so they show up in tab-complete.
 
 | Command                                              | Effect |
 |------------------------------------------------------|--------|
-| `/hydra planner create [flags] <description>`        | Plan a fresh project from `<description>`. Asks the host agent to decompose, then spawns workers. See **flags** below. |
-| `/hydra planner execute [flags]`                     | Plan from the conversation so far — no description needed. Asks the host agent to decompose what you've been discussing into a task DAG and spawns workers. |
-| `/hydra planner status`                              | Render the current session's board (tasks, states, worker assignments, attached status). |
+| `/hydra planner create [flags] <description>`        | **Form a plan** from `<description>`. Asks the host agent to decompose into a task DAG, shows you the plan, and stops — no workers spawned. Review the plan; iterate by running `create` again with a revised description; commit by running `execute` when you're satisfied. See **flags** below. |
+| `/hydra planner execute [flags]`                     | **Run the plan.** If a `create` plan is already ready on this session, kick it off (transition to running, spawn workers, open the live view). If there's no plan yet, decompose from the current conversation and run in one step (the original execute behavior). |
+| `/hydra planner status`                              | One-shot snapshot of the current session's board (tasks, states, worker assignments). Doesn't open the live view — safe to type anytime without affecting an in-flight project. |
+| `/hydra planner continue`                            | Open the live view on this session's running project. Plan panel re-renders, worker output streams, banner stays busy until the project completes (or the user amends/cancels). Used both manually and auto-injected by the planner after every amend on `create`/`execute`/`continue`. |
 | `/hydra planner add <description>`                   | Slot a new task into the current project. Asks the orchestrator agent where it fits in the DAG; appends and schedules. |
 | `/hydra planner retask <taskId>`                     | Reset a task to pending. Closes its current worker (if any), bumps `attemptCount`, schedules a fresh attempt. |
 | `/hydra planner skip <taskId>`                       | Mark a task done without running it (artifacts: `skipped by user`). Frees its worker. |
@@ -208,6 +209,24 @@ preamble. That means you can ask things like:
 …and the agent answers using the board it can see, without needing
 MCP tools. Slash commands (`/hydra …`) are unaffected.
 
+### Workflow: form a plan, then execute
+
+Project lifecycle is two-phase:
+
+1. **Form** with `/hydra planner create <description>`. The planner asks the agent to decompose into a task DAG, saves the plan to disk, shows it to you, and stops. No workers spawned yet. State: `ready`. Revise by running `create` again with a different description — the previous ready plan is replaced.
+2. **Run** with `/hydra planner execute`. Transitions the ready plan to `running`, spawns workers, opens the live view. Banner busy until the project completes.
+
+If you skip step 1 and just run `/hydra planner execute` on a fresh session, the planner decomposes from the current conversation and kicks off in one step (the original single-shot behavior).
+
+```text
+> /hydra planner create build a Python web scraper
+   (decomposes; plan panel shows; turn ends)
+   ...you read the plan, decide it looks good...
+
+> /hydra planner execute
+   (workers start, live view engages, banner stays busy)
+```
+
 ### Live view, yield, and re-acquire
 
 `/hydra planner create` and `/hydra planner execute` open a **held
@@ -231,10 +250,12 @@ background; plan updates continue to emit but don't anchor to a
 held turn until you re-acquire.
 
 To re-acquire the live view while a project is running in
-background mode, run `/hydra planner status`. If the project is
-still active, that command opens a fresh held turn carrying the
-current plan panel; subsequent worker output streams under it
-again. When you yield again (type a prompt), the cycle repeats.
+background mode, run `/hydra planner continue`. The planner also
+**auto-injects** `/hydra planner continue` after every amend, so
+the live view re-engages right after your amended turn ends — you
+don't have to remember to run it yourself. `/hydra planner status`
+is a separate verb that prints a one-shot snapshot without
+opening the live view, for when you just want a quick check.
 
 The lifecycle in a nutshell:
 
@@ -243,8 +264,9 @@ The lifecycle in a nutshell:
 | Project completes                             | resolved (`complete`) | done              |
 | `^C` / Esc                                    | resolved (`cancelled`) | force-cancelled, board frozen |
 | `/hydra planner cancel`                       | resolved (`cancelled`) | force-cancelled, board frozen |
-| Typing a non-slash prompt                     | resolved (`yielded`) | continues in background |
-| `/hydra planner status` (with running project) | new held turn opens | unchanged          |
+| Typing a non-slash prompt (Enter, default amend) | resolved (`yielded`) + auto-injects `/hydra planner continue` after the amended turn | continues in background |
+| `/hydra planner continue` (running project)   | new held turn opens | unchanged          |
+| `/hydra planner status`                       | no change (one-shot snapshot) | unchanged    |
 | `/hydra planner remove`                       | resolved (`removed`) | board deleted     |
 
 ## CLI
