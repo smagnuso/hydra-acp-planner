@@ -178,9 +178,9 @@ const COMMANDS = [
     description: "Re-open the live view on this session's running project. The plan panel re-renders, worker output streams, banner stays busy until the project completes (or the user amends/cancels).",
   },
   {
-    verb: "cancel",
+    verb: "stop",
     argsHint: "[<projectId>]",
-    description: "Stop this session's project (or another by id). Cancels in-flight workers; pending tasks stay frozen on the board.",
+    description: "Stop this session's project (or another by id). Force-cancels in-flight workers and reverts those tasks to pending; the project is resumable via /hydra planner execute.",
   },
   {
     verb: "add",
@@ -255,7 +255,7 @@ export const attachedSessions = new Set<string>();
 // view at the head of the queue) and receive client broadcasts like
 // hydra-acp/prompt/amended. Mirrors the pattern slack-bridge uses
 // in [slack/src/acp/attach.ts].
-const clientAttachedSessions = new Set<string>();
+export const clientAttachedSessions = new Set<string>();
 
 // Boards rehydrated from disk that we haven't yet been able to attach
 // to because their orchestrator session is still cold. The polling
@@ -779,8 +779,8 @@ export class PlannerBridge {
         .finally(() => this.clearPendingDispatch(messageId));
       return;
     }
-    if (verb === "cancel") {
-      this.handleCancel(req.id, sessionId, args);
+    if (verb === "stop") {
+      this.handleStop(req.id, sessionId, args);
       return;
     }
     if (verb === "add") {
@@ -828,7 +828,7 @@ export class PlannerBridge {
   // worker-completion callbacks from re-arming. No sessions are deleted —
   // both orchestrator and worker sessions remain, so the user can
   // inspect (or later, when M5 resurrection lands, resume).
-  private handleCancel(
+  private handleStop(
     reqId: number | string,
     sessionId: string,
     args: string,
@@ -856,12 +856,16 @@ export class PlannerBridge {
         text:
           args.length > 0
             ? `No project '${args}' found.`
-            : "No plan in this session to cancel. Use `/hydra planner cancel <projectId>` for a different project.",
+            : "No plan in this session to stop. Use `/hydra planner stop <projectId>` for a different project.",
       });
       return;
     }
     const canonical = board.projectId;
-    if (board.state === "done" || board.state === "failed") {
+    if (
+      board.state === "done" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
       this.client.reply(reqId, {
         text: `Project ${shortProjectId(canonical)} is already ${board.state}.`,
       });
@@ -876,7 +880,7 @@ export class PlannerBridge {
     // session (cancel by project id), there's no held turn for the
     // caller's session, so we reply to the caller's commands/invoke
     // separately with a short ack.
-    void this.runProjectCancel(orchestratorSessionId, board, "slash");
+    void this.runProjectStop(orchestratorSessionId, board, "slash");
     const tail =
       inFlight > 0
         ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} cancelled`
@@ -1434,10 +1438,17 @@ export class PlannerBridge {
       });
       return;
     }
-    if (board.state === "done" || board.state === "failed") {
+    if (
+      board.state === "done" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
+      const tail =
+        board.state === "stopped"
+          ? ` Use \`/hydra planner execute\` to resume, or \`/hydra planner status\` for the snapshot.`
+          : ` Use \`/hydra planner status\` for the final snapshot.`;
       this.client.reply(reqId, {
-        text:
-          `Project ${shortProjectId(board.projectId)} is ${board.state} — nothing to continue. Use \`/hydra planner status\` for the final snapshot.`,
+        text: `Project ${shortProjectId(board.projectId)} is ${board.state} — nothing to continue.${tail}`,
       });
       return;
     }
@@ -1486,15 +1497,16 @@ export class PlannerBridge {
       existing &&
       existing.state !== "done" &&
       existing.state !== "failed" &&
-      existing.state !== "ready"
+      existing.state !== "ready" &&
+      existing.state !== "stopped"
     ) {
       // running / paused / decomposing — refuse. The user needs to
-      // cancel or wait for the in-flight work before forming a new
-      // plan. `ready` boards (formed but not yet executed) are
-      // allowed to be overwritten since the natural workflow is
-      // "create → review → revise (create again) → execute."
+      // stop or wait for the in-flight work before forming a new
+      // plan. `ready` / `stopped` boards (formed-but-not-executed,
+      // or user-halted) are overwritable since the workflow allows
+      // "create → review → revise" or "stop → revise → create new".
       this.client.reply(reqId, {
-        text: `planner create: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner cancel\` or \`/hydra planner remove\` it first, or run create from a different session.`,
+        text: `planner create: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner stop\` or \`/hydra planner remove\` it first, or run create from a different session.`,
       });
       return;
     }
@@ -1711,7 +1723,7 @@ export class PlannerBridge {
       log.info(
         `commands/cancel arrived during decomposition for ${shortProjectId(board.projectId)} — running project cancel before opening held turn`,
       );
-      await this.runProjectCancel(sessionId, board, "user-cancel");
+      await this.runProjectStop(sessionId, board, "user-cancel");
       this.client.reply(reqId, {
         text: `Cancelled ${shortProjectId(board.projectId)}.`,
       });
@@ -1796,18 +1808,18 @@ export class PlannerBridge {
         existing.state === "decomposing")
     ) {
       this.client.reply(reqId, {
-        text: `planner execute: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner cancel\` or \`/hydra planner remove\` it first, or run execute from a different session.`,
+        text: `planner execute: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner stop\` or \`/hydra planner remove\` it first, or run execute from a different session.`,
       });
       return;
     }
 
-    // Fast path: a `ready` board exists from a prior `create`. Kick
-    // it off without re-decomposing — the user already reviewed the
-    // plan, now they want it to start. Schedule workers and hold the
-    // slash command's turn open as the project's live view.
-    if (existing && existing.state === "ready") {
+    // Fast path: a `ready` or `stopped` board exists. Ready = first
+    // run after create; stopped = resume after user-initiated stop
+    // (runProjectStop reverted in-flight tasks to pending). Both
+    // paths flip to running and kick the scheduler — no re-decomp.
+    if (existing && (existing.state === "ready" || existing.state === "stopped")) {
       log.info(
-        `executing previously-formed plan ${existing.projectId} on session …${sessionId.slice(-8)}`,
+        `${existing.state === "stopped" ? "resuming stopped" : "executing previously-formed"} plan ${existing.projectId} on session …${sessionId.slice(-8)}`,
       );
       existing.state = "running";
       saveBoard(existing, sessionId);
@@ -1990,7 +2002,7 @@ export class PlannerBridge {
   }
 
   // Shared project-cancellation core. Called by both the slash command
-  // (/hydra planner cancel) and the session/cancel intercept. Marks
+  // (/hydra planner stop) and the session/cancel intercept. Marks
   // in-flight tasks failed, force-cancels their workers, transitions
   // board state to failed, persists, emits a final plan snapshot, and
   // resolves the held turn (if any) with a cancelled summary.
@@ -1998,29 +2010,41 @@ export class PlannerBridge {
   // `source` is purely informational — included in the resolved text
   // so the user can tell whether they pressed ^C or typed the slash
   // command. Both paths produce identical board mutations.
-  private async runProjectCancel(
+  private async runProjectStop(
     orchestratorSessionId: string,
     board: Board,
     source: "user-cancel" | "slash",
   ): Promise<void> {
-    if (board.state === "done" || board.state === "failed") {
-      // Race: a concurrent /hydra planner cancel or completion already
-      // landed. Idempotent no-op.
+    if (
+      board.state === "done" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
+      // Race: a concurrent stop or completion already landed.
+      // Idempotent no-op.
       return;
     }
+    // In-flight tasks revert to `pending` rather than `failed`. The
+    // distinction matters: `failed` means "something broke, look at
+    // it"; user-initiated stop means "I'll come back to this." When
+    // execute later resumes the board, pickEligible finds the
+    // pending tasks naturally. attemptCount stays incremented from
+    // the spawn so retry semantics remain honest.
     const inFlight: Array<{ workerId: string; taskId: string }> = [];
     for (const task of board.tasks) {
       if (task.status === "assigned" && task.assignedTo) {
         inFlight.push({ workerId: task.assignedTo, taskId: task.id });
-        task.status = "failed";
-        task.finishedAt = nowIso();
+        task.status = "pending";
+        task.assignedTo = null;
+        task.startedAt = null;
+        task.finishedAt = null;
       }
     }
-    board.state = "failed";
+    board.state = "stopped";
     saveBoard(board, orchestratorSessionId);
 
     log.info(
-      `cancelling project ${shortProjectId(board.projectId)} (${source}) — ${inFlight.length} in-flight worker${inFlight.length === 1 ? "" : "s"}`,
+      `stopping project ${shortProjectId(board.projectId)} (${source}) — ${inFlight.length} in-flight worker${inFlight.length === 1 ? "" : "s"}`,
     );
     for (const { workerId } of inFlight) {
       // Abandon any buffered text — flushing post-cancel would surface
@@ -2048,16 +2072,16 @@ export class PlannerBridge {
           );
         });
     }
-    // Final plan snapshot so the closing turn shows the cancelled state.
+    // Final plan snapshot so the closing turn shows the stopped state.
     this.emitPlanUpdate(orchestratorSessionId, board);
 
     const tail =
       inFlight.length > 0
-        ? `; ${inFlight.length} in-flight task${inFlight.length === 1 ? "" : "s"} cancelled`
+        ? `; ${inFlight.length} in-flight task${inFlight.length === 1 ? "" : "s"} reverted to pending`
         : "";
     resolveHeldTurn(orchestratorSessionId, {
       reason: "cancelled",
-      text: `Project ${shortProjectId(board.projectId)} cancelled${tail}.`,
+      text: `Project ${shortProjectId(board.projectId)} stopped${tail}. Use /hydra planner execute (or planner_execute) to resume.`,
     });
   }
 
@@ -2414,7 +2438,11 @@ export class PlannerBridge {
     // user-cancelled), never schedule new work. Completion callbacks
     // from in-flight workers still fire after cancel — the guard
     // prevents them from re-arming the scheduler.
-    if (board.state === "done" || board.state === "failed") {
+    if (
+      board.state === "done" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
       return;
     }
     // Paused: in-flight workers keep running and their completions
@@ -2802,7 +2830,7 @@ export class PlannerBridge {
     board: Board,
     task: Task,
   ): void {
-    // Cancellation guard: runProjectCancel marks every in-flight task
+    // Cancellation guard: runProjectStop marks every in-flight task
     // `failed` and force-cancels its worker. If force_cancel arrived
     // too late and the agent's turn completed successfully anyway,
     // this callback still fires — without the guard we'd happily
@@ -2812,9 +2840,17 @@ export class PlannerBridge {
     // can leak into a subsequent project's transcript on the same
     // session. Quiet bail is correct: cancel already resolved the
     // held turn and emitted the cancel summary.
-    if (task.status === "failed" || board.state === "failed") {
+    // Stop reverts assigned tasks to pending (and board to stopped);
+    // genuine task failures leave the task `failed`. Both cases mean
+    // "this completion is stale — don't process artifacts."
+    if (
+      task.status === "failed" ||
+      task.status === "pending" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
       log.debug(
-        `task ${task.id}: ignoring late completion — already cancelled`,
+        `task ${task.id}: ignoring late completion — already accounted for`,
       );
       return;
     }
@@ -2898,16 +2934,21 @@ export class PlannerBridge {
     reason: string,
   ): void {
     // Suppress double-report when the task was already marked failed
-    // by an outer cancellation (runProjectCancel marks every in-flight
+    // by an outer cancellation (runProjectStop marks every in-flight
     // task `failed` and force-cancels its worker; the worker's emit
     // promise then rejects with "connection closed" which lands here).
     // Without this guard the user sees the project's cancel summary
     // followed by a redundant "Tn failed — task turn failed: -32603"
     // line for each in-flight worker. Quiet cleanup is the right
     // behavior — the cancel summary already accounts for these.
-    if (task.status === "failed" || board.state === "failed") {
+    if (
+      task.status === "failed" ||
+      task.status === "pending" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
       log.debug(
-        `task ${task.id}: ignoring late failure (${reason}) — already accounted for by cancel`,
+        `task ${task.id}: ignoring late failure (${reason}) — already accounted for by stop/cancel`,
       );
       this.endWorkerForward(workerSessionId);
       clearWorkerState(workerSessionId);
@@ -2975,8 +3016,8 @@ export class PlannerBridge {
       //                  view so the amended prompt runs against
       //                  the agent. Project continues in
       //                  background; workers keep running.
-      //   - cancelled  : ^C / Esc / /hydra planner cancel; full
-      //                  project cancel via runProjectCancel.
+      //   - cancelled  : ^C / Esc / /hydra planner stop; full
+      //                  project cancel via runProjectStop.
       //   - abandoned  : session is closing; release with a
       //                  short note. No further worker cleanup
       //                  needed beyond what markClosed handles
@@ -3043,14 +3084,19 @@ export class PlannerBridge {
       return;
     }
     const board = boards.get(sessionId);
-    if (!board || board.state === "done" || board.state === "failed") {
+    if (
+      !board ||
+      board.state === "done" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
       return;
     }
     log.info(
       `commands/cancel on ${shortProjectId(board.projectId)} session …${sessionId.slice(-8)} reason=${normalizedReason}`,
     );
     if (normalizedReason === "cancelled") {
-      void this.runProjectCancel(sessionId, board, "user-cancel");
+      void this.runProjectStop(sessionId, board, "user-cancel");
       return;
     }
     if (normalizedReason === "abandoned") {
@@ -3294,8 +3340,8 @@ export class PlannerBridge {
           return this.toolGetStatus(req.id, sessionId);
         case "planner_add_task":
           return await this.toolAddTask(req.id, sessionId, args);
-        case "planner_cancel":
-          return this.toolCancel(req.id, sessionId);
+        case "planner_stop":
+          return this.toolStop(req.id, sessionId);
         case "planner_pause":
           return this.toolPause(req.id, sessionId);
         case "planner_resume":
@@ -3385,7 +3431,9 @@ export class PlannerBridge {
     }
 
     // Refuse to overwrite a running/paused board — same guard as
-    // /hydra planner create. ready/done/failed boards are replaceable.
+    // /hydra planner create. ready/done/failed/stopped boards are
+    // replaceable (stopped is user-halted-and-resumable, so set_plan
+    // is a legitimate "I want to start over" path).
     const existing = boards.get(sessionId);
     if (
       existing &&
@@ -3395,7 +3443,7 @@ export class PlannerBridge {
     ) {
       return this.replyMcpTextError(
         reqId,
-        `planner_set_plan: project ${shortProjectId(existing.projectId)} is already ${existing.state}. Cancel or remove it first.`,
+        `planner_set_plan: project ${shortProjectId(existing.projectId)} is already ${existing.state}. Stop or remove it first.`,
       );
     }
     // Clean up a prior ready draft on disk before overwriting (same
@@ -3492,7 +3540,11 @@ export class PlannerBridge {
         `planner_execute: project ${shortProjectId(board.projectId)} is ${board.state}. Call planner_set_plan to start a new project.`,
       );
     }
-    if (board.state !== "ready") {
+    // ready and stopped are both eligible starting points. ready =
+    // fresh plan waiting for kickoff; stopped = user halted, in-flight
+    // tasks already reverted to pending by runProjectStop. Both flow
+    // through the same transition below.
+    if (board.state !== "ready" && board.state !== "stopped") {
       return this.replyMcpTextError(
         reqId,
         `planner_execute: project ${shortProjectId(board.projectId)} is ${board.state}; not ready to execute.`,
@@ -3504,6 +3556,7 @@ export class PlannerBridge {
     // session/updates regardless, and the user can run
     // `/hydra planner continue` to open a held live view turn if
     // they want.
+    const wasStopped = board.state === "stopped";
     board.state = "running";
     saveBoard(board, sessionId);
     try {
@@ -3513,9 +3566,17 @@ export class PlannerBridge {
       log.warn(`execute (tool): transformer/attach failed: ${(err as Error).message}`);
     }
     void this.scheduleEligibleTasks(sessionId, board);
+    // Inject /hydra planner continue at the head of the session's
+    // queue so the TUI opens a held live view automatically. Without
+    // this, the MCP tool call returns immediately and the TUI goes
+    // idle even though workers are running. The continue command
+    // picks up after the agent's current turn ends — natural timing.
+    void this.injectContinueAtHead(sessionId);
+    const verb = wasStopped ? "Resumed" : "Kicked off";
+    const remaining = board.tasks.filter((t) => t.status !== "done").length;
     this.replyMcpResult(
       reqId,
-      `Kicked off ${shortProjectId(board.projectId)}: ${board.tasks.length} tasks, ${board.concurrencyCap} concurrent. Workers spawning now. Use planner_get_status to check progress, or /hydra planner continue to open the live view.`,
+      `${verb} ${shortProjectId(board.projectId)}: ${remaining} task${remaining === 1 ? "" : "s"} remaining, ${board.concurrencyCap} concurrent. Workers spawning now. Live view will open once your current turn ends.`,
       {
         projectId: board.projectId,
         taskCount: board.tasks.length,
@@ -3628,22 +3689,26 @@ export class PlannerBridge {
     );
   }
 
-  private toolCancel(reqId: number | string, sessionId: string): void {
+  private toolStop(reqId: number | string, sessionId: string): void {
     const board = boards.get(sessionId);
     if (!board) {
-      return this.replyMcpTextError(reqId, "planner_cancel: no project on this session");
+      return this.replyMcpTextError(reqId, "planner_stop: no project on this session");
     }
-    if (board.state === "done" || board.state === "failed") {
+    if (
+      board.state === "done" ||
+      board.state === "failed" ||
+      board.state === "stopped"
+    ) {
       return this.replyMcpResult(
         reqId,
         `Project ${shortProjectId(board.projectId)} is already ${board.state}.`,
       );
     }
     const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
-    void this.runProjectCancel(sessionId, board, "slash");
+    void this.runProjectStop(sessionId, board, "slash");
     this.replyMcpResult(
       reqId,
-      `Cancelled ${shortProjectId(board.projectId)}${inFlight > 0 ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} force-cancelled` : ""}.`,
+      `Stopped ${shortProjectId(board.projectId)}${inFlight > 0 ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} reverted to pending` : ""}. Call planner_execute to resume.`,
     );
   }
 
@@ -3680,6 +3745,9 @@ export class PlannerBridge {
     board.state = "running";
     saveBoard(board, sessionId);
     void this.scheduleEligibleTasks(sessionId, board);
+    // Same rationale as toolExecute — re-open the live view so the
+    // TUI shows busy while resumed work runs.
+    void this.injectContinueAtHead(sessionId);
     this.replyMcpResult(reqId, `Resumed ${shortProjectId(board.projectId)}.`);
   }
 

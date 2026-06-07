@@ -42,7 +42,7 @@ Workflow:
 
   6. While running, call planner_get_status when the user asks \
      about progress, planner_add_task to slot in mid-flight \
-     additions, or planner_cancel / planner_pause / planner_resume \
+     additions, or planner_stop / planner_pause / planner_resume \
      to control execution.
 
 User-stated preferences (worker count, preferred agent/model, \
@@ -200,9 +200,9 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_cancel",
+    name: "planner_stop",
     description:
-      "Stop the running project. Force-cancels in-flight workers, freezes the board state. Use only when the user explicitly wants to abort.",
+      "Stop the running project. Force-cancels in-flight workers and reverts those tasks to pending; the project moves to state 'stopped' and is resumable via planner_execute. Use when the user wants to halt work but might come back to it. Distinct from planner_remove (which deletes the project) and planner_pause (which lets in-flight workers finish).",
     inputSchema: {
       type: "object",
       properties: {},
@@ -258,7 +258,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "planner_remove",
     description:
-      "Delete this session's project. Closes worker sessions; orchestrator session is left intact. Use only when the user is done with the project entirely — for stopping work without deleting, use planner_cancel.",
+      "Delete this session's project. Closes worker sessions; orchestrator session is left intact. Use only when the user is done with the project entirely — for stopping work without deleting, use planner_stop.",
     inputSchema: {
       type: "object",
       properties: {},

@@ -8,6 +8,7 @@ import {
   PlannerBridge,
   boards,
   attachedSessions,
+  clientAttachedSessions,
   type BridgeClient,
 } from "../src/bridge.ts";
 import { newBoard, saveBoard, type Board } from "../src/board.ts";
@@ -104,6 +105,7 @@ beforeEach(() => {
   process.env.HOME = tmpHome;
   boards.clear();
   attachedSessions.clear();
+  clientAttachedSessions.clear();
   client = new FakeClient();
   bridge = new PlannerBridge({
     daemonWsUrl: "ws://unused",
@@ -117,6 +119,7 @@ afterEach(() => {
   rmSync(tmpHome, { recursive: true, force: true });
   boards.clear();
   attachedSessions.clear();
+  clientAttachedSessions.clear();
 });
 
 // Direct-invoke private dispatcher.
@@ -445,6 +448,63 @@ describe("planner_execute", () => {
     assert.equal(result.structuredContent.state, "running");
     assert.match(result.content[0]!.text, /Kicked off/);
   });
+
+  it("accepts a stopped board and reports 'Resumed' rather than 'Kicked off'", async () => {
+    // After planner_stop, the board state is `stopped` and previously
+    // assigned tasks are pending. Execute should treat this as a
+    // resume — same transition + scheduler kick, distinct message.
+    seedBoard("hydra_session_test", {
+      state: "stopped",
+      tasks: [
+        { id: "T1", title: "done", status: "done" },
+        // T2 depends on T3 (which is blocked), so the scheduler
+        // can't pick it up — keeps the fake from spawning a phantom
+        // worker. The test is about the resume *transition*, not
+        // actual scheduling.
+        { id: "T2", title: "was-assigned", status: "pending", deps: ["T3"] },
+        { id: "T3", title: "blocked", status: "blocked" },
+      ],
+    });
+    dispatch(mkInvoke(37, "planner_execute", {}));
+    await settle();
+    assert.equal(boards.get("hydra_session_test")!.state, "running");
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }>; structuredContent: { state: string } };
+    assert.equal(result.structuredContent.state, "running");
+    assert.match(result.content[0]!.text, /Resumed/);
+    // Remaining-tasks count excludes the already-done task.
+    assert.match(result.content[0]!.text, /2 tasks remaining/);
+  });
+
+  it("injects /hydra planner continue at the head of the queue so the TUI shows busy", async () => {
+    // Without the inject, the MCP tool returns immediately and the
+    // TUI goes idle while workers are running. The continue command
+    // opens a held turn that drives the busy banner.
+    seedBoard("hydra_session_test", {
+      state: "ready",
+      tasks: [{ id: "T1", title: "blocked", status: "blocked" }],
+    });
+    dispatch(mkInvoke(36, "planner_execute", {}));
+    await settle();
+    // session/attach is required before session/prompt — verify the
+    // lazy attach happened.
+    const attachAsClient = client
+      .requestsFor("session/attach")
+      .find((r) => (r.params as { sessionId?: string }).sessionId === "hydra_session_test");
+    assert.ok(attachAsClient, "expected session/attach for orchestrator session");
+
+    const continuePrompt = client.requestsFor("session/prompt").find((r) => {
+      const p = r.params as { prompt?: Array<{ text?: string }>; _meta?: { "hydra-acp"?: { queuePosition?: string } } };
+      return p.prompt?.[0]?.text === "/hydra planner continue";
+    });
+    assert.ok(continuePrompt, "expected an injected /hydra planner continue prompt");
+    const params = continuePrompt.params as {
+      sessionId: string;
+      _meta: { "hydra-acp": { queuePosition: string } };
+    };
+    assert.equal(params.sessionId, "hydra_session_test");
+    assert.equal(params._meta["hydra-acp"].queuePosition, "head");
+  });
 });
 
 // ── planner_get_plan ───────────────────────────────────────────────
@@ -569,24 +629,51 @@ describe("planner_add_task", () => {
   });
 });
 
-// ── planner_cancel / pause / resume ────────────────────────────────
+// ── planner_stop / pause / resume ──────────────────────────────────
 
-describe("planner_cancel", () => {
+describe("planner_stop", () => {
   it("errors when no board exists", async () => {
-    dispatch(mkInvoke(70, "planner_cancel", {}));
+    dispatch(mkInvoke(70, "planner_stop", {}));
     await settle();
     const r = client.lastReply();
     assert.equal((r.result as { isError: boolean }).isError, true);
   });
 
-  it("reports already-terminal as a non-error", async () => {
-    seedBoard("hydra_session_test", { state: "done" });
-    dispatch(mkInvoke(71, "planner_cancel", {}));
+  it("reports already-terminal as a non-error for done/failed/stopped", async () => {
+    for (const [state, idx] of [["done", 71], ["failed", 72], ["stopped", 73]] as const) {
+      boards.clear();
+      seedBoard("hydra_session_test", { state });
+      dispatch(mkInvoke(idx, "planner_stop", {}));
+      await settle();
+      const r = client.lastReply();
+      const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
+      assert.notEqual(result.isError, true, `${state} should be non-error`);
+      assert.match(result.content[0]!.text, new RegExp(`already ${state}`));
+    }
+  });
+
+  it("transitions a running board to stopped and reverts in-flight tasks to pending", async () => {
+    seedBoard("hydra_session_test", {
+      state: "running",
+      tasks: [
+        { id: "T1", title: "done", status: "done" },
+        { id: "T2", title: "inflight", status: "assigned", assignedTo: "hydra_session_w1" },
+        { id: "T3", title: "pend", status: "pending" },
+      ],
+    });
+    dispatch(mkInvoke(74, "planner_stop", {}));
     await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.equal(board.state, "stopped");
+    const t2 = board.tasks.find((t) => t.id === "T2")!;
+    assert.equal(t2.status, "pending", "in-flight task should revert to pending, not failed");
+    assert.equal(t2.assignedTo, null);
+    // Done tasks stay done — only assigned tasks revert.
+    assert.equal(board.tasks.find((t) => t.id === "T1")!.status, "done");
+    // Reply mentions resume path.
     const r = client.lastReply();
-    const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
-    assert.notEqual(result.isError, true);
-    assert.match(result.content[0]!.text, /already done/);
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /Stopped.*resume/);
   });
 });
 
@@ -630,7 +717,7 @@ describe("planner_resume", () => {
     assert.match(result.content[0]!.text, /not paused/);
   });
 
-  it("flips paused to running and invokes the scheduler", async () => {
+  it("flips paused to running, invokes the scheduler, and injects continue", async () => {
     seedBoard("hydra_session_test", {
       state: "paused",
       tasks: [{ id: "T1", title: "blocked", status: "blocked" }], // nothing eligible
@@ -638,6 +725,13 @@ describe("planner_resume", () => {
     dispatch(mkInvoke(91, "planner_resume", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "running");
+    // Same live-view inject as execute — resume also kicks workers,
+    // so the TUI should go busy.
+    const continuePrompt = client.requestsFor("session/prompt").find((r) => {
+      const p = r.params as { prompt?: Array<{ text?: string }> };
+      return p.prompt?.[0]?.text === "/hydra planner continue";
+    });
+    assert.ok(continuePrompt, "expected an injected /hydra planner continue prompt on resume");
   });
 });
 

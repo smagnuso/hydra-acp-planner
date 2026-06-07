@@ -40,8 +40,9 @@ export type BoardState =
   | "ready"
   | "running"
   | "paused"
+  | "stopped" // user-initiated halt; resumable via execute/set_plan. Workers killed; in-flight tasks reverted to pending.
   | "done"
-  | "failed";
+  | "failed"; // hard failure (e.g. worker failed to launch); distinct from user stop. NOT auto-resumable.
 
 export interface TaskArtifacts {
   files_changed?: string[];
