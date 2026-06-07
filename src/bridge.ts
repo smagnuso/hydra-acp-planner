@@ -1131,9 +1131,15 @@ export class PlannerBridge {
     task.finishedAt = null;
     task.artifacts = null;
     log.info(`retask ${task.id} in ${board.projectId} (attemptCount=${task.attemptCount})`);
+    // Include task id and (if any) the now-closed worker session in the
+    // user-facing notice so it's identifiable at a glance in a transcript
+    // that may carry multiple retask events from a no-arg "retask all
+    // failed" invocation. The metadata carries taskId separately but
+    // renderers don't all surface it inline.
+    const workerTag = workerId ? ` on worker ${shortSessionId(workerId)}` : "";
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `reset to pending (attempt #${task.attemptCount + 1} next)`,
+      `${task.id}${workerTag} reset to pending (attempt #${task.attemptCount + 1} next)`,
       { event: "task-retasked", taskId: task.id },
     );
   }
