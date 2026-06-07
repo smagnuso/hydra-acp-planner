@@ -21,7 +21,28 @@
 // in-flight decomposition turn for a known orchestrator.
 
 import { TransformerClient } from "./acp/transformer.js";
-import type { JsonRpcRequest, JsonRpcNotification } from "./acp/protocol.js";
+import type {
+  JsonRpcId,
+  JsonRpcNotification,
+  JsonRpcRequest,
+} from "./acp/protocol.js";
+
+// Minimal surface PlannerBridge uses on its TransformerClient. Defined
+// as a structural interface so tests can substitute a fake without
+// pulling in the real WebSocket. TransformerClient already satisfies
+// this shape.
+export interface BridgeClient {
+  request<R = unknown>(method: string, params?: unknown): Promise<R>;
+  reply(id: JsonRpcId, result: unknown): void;
+  replyError(id: JsonRpcId, code: number, message: string): void;
+  start(): void;
+  stop(): void;
+  on(event: "open", listener: () => void): unknown;
+  on(event: "close", listener: (info: { hadError: boolean }) => void): unknown;
+  on(event: "error", listener: (err: Error) => void): unknown;
+  on(event: "request", listener: (req: JsonRpcRequest) => void): unknown;
+  on(event: "notification", listener: (n: JsonRpcNotification) => void): unknown;
+}
 import { logger } from "./util/log.js";
 import {
   buildAgentMessageChunkEnvelope,
@@ -45,6 +66,7 @@ import {
   type HeldTurnVerb,
 } from "./held-turn.js";
 import { WorkerForwarder } from "./worker-forward.js";
+import { PLANNER_MCP_INSTRUCTIONS, PLANNER_MCP_TOOLS } from "./mcp-tools.js";
 import { rmSync } from "node:fs";
 import {
   allTerminal,
@@ -203,12 +225,18 @@ const COMMANDS = [
 export interface BridgeOptions {
   daemonWsUrl: string;
   token: string;
+  // Test seam: when provided, PlannerBridge uses this instead of
+  // constructing a TransformerClient. Lets tests inject a fake that
+  // records request/reply calls without opening a real WebSocket.
+  client?: BridgeClient;
 }
 
 // Track active boards in memory so we don't reload from disk on every
 // intercept. Updates flow to board.json on every state transition; the
 // in-memory copy is the source of truth during process lifetime.
-const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
+// Exported so tests can reset between cases — production code never
+// imports this; it's a module-private singleton in practice.
+export const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
 
 // Sessions we've successfully attached to via hydra-acp/transformer/attach
 // during this process lifetime. Best-effort: if the daemon restarted
@@ -216,7 +244,7 @@ const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
 // there's no current way for the planner to know that without
 // querying. Used by `/hydra planner status` to report whether we
 // believe we're observing the session.
-const attachedSessions = new Set<string>();
+export const attachedSessions = new Set<string>();
 
 // Sessions we've ALSO attached to as a peer client via session/attach
 // (in addition to transformer/attach above). Two roles, one WS
@@ -296,7 +324,7 @@ function orchestratorSessionForProject(projectId: string): string | undefined {
 // dragging in the PlannerBridge constructor and its WS connection.
 
 export class PlannerBridge {
-  private client: TransformerClient;
+  private client: BridgeClient;
   // Cached list of installed specialist agents, populated lazily on
   // first prompt-building call. Refreshed at startup. Decomposition and
   // add-task prompts splice this in so the planner agent only suggests
@@ -329,15 +357,18 @@ export class PlannerBridge {
   }
 
   constructor(opts: BridgeOptions) {
-    this.client = new TransformerClient({
-      daemonWsUrl: opts.daemonWsUrl,
-      token: opts.token,
-      intercepts: INTERCEPTS,
-      clientName: PROCESS_NAME,
-    });
+    this.client =
+      opts.client ??
+      new TransformerClient({
+        daemonWsUrl: opts.daemonWsUrl,
+        token: opts.token,
+        intercepts: INTERCEPTS,
+        clientName: PROCESS_NAME,
+      });
     this.client.on("open", () => {
       log.info("transformer registered, intercepts active");
       void this.registerCommands();
+      void this.registerMcpTools();
       void this.rehydrateFromDisk();
     });
     this.client.on("close", ({ hadError }) => log.info(`disconnected (hadError=${hadError})`));
@@ -392,6 +423,31 @@ export class PlannerBridge {
       log.info(`registered ${COMMANDS.length} slash command(s): ${COMMANDS.map((c) => c.verb).join(", ")}`);
     } catch (err) {
       log.error(`commands/register failed: ${(err as Error).message}`);
+    }
+  }
+
+  // Advertise MCP tools the planner implements. The daemon injects
+  // them into each session's mcpServers list at session/new time, so
+  // MCP-capable agents (Claude, opencode, codex, …) see them
+  // natively and can call them from conversational turns without the
+  // user needing to remember slash command syntax.
+  //
+  // Tool invocations arrive on this transformer's WS connection as
+  // hydra-acp/mcp_tools/invoke requests; dispatched in handleRequest.
+  private async registerMcpTools(): Promise<void> {
+    try {
+      const result = await this.client.request<{ ok: boolean; registered: number }>(
+        "hydra-acp/mcp_tools/register",
+        {
+          instructions: PLANNER_MCP_INSTRUCTIONS,
+          tools: PLANNER_MCP_TOOLS,
+        },
+      );
+      log.info(
+        `registered ${result.registered ?? PLANNER_MCP_TOOLS.length} MCP tool(s): ${PLANNER_MCP_TOOLS.map((t) => t.name).join(", ")}`,
+      );
+    } catch (err) {
+      log.error(`mcp_tools/register failed: ${(err as Error).message}`);
     }
   }
 
@@ -629,6 +685,21 @@ export class PlannerBridge {
     }
     if (req.method === "hydra-acp/commands/invoke") {
       this.handleCommandsInvoke(req);
+      return;
+    }
+    if (req.method === "hydra-acp/mcp_tools/invoke") {
+      void this.handleMcpToolInvoke(req).catch((err) => {
+        log.error(`handleMcpToolInvoke threw: ${(err as Error).message}`);
+        this.client.reply(req.id, {
+          content: [
+            {
+              type: "text",
+              text: `internal error invoking planner tool: ${(err as Error).message}`,
+            },
+          ],
+          isError: true,
+        });
+      });
       return;
     }
     log.warn(`unexpected request method: ${req.method}`);
@@ -2218,9 +2289,17 @@ export class PlannerBridge {
     this.client.reply(reqId, { action: "continue" });
   }
 
-  // Called when the message/emit promise resolves (agent's session/prompt
-  // response came back, turn is complete). Parses the accumulated agent
-  // reply, populates the board, emits the plan summary.
+  // Called when the decomposition prompt's emit promise resolves
+  // (the agent's session/prompt response came back, turn is complete).
+  // Thin wrapper around setPlan — parses the accumulated fenced-JSON
+  // reply and delegates to the shared persistence layer.
+  //
+  // This is the non-MCP path: agents that don't speak the
+  // planner_set_plan MCP tool emit fenced JSON which we extract and
+  // parse. MCP-speaking agents skip this code path — they call
+  // planner_set_plan directly with structured input, and the MCP
+  // tool handler calls setPlan with the same shape we'd reconstruct
+  // from the fenced block here.
   private finishDecomposition(
     sessionId: string,
     state: NonNullable<ReturnType<typeof getOrchestratorState>>,
@@ -2235,6 +2314,9 @@ export class PlannerBridge {
     const raw = extractJsonBlock(state.decompositionAccumulator);
     const result = raw === undefined ? undefined : normalizeDecomposition(raw);
 
+    state.awaitingDecomposition = false;
+    state.decompositionAccumulator = "";
+
     if (!result) {
       log.warn(`decomposition parse failed for ${board.projectId}; accumulator length=${state.decompositionAccumulator.length}`);
       board.state = "failed";
@@ -2243,43 +2325,53 @@ export class PlannerBridge {
         sessionId,
         `Couldn't parse a decomposition out of the agent's reply for ${shortProjectId(board.projectId)}. Try \`/hydra planner create\` again with a clearer description.`,
       );
-      state.awaitingDecomposition = false;
-      state.decompositionAccumulator = "";
       return;
     }
 
+    // Hand off to the shared persistence layer. board.pendingExecute
+    // (set by the original create/execute caller) determines whether
+    // we transition to ready or running.
+    this.setPlan(sessionId, board, result);
+  }
+
+  // Shared persistence layer for plan materialization. Used by:
+  //   - finishDecomposition (fenced-JSON path, for non-MCP agents)
+  //   - planner_set_plan MCP tool (for MCP-capable agents)
+  //
+  // Takes an already-normalized DecompositionResult (tasks + optional
+  // description + warnings) and:
+  //   - applies tasks + description to the board
+  //   - recomputes concurrency cap from DAG shape unless locked
+  //   - transitions state to running (when board.pendingExecute is
+  //     true) or ready (otherwise)
+  //   - persists, emits warnings, emits plan panel
+  //   - kicks off the scheduler when running, or shows the "run
+  //     execute to start" hint when ready
+  //
+  // Idempotent on the board reference — caller owns the board and
+  // any pre-call mutations are visible. pendingExecute is cleared
+  // after the transition so subsequent setPlan calls (e.g. user
+  // revises via planner_set_plan) default to ready unless explicitly
+  // re-flagged.
+  private setPlan(
+    sessionId: string,
+    board: Board,
+    result: { tasks: Task[]; description?: string; warnings: string[] },
+  ): void {
     board.tasks = result.tasks;
     if (!board.concurrencyCapLocked) {
       board.concurrencyCap = sweepLineConcurrencyCap(result.tasks);
     }
-    // `execute` seeds the board with a placeholder description and
-    // asks the agent to summarize the conversation-driven project in
-    // its response. When that summary comes back, replace the
-    // placeholder so /status and the context preamble show something
-    // meaningful.
+    // execute seeds the board with a placeholder description and asks
+    // the agent to summarize the conversation-driven project in its
+    // response (or sets a real description from the tool input). When
+    // a non-empty description comes back, replace any placeholder so
+    // /status and the context preamble read sensibly.
     if (result.description) {
       board.description = result.description;
     }
-    // Two post-decomposition modes, chosen by board.pendingExecute:
-    //
-    //   - kickoff (pendingExecute === true): transition to running
-    //     and start scheduling workers. This is the execute path
-    //     (decompose-from-conversation flow) — caller will open a
-    //     held turn after this returns so plan updates anchor under
-    //     the slash command's turn.
-    //
-    //   - plan-only (pendingExecute false/undefined): transition to
-    //     ready, emit the plan panel and a "run execute to start"
-    //     hint, and stop. This is the create path — caller will
-    //     reply to commands/invoke immediately (no held turn). The
-    //     user reviews the plan and runs `/hydra planner execute`
-    //     when they're ready to kick off.
-    state.awaitingDecomposition = false;
-    state.decompositionAccumulator = "";
     const willKickoff = board.pendingExecute === true;
     board.state = willKickoff ? "running" : "ready";
-    // pendingExecute is consumed — clear it so subsequent operations
-    // (rehydrate after restart, etc.) don't re-trigger kickoff.
     board.pendingExecute = undefined;
     saveBoard(board, sessionId);
 
@@ -2294,14 +2386,9 @@ export class PlannerBridge {
     log.debug(formatPlanSummary(result.tasks, board.concurrencyCap));
 
     if (willKickoff) {
-      // Kick off the scheduler: fills up to concurrencyCap workers
-      // with initial eligible tasks. Subsequent completions trigger
-      // refill.
       void this.scheduleEligibleTasks(sessionId, board);
       return;
     }
-    // Plan-only mode: emit the plan panel so the user sees what was
-    // formed, then a hint telling them how to start.
     this.emitPlanUpdate(sessionId, board);
     void this.emitSyntheticMessage(
       sessionId,
@@ -3165,5 +3252,563 @@ export class PlannerBridge {
           );
         });
     };
+  }
+
+  // ── MCP tool dispatch ──────────────────────────────────────────────
+
+  // Dispatch incoming hydra-acp/mcp_tools/invoke to the right tool
+  // handler. Returns an MCP CallToolResult ({content, isError?,
+  // structuredContent?}) shape that the daemon hands back to the
+  // agent. Errors always come back as isError:true rather than
+  // throwing — the agent's MCP client expects to read errors from
+  // the result envelope, and a thrown JSON-RPC error doesn't surface
+  // cleanly to the agent's reasoning.
+  private async handleMcpToolInvoke(req: JsonRpcRequest): Promise<void> {
+    const params = (req.params ?? {}) as {
+      server?: string;
+      tool?: string;
+      args?: Record<string, unknown>;
+      sessionId?: string;
+    };
+    const tool = params.tool ?? "";
+    const args = (params.args ?? {}) as Record<string, unknown>;
+    const sessionId = params.sessionId ?? "";
+    if (!sessionId) {
+      return this.replyMcpTextError(
+        req.id,
+        "internal: missing sessionId on mcp_tools/invoke (daemon-side bug)",
+      );
+    }
+    log.info(`mcp tool ${tool} on session …${sessionId.slice(-8)}`);
+    try {
+      switch (tool) {
+        case "planner_list_agents":
+          return await this.toolListAgents(req.id);
+        case "planner_set_plan":
+          return await this.toolSetPlan(req.id, sessionId, args);
+        case "planner_execute":
+          return await this.toolExecute(req.id, sessionId);
+        case "planner_get_plan":
+          return this.toolGetPlan(req.id, sessionId);
+        case "planner_get_status":
+          return this.toolGetStatus(req.id, sessionId);
+        case "planner_add_task":
+          return await this.toolAddTask(req.id, sessionId, args);
+        case "planner_cancel":
+          return this.toolCancel(req.id, sessionId);
+        case "planner_pause":
+          return this.toolPause(req.id, sessionId);
+        case "planner_resume":
+          return this.toolResume(req.id, sessionId);
+        case "planner_skip":
+          return this.toolSkip(req.id, sessionId, args);
+        case "planner_retask":
+          return this.toolRetask(req.id, sessionId, args);
+        case "planner_remove":
+          return this.toolRemove(req.id, sessionId);
+        default:
+          return this.replyMcpTextError(req.id, `unknown planner tool: ${tool}`);
+      }
+    } catch (err) {
+      return this.replyMcpTextError(
+        req.id,
+        `tool ${tool} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // Helper: send an MCP CallToolResult with text content and
+  // isError:true. Used for tool-handler error cases.
+  private replyMcpTextError(reqId: number | string, text: string): void {
+    this.client.reply(reqId, {
+      content: [{ type: "text", text }],
+      isError: true,
+    });
+  }
+
+  // Helper: send an MCP CallToolResult with text + structured content.
+  // The agent surfaces `content` to itself for reasoning; structured
+  // content is parsed (when both client and tool agree on shape).
+  private replyMcpResult(
+    reqId: number | string,
+    text: string,
+    structuredContent?: Record<string, unknown>,
+  ): void {
+    const payload: Record<string, unknown> = {
+      content: [{ type: "text", text }],
+    };
+    if (structuredContent !== undefined) {
+      payload.structuredContent = structuredContent;
+    }
+    this.client.reply(reqId, payload);
+  }
+
+  // ── Individual tool handlers ───────────────────────────────────────
+
+  private async toolListAgents(reqId: number | string): Promise<void> {
+    const choices = (await this.ensureAgentChoices()) ?? [];
+    const list = choices.map((a) => ({
+      id: a.id,
+      description: a.description ?? "",
+    }));
+    const text = list.length === 0
+      ? "No agents are installed. Workers will spawn with the daemon's default agent."
+      : `Available agents (${list.length}):\n${list.map((a) => `  - ${a.id}${a.description ? ` — ${a.description}` : ""}`).join("\n")}`;
+    this.replyMcpResult(reqId, text, { agents: list });
+  }
+
+  private async toolSetPlan(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): Promise<void> {
+    const description = typeof args.description === "string" ? args.description.trim() : "";
+    if (!description) {
+      return this.replyMcpTextError(reqId, "planner_set_plan: missing required `description`");
+    }
+    const tasksRaw = args.tasks;
+    if (!Array.isArray(tasksRaw) || tasksRaw.length === 0) {
+      return this.replyMcpTextError(reqId, "planner_set_plan: `tasks` must be a non-empty array");
+    }
+    // Reuse the fenced-JSON normalizer — same task shape, same
+    // validation. The agent's tool input is already structured but
+    // may still be missing fields or carry invalid deps.
+    const normalized = normalizeDecomposition({
+      description,
+      tasks: tasksRaw,
+    });
+    if (!normalized || normalized.tasks.length === 0) {
+      return this.replyMcpTextError(
+        reqId,
+        "planner_set_plan: tasks failed validation (need at least one valid task with id, title, and deps)",
+      );
+    }
+
+    // Refuse to overwrite a running/paused board — same guard as
+    // /hydra planner create. ready/done/failed boards are replaceable.
+    const existing = boards.get(sessionId);
+    if (
+      existing &&
+      (existing.state === "running" ||
+        existing.state === "paused" ||
+        existing.state === "decomposing")
+    ) {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_set_plan: project ${shortProjectId(existing.projectId)} is already ${existing.state}. Cancel or remove it first.`,
+      );
+    }
+    // Clean up a prior ready draft on disk before overwriting (same
+    // policy as slash command create).
+    let replacedReadyId: string | undefined;
+    if (existing && existing.state === "ready") {
+      replacedReadyId = existing.projectId;
+      try {
+        rmSync(projectDir(existing.projectId), { recursive: true, force: true });
+      } catch (err) {
+        log.warn(
+          `failed to remove prior ready plan ${shortProjectId(existing.projectId)}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // Parse fleet defaults + concurrencyCap from the tool args.
+    const fleetDefaultsRaw = args.fleetDefaults;
+    let fleetAgent: string | null = null;
+    let fleetModel: string | null = null;
+    if (fleetDefaultsRaw && typeof fleetDefaultsRaw === "object" && !Array.isArray(fleetDefaultsRaw)) {
+      const fd = fleetDefaultsRaw as Record<string, unknown>;
+      if (typeof fd.agent === "string") fleetAgent = fd.agent;
+      if (typeof fd.model === "string") fleetModel = fd.model;
+    }
+    const concurrencyCapRaw = args.concurrencyCap;
+    const concurrencyCap =
+      typeof concurrencyCapRaw === "number" && Number.isFinite(concurrencyCapRaw) && concurrencyCapRaw > 0
+        ? Math.floor(concurrencyCapRaw)
+        : undefined;
+
+    const board = newBoard({
+      description,
+      concurrencyCap,
+      fleetDefaults: { agent: fleetAgent, model: fleetModel },
+    });
+    board.pendingExecute = false; // ready, awaiting planner_execute
+    boards.set(sessionId, board);
+    saveBoard(board, sessionId);
+    // Make sure we're a transformer on the session so subsequent
+    // emits (plan panel, hints) reach attached clients.
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(`set_plan: transformer/attach failed: ${(err as Error).message}`);
+    }
+    if (replacedReadyId) {
+      void this.emitSyntheticMessage(
+        sessionId,
+        `Replacing prior draft plan ${shortProjectId(replacedReadyId)} on this session.`,
+      );
+    }
+
+    this.setPlan(sessionId, board, normalized);
+
+    // Build a compact summary the agent can quote back to the user.
+    const titles = normalized.tasks
+      .map((t) => `${t.id} ${t.title}`)
+      .join(" · ");
+    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}): ${titles}. Call planner_execute when ready to start.`;
+    this.replyMcpResult(reqId, summary, {
+      projectId: board.projectId,
+      replacedReadyProjectId: replacedReadyId,
+      taskCount: normalized.tasks.length,
+      concurrencyCap: board.concurrencyCap,
+      warnings: normalized.warnings,
+    });
+  }
+
+  private async toolExecute(reqId: number | string, sessionId: string): Promise<void> {
+    const board = boards.get(sessionId);
+    if (!board) {
+      return this.replyMcpTextError(
+        reqId,
+        "planner_execute: no plan on this session. Call planner_set_plan first.",
+      );
+    }
+    if (board.state === "running") {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_execute: project ${shortProjectId(board.projectId)} is already running.`,
+      );
+    }
+    if (board.state === "paused") {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_execute: project ${shortProjectId(board.projectId)} is paused. Call planner_resume to continue.`,
+      );
+    }
+    if (board.state === "done" || board.state === "failed") {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_execute: project ${shortProjectId(board.projectId)} is ${board.state}. Call planner_set_plan to start a new project.`,
+      );
+    }
+    if (board.state !== "ready") {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_execute: project ${shortProjectId(board.projectId)} is ${board.state}; not ready to execute.`,
+      );
+    }
+    // Transition ready → running and kick off the scheduler. The
+    // live view isn't anchored to this tool call (the MCP invoke is
+    // request-response, not a held turn) — plan updates emit as
+    // session/updates regardless, and the user can run
+    // `/hydra planner continue` to open a held live view turn if
+    // they want.
+    board.state = "running";
+    saveBoard(board, sessionId);
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(`execute (tool): transformer/attach failed: ${(err as Error).message}`);
+    }
+    void this.scheduleEligibleTasks(sessionId, board);
+    this.replyMcpResult(
+      reqId,
+      `Kicked off ${shortProjectId(board.projectId)}: ${board.tasks.length} tasks, ${board.concurrencyCap} concurrent. Workers spawning now. Use planner_get_status to check progress, or /hydra planner continue to open the live view.`,
+      {
+        projectId: board.projectId,
+        taskCount: board.tasks.length,
+        concurrencyCap: board.concurrencyCap,
+        state: "running",
+      },
+    );
+  }
+
+  private toolGetPlan(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    if (!board) {
+      return this.replyMcpResult(
+        reqId,
+        "No plan on this session. Use planner_set_plan to create one.",
+        { hasPlan: false },
+      );
+    }
+    const text = `Plan for ${shortProjectId(board.projectId)} (${board.state}): ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"}, concurrency cap ${board.concurrencyCap}.\n${board.tasks.map((t) => `  - ${t.id} [${t.status}] ${t.title}${t.deps.length ? ` (deps: ${t.deps.join(", ")})` : ""}`).join("\n")}`;
+    this.replyMcpResult(reqId, text, {
+      hasPlan: true,
+      projectId: board.projectId,
+      state: board.state,
+      description: board.description,
+      concurrencyCap: board.concurrencyCap,
+      fleetDefaults: board.fleetDefaults,
+      tasks: board.tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        why: t.why,
+        what: t.what,
+        constraints: t.constraints,
+        deps: t.deps,
+        agent: t.agent,
+        model: t.model,
+        status: t.status,
+        assignedTo: t.assignedTo,
+        artifacts: t.artifacts,
+      })),
+    });
+  }
+
+  private toolGetStatus(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    if (!board) {
+      return this.replyMcpResult(reqId, "No project on this session.", {
+        hasProject: false,
+      });
+    }
+    const text = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const done = board.tasks.filter((t) => t.status === "done").length;
+    const failed = board.tasks.filter((t) => t.status === "failed").length;
+    const inFlight = inFlightCount(board);
+    const pending = board.tasks.filter((t) => t.status === "pending").length;
+    this.replyMcpResult(reqId, text, {
+      hasProject: true,
+      projectId: board.projectId,
+      state: board.state,
+      counts: {
+        total: board.tasks.length,
+        done,
+        failed,
+        inFlight,
+        pending,
+      },
+      inFlightWorkers: board.tasks
+        .filter((t) => t.status === "assigned" && t.assignedTo)
+        .map((t) => ({
+          taskId: t.id,
+          taskTitle: t.title,
+          workerSessionId: t.assignedTo,
+        })),
+      recentlyDone: board.tasks
+        .filter((t) => t.status === "done")
+        .slice(-5)
+        .map((t) => ({
+          taskId: t.id,
+          summary: t.artifacts?.summary ?? null,
+        })),
+    });
+  }
+
+  private async toolAddTask(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): Promise<void> {
+    const description = typeof args.description === "string" ? args.description.trim() : "";
+    if (!description) {
+      return this.replyMcpTextError(reqId, "planner_add_task: missing required `description`");
+    }
+    const ctx = this.requireBoardForTool(sessionId);
+    if ("error" in ctx) {
+      return this.replyMcpTextError(reqId, ctx.error);
+    }
+    // Delegate to the slash command's handler via a synthetic reqId
+    // — handleAdd already does all the work (orchestrator state
+    // setup, sub-prompt to agent, parse, schedule). It replies via
+    // this.client.reply on the reqId we pass in. We can't reuse the
+    // MCP reqId since the daemon expects a CallToolResult, not a
+    // commands/invoke-style { text } reply. Easier path: signal
+    // success immediately and let handleAdd's emits flow through.
+    void this.handleAdd(0 /* dummy reqId */, sessionId, description).catch((err) => {
+      log.warn(`add via tool failed: ${(err as Error).message}`);
+    });
+    this.replyMcpResult(
+      reqId,
+      `Asking the agent to slot in: "${description}". The new task will appear once the agent figures out where it fits.`,
+      { dispatched: true },
+    );
+  }
+
+  private toolCancel(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId);
+    if (!board) {
+      return this.replyMcpTextError(reqId, "planner_cancel: no project on this session");
+    }
+    if (board.state === "done" || board.state === "failed") {
+      return this.replyMcpResult(
+        reqId,
+        `Project ${shortProjectId(board.projectId)} is already ${board.state}.`,
+      );
+    }
+    const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
+    void this.runProjectCancel(sessionId, board, "slash");
+    this.replyMcpResult(
+      reqId,
+      `Cancelled ${shortProjectId(board.projectId)}${inFlight > 0 ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} force-cancelled` : ""}.`,
+    );
+  }
+
+  private toolPause(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId);
+    if (!board) return this.replyMcpTextError(reqId, "planner_pause: no project on this session");
+    if (board.state === "paused") {
+      return this.replyMcpResult(reqId, `${shortProjectId(board.projectId)} is already paused.`);
+    }
+    if (board.state !== "running") {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_pause: project is ${board.state}; can only pause a running project.`,
+      );
+    }
+    board.state = "paused";
+    saveBoard(board, sessionId);
+    const inFlight = inFlightCount(board);
+    this.replyMcpResult(
+      reqId,
+      `Paused ${shortProjectId(board.projectId)}.${inFlight > 0 ? ` ${inFlight} in-flight worker${inFlight === 1 ? "" : "s"} will run to completion.` : ""}`,
+    );
+  }
+
+  private toolResume(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId);
+    if (!board) return this.replyMcpTextError(reqId, "planner_resume: no project on this session");
+    if (board.state !== "paused") {
+      return this.replyMcpTextError(
+        reqId,
+        `planner_resume: project is ${board.state}, not paused.`,
+      );
+    }
+    board.state = "running";
+    saveBoard(board, sessionId);
+    void this.scheduleEligibleTasks(sessionId, board);
+    this.replyMcpResult(reqId, `Resumed ${shortProjectId(board.projectId)}.`);
+  }
+
+  private toolSkip(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): void {
+    const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
+    if (!taskId) return this.replyMcpTextError(reqId, "planner_skip: missing required `taskId`");
+    const ctx = this.requireBoardForTool(sessionId);
+    if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
+    const { board } = ctx;
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task) return this.replyMcpTextError(reqId, `planner_skip: no task '${taskId}' in this project`);
+    if (task.status === "done") {
+      return this.replyMcpResult(reqId, `${taskId} is already done.`);
+    }
+    const workerId = task.assignedTo;
+    if (task.status === "assigned" && workerId) {
+      this.endWorkerForward(workerId);
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      delete board.workers[workerId];
+      void this.closeWorker(workerId);
+    }
+    task.status = "done";
+    task.finishedAt = nowIso();
+    task.artifacts = { summary: "skipped by user" };
+    task.assignedTo = null;
+    saveBoard(board, sessionId);
+    this.emitPlanUpdate(sessionId, board);
+    void this.emitSyntheticMessage(
+      sessionId,
+      "skipped (marked done with no work)",
+      { event: "task-skipped", taskId },
+    );
+    void this.scheduleEligibleTasks(sessionId, board);
+    this.replyMcpResult(reqId, `Skipped ${taskId}.`);
+  }
+
+  private toolRetask(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): void {
+    const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
+    if (!taskId) return this.replyMcpTextError(reqId, "planner_retask: missing required `taskId`");
+    const ctx = this.requireBoardForTool(sessionId);
+    if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
+    const { board } = ctx;
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task) return this.replyMcpTextError(reqId, `planner_retask: no task '${taskId}' in this project`);
+    const workerId = task.assignedTo;
+    if (task.status === "assigned" && workerId) {
+      this.endWorkerForward(workerId);
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      delete board.workers[workerId];
+      void this.closeWorker(workerId);
+    }
+    task.status = "pending";
+    task.assignedTo = null;
+    task.startedAt = null;
+    task.finishedAt = null;
+    task.artifacts = null;
+    saveBoard(board, sessionId);
+    this.emitPlanUpdate(sessionId, board);
+    void this.emitSyntheticMessage(
+      sessionId,
+      `reset to pending (attempt #${task.attemptCount + 1} next)`,
+      { event: "task-retasked", taskId },
+    );
+    void this.scheduleEligibleTasks(sessionId, board);
+    this.replyMcpResult(reqId, `Reset ${taskId} to pending.`);
+  }
+
+  private toolRemove(reqId: number | string, sessionId: string): void {
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    if (!board) {
+      return this.replyMcpTextError(reqId, "planner_remove: no project on this session");
+    }
+    const canonical = board.projectId;
+    const workerIds = Object.keys(board.workers);
+    void (async () => {
+      for (const workerId of workerIds) {
+        try {
+          await this.client.request("hydra-acp/session/delete", { sessionId: workerId });
+        } catch {
+          // already-gone is fine
+        }
+      }
+    })();
+    if (boards.get(sessionId)?.projectId === canonical) {
+      boards.delete(sessionId);
+      clearOrchestratorState(sessionId);
+      resolveHeldTurn(sessionId, {
+        reason: "removed",
+        text: `Removed project ${shortProjectId(canonical)}.`,
+      });
+    }
+    for (const workerId of workerIds) {
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      attachedSessions.delete(workerId);
+    }
+    rmSync(projectDir(canonical), { recursive: true, force: true });
+    this.replyMcpResult(
+      reqId,
+      `Removed project ${shortProjectId(canonical)}${workerIds.length > 0 ? ` (${workerIds.length} worker session${workerIds.length === 1 ? "" : "s"} closed)` : ""}.`,
+    );
+  }
+
+  // Helper used by tools that need an active (non-terminal) board.
+  private requireBoardForTool(
+    sessionId: string,
+  ): { board: Board } | { error: string } {
+    const board = boards.get(sessionId);
+    if (!board) {
+      return {
+        error:
+          "no plan in this session yet. Use planner_set_plan to create one, or /hydra planner create.",
+      };
+    }
+    if (board.state === "done" || board.state === "failed") {
+      return {
+        error: `project ${shortProjectId(board.projectId)} is ${board.state}; use planner_set_plan to start a new one.`,
+      };
+    }
+    return { board };
   }
 }
