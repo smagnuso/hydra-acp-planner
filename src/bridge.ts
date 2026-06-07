@@ -47,11 +47,14 @@ import { logger } from "./util/log.js";
 import {
   buildAgentMessageChunkEnvelope,
   buildTextPromptEnvelope,
+  extractAgentIdUpdate,
+  extractCurrentModelUpdate,
   extractPromptText,
   extractUpdateText,
+  extractUsageUpdate,
   updateKind,
 } from "./util/text.js";
-import { formatBoardContext, formatStatus } from "./format.js";
+import { formatBoardContext, formatStatus, totalUsage } from "./format.js";
 import {
   buildAsciiPlanEnvelope,
   buildPlanUpdateEnvelope,
@@ -2247,6 +2250,37 @@ export class PlannerBridge {
       return;
     }
 
+    // Orchestrator-side metadata capture: usage_update for cost/tokens,
+    // session_info_update for agentId, current_model_update for model.
+    // Snapshots are persisted on the board so the sessions table can
+    // render them after the fact. We always pass through here so other
+    // transformers and the client see these notifications normally.
+    {
+      const kind = updateKind(envelope);
+      const board = boards.get(sessionId);
+      if (board) {
+        if (kind === "usage_update") {
+          const usage = extractUsageUpdate(envelope);
+          if (usage) {
+            board.orchestratorUsage = { ...(board.orchestratorUsage ?? {}), ...usage };
+            saveBoard(board, sessionId);
+          }
+        } else if (kind === "session_info_update") {
+          const agentId = extractAgentIdUpdate(envelope);
+          if (agentId && agentId !== board.orchestratorAgent) {
+            board.orchestratorAgent = agentId;
+            saveBoard(board, sessionId);
+          }
+        } else if (kind === "current_model_update") {
+          const model = extractCurrentModelUpdate(envelope);
+          if (model && model !== board.orchestratorModel) {
+            board.orchestratorModel = model;
+            saveBoard(board, sessionId);
+          }
+        }
+      }
+    }
+
     const workerState = getWorkerState(sessionId);
     if (workerState) {
       const kind = updateKind(envelope);
@@ -2288,6 +2322,40 @@ export class PlannerBridge {
           if (!blockOpenerSeen) {
             forwarder.ingestText(text, kind);
           }
+        }
+        this.client.reply(reqId, { action: "continue" });
+        return;
+      }
+      if (
+        kind === "usage_update" ||
+        kind === "session_info_update" ||
+        kind === "current_model_update"
+      ) {
+        const orchestratorId = orchestratorOfWorker(sessionId);
+        const board = orchestratorId ? boards.get(orchestratorId) : undefined;
+        const w = board ? board.workers[sessionId] : undefined;
+        if (board && orchestratorId && w) {
+          let changed = false;
+          if (kind === "usage_update") {
+            const usage = extractUsageUpdate(envelope);
+            if (usage) {
+              w.usage = { ...(w.usage ?? {}), ...usage };
+              changed = true;
+            }
+          } else if (kind === "session_info_update") {
+            const agentId = extractAgentIdUpdate(envelope);
+            if (agentId && agentId !== w.agent) {
+              w.agent = agentId;
+              changed = true;
+            }
+          } else if (kind === "current_model_update") {
+            const model = extractCurrentModelUpdate(envelope);
+            if (model && model !== w.model) {
+              w.model = model;
+              changed = true;
+            }
+          }
+          if (changed) saveBoard(board, orchestratorId);
         }
         this.client.reply(reqId, { action: "continue" });
         return;
@@ -2460,9 +2528,11 @@ export class PlannerBridge {
       this.emitPlanUpdate(orchestratorSessionId, board);
       const failed = board.tasks.filter((t) => t.status === "failed").length;
       const done = board.tasks.length - failed;
-      const summary = failed > 0
+      const headline = failed > 0
         ? `Project ${shortProjectId(board.projectId)} done with ${failed} failure${failed === 1 ? "" : "s"} (${done}/${board.tasks.length} done).`
-        : `Project Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`;
+        : `Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`;
+      const statusDump = formatStatus(board, attachedSessions.has(orchestratorSessionId), orchestratorSessionId);
+      const summary = `${headline}\n\n${statusDump}`;
       if (!resolveHeldTurn(orchestratorSessionId, {
         reason: failed > 0 ? "failed" : "complete",
         text: summary,
@@ -2591,7 +2661,12 @@ export class PlannerBridge {
     task.assignedTo = childSessionId;
     task.startedAt = nowIso();
     task.attemptCount += 1;
-    board.workers[childSessionId] = { currentTaskId: task.id, tasksCompleted: [] };
+    board.workers[childSessionId] = {
+      currentTaskId: task.id,
+      tasksCompleted: [],
+      agent: effectiveAgent,
+      model: effectiveModel,
+    };
     saveBoard(board, orchestratorSessionId);
 
     setWorkerState(childSessionId, {
@@ -3635,6 +3710,7 @@ export class PlannerBridge {
       });
     }
     const text = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const totals = totalUsage(board);
     const done = board.tasks.filter((t) => t.status === "done").length;
     const failed = board.tasks.filter((t) => t.status === "failed").length;
     const inFlight = inFlightCount(board);
@@ -3664,6 +3740,19 @@ export class PlannerBridge {
           taskId: t.id,
           summary: t.artifacts?.summary ?? null,
         })),
+      usage: {
+        totalCost: totals.cost,
+        currency: totals.currency ?? null,
+        perWorker: Object.entries(board.workers)
+          .filter(([, w]) => w.usage)
+          .map(([workerSessionId, w]) => ({
+            workerSessionId,
+            used: w.usage?.used ?? null,
+            size: w.usage?.size ?? null,
+            costAmount: w.usage?.costAmount ?? null,
+            costCurrency: w.usage?.costCurrency ?? null,
+          })),
+      },
     });
   }
 

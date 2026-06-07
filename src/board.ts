@@ -69,6 +69,13 @@ export interface Task {
   finishedAt?: string | null;
 }
 
+export interface WorkerUsage {
+  used?: number;
+  size?: number;
+  costAmount?: number;
+  costCurrency?: string;
+}
+
 export interface Board {
   version: number;
   projectId: string;
@@ -78,7 +85,21 @@ export interface Board {
   updatedAt: string;
   fleetDefaults: { agent: string | null; model: string | null };
   tasks: Task[];
-  workers: Record<string, { currentTaskId: string | null; tasksCompleted: string[] }>;
+  workers: Record<string, {
+    currentTaskId: string | null;
+    tasksCompleted: string[];
+    // Effective agent/model the worker session was spawned with —
+    // captured at spawn time so the sessions table can render
+    // AGENT|MODEL even after assignedTo has been cleared on completion.
+    // Distinct from per-task overrides (task.agent / task.model): these
+    // record what was actually applied (after fleet-default fallback).
+    agent?: string | null;
+    model?: string | null;
+    // Last-observed usage_update snapshot for this worker session.
+    // Cost is cumulative within the worker's lifetime; we aggregate
+    // across workers for the project total in formatStatus.
+    usage?: WorkerUsage;
+  }>;
   concurrencyCap: number;
   // When true, decomposition won't recompute concurrencyCap from the
   // DAG shape — the user pinned it explicitly via `--workers N`.
@@ -97,6 +118,15 @@ export interface Board {
   // Persisted so a daemon restart mid-decomposition preserves the
   // user's original intent.
   pendingExecute?: boolean;
+  // Last-observed usage_update snapshot for the orchestrator session
+  // itself. Captured the same way as worker usage; rendered on the
+  // orchestrator row of the sessions table.
+  orchestratorUsage?: WorkerUsage;
+  // Last-observed agent/model on the orchestrator session, captured
+  // from session_info_update (agentId under _meta["hydra-acp"]) and
+  // current_model_update (currentModel).
+  orchestratorAgent?: string | null;
+  orchestratorModel?: string | null;
 }
 
 export const PROJECT_ID_PREFIX = "hydra_plan_";

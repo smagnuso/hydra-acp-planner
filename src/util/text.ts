@@ -106,6 +106,60 @@ export function updateKind(envelope: unknown): string | undefined {
   return typeof kind === "string" ? kind : undefined;
 }
 
+// Extract the fields planner cares about from a usage_update envelope.
+// Returns undefined for non-usage updates. Individual fields are
+// optional — agents emit varying subsets, callers should merge onto
+// prior state. Cost may also ride under update._meta["hydra-acp"]
+// .cumulativeCost when hydra has stamped a cross-life total.
+export function extractUsageUpdate(envelope: unknown): {
+  used?: number;
+  size?: number;
+  costAmount?: number;
+  costCurrency?: string;
+} | undefined {
+  const env = envelope as { update?: Record<string, unknown> } | undefined;
+  const update = env?.update;
+  if (!update || update.sessionUpdate !== "usage_update") {
+    return undefined;
+  }
+  const out: { used?: number; size?: number; costAmount?: number; costCurrency?: string } = {};
+  if (typeof update.used === "number") out.used = update.used;
+  if (typeof update.size === "number") out.size = update.size;
+  const cost = update.cost as { amount?: unknown; currency?: unknown } | undefined;
+  if (cost && typeof cost === "object") {
+    if (typeof cost.amount === "number") out.costAmount = cost.amount;
+    if (typeof cost.currency === "string") out.costCurrency = cost.currency;
+  }
+  const meta = update._meta as Record<string, unknown> | undefined;
+  const ns = meta?.["hydra-acp"] as Record<string, unknown> | undefined;
+  if (ns && typeof ns.cumulativeCost === "number") {
+    out.costAmount = ns.cumulativeCost;
+  }
+  return out;
+}
+
+// Extract the agentId from a session_info_update envelope (hydra
+// stamps it under update._meta["hydra-acp"].agentId). Returns
+// undefined for other update kinds or when the field is absent.
+export function extractAgentIdUpdate(envelope: unknown): string | undefined {
+  const env = envelope as { update?: Record<string, unknown> } | undefined;
+  const update = env?.update;
+  if (!update || update.sessionUpdate !== "session_info_update") return undefined;
+  const meta = update._meta as Record<string, unknown> | undefined;
+  const ns = meta?.["hydra-acp"] as Record<string, unknown> | undefined;
+  const id = ns?.agentId;
+  return typeof id === "string" ? id : undefined;
+}
+
+// Extract currentModel from a current_model_update envelope.
+export function extractCurrentModelUpdate(envelope: unknown): string | undefined {
+  const env = envelope as { update?: Record<string, unknown> } | undefined;
+  const update = env?.update;
+  if (!update || update.sessionUpdate !== "current_model_update") return undefined;
+  const m = update.currentModel;
+  return typeof m === "string" ? m : undefined;
+}
+
 // Pull the text content out of an inbound session/update envelope —
 // used to accumulate the agent's reply chunks during decomposition.
 // Returns "" for non-text updates (tool calls, plans, mode changes).

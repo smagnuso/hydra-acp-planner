@@ -205,7 +205,7 @@ describe("formatStatus", () => {
       "hydra_session_ORCHESTRATORXXXX",
     );
     assert.match(out, /Sessions:/);
-    assert.match(out, /ROLE\s+SESSION\s+TASK\s+STATE\s+AGENT\|MODEL\s+DONE\s+TITLE/);
+    assert.match(out, /ROLE\s+SESSION\s+TASK\s+STATE\s+AGENT\|MODEL\s+DONE\s+COST\s+TOKENS\s+TITLE/);
     assert.match(out, /orchestrator/);
     assert.match(out, /worker\s+\S*BBBBBBBB\s+T1/);
   });

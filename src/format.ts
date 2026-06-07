@@ -1,7 +1,119 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { shortProjectId, shortSessionId, type Board, type Task } from "./board.js";
+import { shortProjectId, shortSessionId, type Board, type Task, type WorkerUsage } from "./board.js";
+
+// Format a cost amount with the worker's reported currency. Falls back
+// to a bare numeric when no currency is known; treats "USD" specially
+// to render as `$1.23` (the common case). Returns "-" for missing data.
+export function formatCost(amount: number | undefined, currency: string | undefined): string {
+  if (typeof amount !== "number") return "-";
+  if (currency === "USD" || currency === undefined) {
+    return `$${amount.toFixed(2)}`;
+  }
+  return `${amount.toFixed(2)} ${currency}`;
+}
+
+// Format a task's elapsed time. For done/failed tasks uses
+// finishedAt - startedAt; for in-flight tasks uses now - startedAt
+// (and suffixes with "+"). Returns "" when the task hasn't started.
+export function formatTaskDuration(task: Task, now: number = Date.now()): string {
+  if (!task.startedAt) return "";
+  const start = Date.parse(task.startedAt);
+  if (!Number.isFinite(start)) return "";
+  const endIso = task.finishedAt;
+  const end = endIso ? Date.parse(endIso) : now;
+  if (!Number.isFinite(end)) return "";
+  const ms = Math.max(0, end - start);
+  const live = !endIso;
+  return formatDurationMs(ms) + (live ? "+" : "");
+}
+
+export function formatDurationMs(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs === 0 ? `${m}m` : `${m}m${rs}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm === 0 ? `${h}h` : `${h}h${rm}m`;
+}
+
+// Compact token count: 12345 → "12.3k". Returns "-" for missing data.
+export function formatTokens(n: number | undefined): string {
+  if (typeof n !== "number") return "-";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+// Sum cumulative cost across all workers for the project total. Each
+// worker reports a session-cumulative amount, so summing across
+// distinct worker sessions gives the project-wide total.
+export function totalUsage(board: Board): {
+  cost: number;
+  currency: string | undefined;
+  tokensUsed: number;
+  hasTokens: boolean;
+} {
+  let cost = 0;
+  let currency: string | undefined;
+  let tokensUsed = 0;
+  let hasTokens = false;
+  const sources: Array<WorkerUsage | undefined> = [
+    board.orchestratorUsage,
+    ...Object.values(board.workers).map((w) => w.usage),
+  ];
+  for (const u of sources) {
+    if (!u) continue;
+    if (typeof u.costAmount === "number") {
+      cost += u.costAmount;
+      if (!currency && u.costCurrency) currency = u.costCurrency;
+    }
+    if (typeof u.used === "number") {
+      tokensUsed += u.used;
+      hasTokens = true;
+    }
+  }
+  return { cost, currency, tokensUsed, hasTokens };
+}
+
+// Sum of per-task durations (finished - started, or now - started for
+// in-flight tasks). Returns 0 if no tasks have started yet. This is
+// "compute time" — distinct from wall-clock, since tasks can run in
+// parallel.
+export function totalTaskDurationMs(board: Board, now: number = Date.now()): number {
+  let sum = 0;
+  for (const t of board.tasks) {
+    if (!t.startedAt) continue;
+    const start = Date.parse(t.startedAt);
+    if (!Number.isFinite(start)) continue;
+    const end = t.finishedAt ? Date.parse(t.finishedAt) : now;
+    if (!Number.isFinite(end)) continue;
+    sum += Math.max(0, end - start);
+  }
+  return sum;
+}
+
+// Wall-clock elapsed from project creation to either the last task's
+// finishedAt (terminal projects) or now (live projects). Returns 0 if
+// createdAt is missing/unparseable.
+export function wallClockMs(board: Board, now: number = Date.now()): number {
+  const start = Date.parse(board.createdAt);
+  if (!Number.isFinite(start)) return 0;
+  let end = now;
+  if (board.state === "done" || board.state === "failed") {
+    let latest = 0;
+    for (const t of board.tasks) {
+      if (!t.finishedAt) continue;
+      const f = Date.parse(t.finishedAt);
+      if (Number.isFinite(f) && f > latest) latest = f;
+    }
+    if (latest > 0) end = latest;
+  }
+  return Math.max(0, end - start);
+}
 
 // Inline overrides tag for a task: " {agent-id}", " {agent-id|model}",
 // or "" when neither is set. Same shape in both formatters so a task
@@ -42,18 +154,32 @@ export function formatSessionsTable(
     state: string;
     agent: string;
     done: string;
+    cost: string;
+    tokens: string;
     title: string;
   };
 
   const rows: Row[] = [];
   if (orchestratorSessionId) {
+    const ou = board.orchestratorUsage;
+    const oa = board.orchestratorAgent;
+    const om = board.orchestratorModel;
+    const orchAgentCell = oa || om
+      ? (oa && om ? `${oa} | ${om}` : (oa ?? om ?? "-"))
+      : "-";
     rows.push({
       role: "orchestrator",
       session: shortSessionId(orchestratorSessionId),
       task: "-",
-      state: "-",
-      agent: "-",
+      state: board.state,
+      agent: orchAgentCell,
       done: "-",
+      cost: formatCost(ou?.costAmount, ou?.costCurrency),
+      tokens: ou?.used !== undefined
+        ? (ou.size !== undefined
+            ? `${formatTokens(ou.used)}/${formatTokens(ou.size)}`
+            : formatTokens(ou.used))
+        : "-",
       title: board.description,
     });
   }
@@ -65,16 +191,32 @@ export function formatSessionsTable(
   for (const t of board.tasks) {
     if (t.assignedTo) taskByWorker.set(t.assignedTo, t);
   }
+  const taskById = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
   for (const [workerId, w] of Object.entries(board.workers)) {
-    const t = taskByWorker.get(workerId);
-    const agentTag = t ? formatTaskTag(t).trim().replace(/^\{|\}$/g, "") : "";
+    let t = taskByWorker.get(workerId);
+    if (!t && w.tasksCompleted.length > 0) {
+      const lastId = w.tasksCompleted[w.tasksCompleted.length - 1];
+      t = lastId ? taskById.get(lastId) : undefined;
+    }
+    const taskTag = t ? formatTaskTag(t).trim().replace(/^\{|\}$/g, "") : "";
+    const workerTag = w.agent || w.model
+      ? (w.agent && w.model ? `${w.agent} | ${w.model}` : (w.agent ?? w.model ?? ""))
+      : "";
+    const agentCell = taskTag.length > 0 ? taskTag : workerTag;
+    const totalTasks = w.tasksCompleted.length + (w.currentTaskId ? 1 : 0);
     rows.push({
       role: "worker",
       session: shortSessionId(workerId),
       task: t?.id ?? "-",
       state: t?.status ?? "-",
-      agent: agentTag.length > 0 ? agentTag : "-",
-      done: String(w.tasksCompleted.length),
+      agent: agentCell.length > 0 ? agentCell : "-",
+      done: totalTasks > 0 ? `${w.tasksCompleted.length}/${totalTasks}` : "-",
+      cost: formatCost(w.usage?.costAmount, w.usage?.costCurrency),
+      tokens: w.usage?.used !== undefined
+        ? (w.usage.size !== undefined
+            ? `${formatTokens(w.usage.used)}/${formatTokens(w.usage.size)}`
+            : formatTokens(w.usage.used))
+        : "-",
       title: t?.title ?? "-",
     });
   }
@@ -88,10 +230,12 @@ export function formatSessionsTable(
     state: "STATE",
     agent: "AGENT|MODEL",
     done: "DONE",
+    cost: "COST",
+    tokens: "TOKENS",
     title: "TITLE",
   };
 
-  const cols: Array<keyof Row> = ["role", "session", "task", "state", "agent", "done", "title"];
+  const cols: Array<keyof Row> = ["role", "session", "task", "state", "agent", "done", "cost", "tokens", "title"];
   const widths = Object.fromEntries(
     cols.map((c) => [c, Math.max(header[c].length, ...rows.map((r) => r[c].length))]),
   ) as Record<keyof Row, number>;
@@ -151,7 +295,9 @@ export function formatBoardContext(board: Board): string {
           ? `, worker: ${shortSessionId(task.assignedTo)}`
           : "";
       const tag = formatTaskTag(task);
-      lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${task.status}${deps}${worker}]`);
+      const dur = formatTaskDuration(task);
+      const durTag = dur ? `, duration: ${dur}` : "";
+      lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${task.status}${deps}${worker}${durTag}]`);
       if (task.what) lines.push(`     what: ${task.what}`);
       if (task.constraints) lines.push(`     constraints: ${task.constraints}`);
       if (task.artifacts?.summary) lines.push(`     result: ${task.artifacts.summary}`);
@@ -195,6 +341,22 @@ export function formatStatus(
   if (failed > 0) counts.push(`${failed} failed`);
   lines.push(`   Tasks: ${counts.join(", ")}`);
   lines.push(`   Concurrency cap: ${board.concurrencyCap}`);
+  const totals = totalUsage(board);
+  const usageParts: string[] = [];
+  if (totals.cost > 0) usageParts.push(formatCost(totals.cost, totals.currency));
+  if (totals.hasTokens) usageParts.push(`${formatTokens(totals.tokensUsed)} tokens`);
+  if (usageParts.length > 0) {
+    const n = Object.keys(board.workers).length;
+    lines.push(`   Usage: ${usageParts.join(", ")} (orchestrator + ${n} worker${n === 1 ? "" : "s"})`);
+  }
+  const wall = wallClockMs(board);
+  const compute = totalTaskDurationMs(board);
+  if (wall > 0 || compute > 0) {
+    const parts: string[] = [];
+    if (wall > 0) parts.push(`wall ${formatDurationMs(wall)}`);
+    if (compute > 0) parts.push(`task ${formatDurationMs(compute)}`);
+    lines.push(`   Duration: ${parts.join(", ")}`);
+  }
   lines.push(
     `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`,
   );
@@ -210,7 +372,9 @@ export function formatStatus(
         ? `  → ${shortSessionId(task.assignedTo)}`
         : "";
     const tag = formatTaskTag(task);
-    lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}`);
+    const dur = formatTaskDuration(task);
+    const durStr = dur ? `  (${dur})` : "";
+    lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}${durStr}`);
   }
 
   const sessionsTable = formatSessionsTable(board, orchestratorSessionId, {
