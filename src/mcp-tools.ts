@@ -241,15 +241,15 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_retask",
+    name: "planner_retry",
     description:
-      "Reset a task to pending. If it's currently assigned, closes its worker (work is discarded), bumps attemptCount, schedules a fresh attempt. Use when a task got into a bad state and the user wants to try again from scratch. Omit `taskId` to retask every task currently in `failed` status — the common recovery flow after a stuck-board notice.",
+      "Reset a task to pending and resume work. If it's currently assigned, closes its worker (work is discarded), bumps attemptCount, schedules a fresh attempt. If the project was in `stopped` state, also flips it back to running. Use when a task got into a bad state and the user wants to try again from scratch. Omit `taskId` to retry every task currently in `failed` status — the common recovery flow after a stuck-board notice.",
     inputSchema: {
       type: "object",
       properties: {
         taskId: {
           type: "string",
-          description: "Id of the task to retask. Omit to retask all failed tasks.",
+          description: "Id of the task to retry. Omit to retry all failed tasks.",
         },
       },
     },

@@ -735,7 +735,7 @@ describe("planner_resume", () => {
   });
 });
 
-// ── planner_skip / retask ──────────────────────────────────────────
+// ── planner_skip / retry ───────────────────────────────────────────
 
 describe("planner_skip", () => {
   it("errors when taskId is missing", async () => {
@@ -785,14 +785,14 @@ describe("planner_skip", () => {
   });
 });
 
-describe("planner_retask", () => {
+describe("planner_retry", () => {
   it("errors when taskId is missing or unknown", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(110, "planner_retask", {}));
+    dispatch(mkInvoke(110, "planner_retry", {}));
     await settle();
     assert.equal((client.lastReply().result as { isError: boolean }).isError, true);
 
-    dispatch(mkInvoke(111, "planner_retask", { taskId: "Tnope" }));
+    dispatch(mkInvoke(111, "planner_retry", { taskId: "Tnope" }));
     await settle();
     assert.equal((client.lastReply().result as { isError: boolean }).isError, true);
   });
@@ -805,7 +805,7 @@ describe("planner_retask", () => {
           id: "T1",
           title: "done-now-redo",
           status: "done",
-          deps: ["T2"], // keeps T1 ineligible after retask so the scheduler can't re-assign it
+          deps: ["T2"], // keeps T1 ineligible after retry so the scheduler can't re-assign it
           startedAt: "2025-01-01T00:00:00Z",
           finishedAt: "2025-01-01T00:01:00Z",
           artifacts: { summary: "old" },
@@ -813,7 +813,7 @@ describe("planner_retask", () => {
         { id: "T2", title: "blocked", status: "blocked" },
       ],
     });
-    dispatch(mkInvoke(112, "planner_retask", { taskId: "T1" }));
+    dispatch(mkInvoke(112, "planner_retry", { taskId: "T1" }));
     await settle();
     const t1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
     assert.equal(t1.status, "pending");

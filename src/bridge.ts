@@ -186,9 +186,9 @@ const COMMANDS = [
     description: "Slot a new task into this session's project. Asks the orchestrator agent where it fits and schedules it.",
   },
   {
-    verb: "retask",
+    verb: "retry",
     argsHint: "[taskId]",
-    description: "Reset a task to pending. Closes its current worker (if any), bumps attemptCount, schedules next. With no arg, retasks every failed task.",
+    description: "Reset a task to pending and resume work. Closes its current worker (if any), bumps attemptCount. If the project was stopped, flips it back to running and re-opens the live view. With no arg, retries every failed task.",
   },
   {
     verb: "skip",
@@ -330,9 +330,9 @@ export class PlannerBridge {
   private agentChoices: AgentChoice[] | undefined;
   // Per-project guard for the "stuck behind failed deps" notification
   // so we don't re-emit it every time scheduleEligibleTasks is invoked
-  // (which happens after every completion + cancel + retask). Cleared
+  // (which happens after every completion + cancel + retry). Cleared
   // when the board exits the blocked state (any pending task becomes
-  // eligible again, e.g. via retask of the failed root).
+  // eligible again, e.g. via retry of the failed root).
   private blockedNotifiedFor = new Set<string>();
 
   private async ensureAgentChoices(): Promise<AgentChoice[] | undefined> {
@@ -796,8 +796,15 @@ export class PlannerBridge {
       });
       return;
     }
-    if (verb === "retask") {
-      this.handleRetask(req.id, sessionId, args);
+    if (verb === "retry") {
+      void this.handleRetry(req.id, sessionId, args, messageId)
+        .catch((err) => {
+          log.error(`handleRetry threw: ${(err as Error).message}`);
+          this.client.reply(req.id, {
+            text: `Internal error: ${(err as Error).message}`,
+          });
+        })
+        .finally(() => this.clearPendingDispatch(messageId));
       return;
     }
     if (verb === "skip") {
@@ -1081,7 +1088,7 @@ export class PlannerBridge {
     }
     if (task.status === "failed") {
       this.client.reply(reqId, {
-        text: `${taskId} is in failed state — use \`/hydra planner retask ${taskId}\` to retry or accept it as is.`,
+        text: `${taskId} is in failed state — use \`/hydra planner retry ${taskId}\` to retry or accept it as is.`,
       });
       return;
     }
@@ -1115,8 +1122,9 @@ export class PlannerBridge {
   // Reset a single task to pending. If it's currently assigned, close
   // its worker first (the work is discarded). Mutates board in place;
   // caller is responsible for saveBoard + emitPlanUpdate +
-  // scheduleEligibleTasks after one or more invocations.
-  private retaskOne(board: Board, orchestratorSessionId: string, task: Task): void {
+  // scheduleEligibleTasks (and, if the board was stopped, the resume
+  // flow) after one or more invocations.
+  private retryOne(board: Board, orchestratorSessionId: string, task: Task): void {
     const workerId = task.assignedTo;
     if (task.status === "assigned" && workerId) {
       this.endWorkerForward(workerId);
@@ -1130,68 +1138,104 @@ export class PlannerBridge {
     task.startedAt = null;
     task.finishedAt = null;
     task.artifacts = null;
-    log.info(`retask ${task.id} in ${board.projectId} (attemptCount=${task.attemptCount})`);
+    log.info(`retry ${task.id} in ${board.projectId} (attemptCount=${task.attemptCount})`);
     // Include task id and (if any) the now-closed worker session in the
     // user-facing notice so it's identifiable at a glance in a transcript
-    // that may carry multiple retask events from a no-arg "retask all
+    // that may carry multiple retry events from a no-arg "retry all
     // failed" invocation. The metadata carries taskId separately but
     // renderers don't all surface it inline.
     const workerTag = workerId ? ` on worker ${shortSessionId(workerId)}` : "";
     void this.emitSyntheticMessage(
       orchestratorSessionId,
       `${task.id}${workerTag} reset to pending (attempt #${task.attemptCount + 1} next)`,
-      { event: "task-retasked", taskId: task.id },
+      { event: "task-retried", taskId: task.id },
     );
   }
 
-  // /hydra planner retask [taskId]
+  // Resume a stopped board: flip state to running, re-attach the
+  // transformer, kick the scheduler. Mirrors the `stopped` branch of
+  // handleExecute (src/bridge.ts ~1955) so retry-after-stop behaves
+  // identically to execute-after-stop. Returns after attach + initial
+  // schedule; caller is responsible for opening the held turn.
+  private async resumeStoppedBoard(sessionId: string, board: Board): Promise<void> {
+    log.info(`resuming stopped plan ${board.projectId} on session …${sessionId.slice(-8)} (via retry)`);
+    board.state = "running";
+    saveBoard(board, sessionId);
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(
+        `retry: transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
+      );
+    }
+    void this.scheduleEligibleTasks(sessionId, board);
+  }
+
+  // /hydra planner retry [taskId]
   //
   // With <taskId>: reset that one task to pending (closing its worker
   // if assigned). With no arg: reset every task currently in `failed`
   // status — the common case after a stuck-board notice naming several
   // failed roots. Useful when a task got into a bad state and the user
   // wants to try fresh.
-  private handleRetask(
+  //
+  // If the board is in `stopped` state, retry also resumes the
+  // project: flips state to running, re-attaches the transformer,
+  // re-opens the live view. Single command, no follow-up execute
+  // needed.
+  private async handleRetry(
     reqId: number | string,
     sessionId: string,
     args: string,
-  ): void {
+    slashMessageId: string | undefined,
+  ): Promise<void> {
     const taskId = args.split(/\s+/)[0]?.trim() ?? "";
     const ctx = this.requireBoard(reqId, sessionId);
     if (!ctx) return;
     const { board, orchestratorSessionId } = ctx;
 
+    let resetIds: string[];
     if (!taskId) {
       const failed = board.tasks.filter((t) => t.status === "failed");
       if (failed.length === 0) {
         this.client.reply(reqId, {
-          text: "planner retask: no failed tasks. Usage: `/hydra planner retask` (all failed) or `/hydra planner retask <taskId>` (one task).",
+          text: "planner retry: no failed tasks. Usage: `/hydra planner retry` (all failed) or `/hydra planner retry <taskId>` (one task).",
         });
         return;
       }
       for (const task of failed) {
-        this.retaskOne(board, orchestratorSessionId, task);
+        this.retryOne(board, orchestratorSessionId, task);
       }
-      saveBoard(board, orchestratorSessionId);
-      this.emitPlanUpdate(orchestratorSessionId, board);
-      void this.scheduleEligibleTasks(orchestratorSessionId, board);
-      const ids = failed.map((t) => t.id).join(", ");
-      this.client.reply(reqId, {
-        text: `Reset ${failed.length} failed task${failed.length === 1 ? "" : "s"} to pending: ${ids}.`,
-      });
+      resetIds = failed.map((t) => t.id);
+    } else {
+      const task = board.tasks.find((t) => t.id === taskId);
+      if (!task) {
+        this.client.reply(reqId, { text: `No task '${taskId}' in this project.` });
+        return;
+      }
+      this.retryOne(board, orchestratorSessionId, task);
+      resetIds = [taskId];
+    }
+
+    saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+
+    const wasStopped = board.state === "stopped";
+    if (wasStopped) {
+      // Auto-resume + open held turn so the user gets the live view
+      // back. holdAndReply keeps the commands/invoke open for the
+      // remainder of the project lifetime — same shape as execute.
+      await this.resumeStoppedBoard(orchestratorSessionId, board);
+      await this.holdAndReply(reqId, orchestratorSessionId, board, slashMessageId, "retry");
       return;
     }
 
-    const task = board.tasks.find((t) => t.id === taskId);
-    if (!task) {
-      this.client.reply(reqId, { text: `No task '${taskId}' in this project.` });
-      return;
-    }
-    this.retaskOne(board, orchestratorSessionId, task);
-    saveBoard(board, orchestratorSessionId);
-    this.emitPlanUpdate(orchestratorSessionId, board);
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
-    this.client.reply(reqId, { text: `Reset ${taskId} to pending.` });
+    const reply = resetIds.length === 1
+      ? `Reset ${resetIds[0]} to pending.`
+      : `Reset ${resetIds.length} failed tasks to pending: ${resetIds.join(", ")}.`;
+    this.client.reply(reqId, { text: reply });
   }
 
   // /hydra planner kill <workerId>
@@ -2117,12 +2161,20 @@ export class PlannerBridge {
     });
    }
 
-  // Surface a one-shot "project stuck behind failed dependencies"
-  // notice. Called from the scheduler when no task is eligible AND no
-  // worker is in flight AND tasks remain pending — i.e. every pending
-  // task is transitively blocked by a `failed` ancestor. Without this
-  // the board sits silently in "running" state and the user has no
-  // signal that they need to /hydra planner retask the failed root(s).
+  // Surface "project stuck behind failed dependencies" by ending the
+  // user's held turn with a failure resolution. Called from the
+  // scheduler when no task is eligible AND no worker is in flight AND
+  // tasks remain pending — i.e. every pending task is transitively
+  // blocked by a `failed` ancestor.
+  //
+  // Without this the board sat silently in "running" state with no
+  // workers, leaving the TUI looking busy forever. By resolving the
+  // held turn with reason "failed" we close the turn with explicit
+  // instructions, so the TUI stops spinning and the user sees the
+  // path forward. The board state itself stays `running` (tasks are
+  // still pending, just unreachable); a follow-up `/hydra planner
+  // retry` opens a fresh held turn via its own resume path.
+  //
   // Per-project deduped: re-emitted only if a future call sees the
   // board unstuck and then stuck again.
   private notifyBlockedByFailure(orchestratorSessionId: string, board: Board): void {
@@ -2133,15 +2185,21 @@ export class PlannerBridge {
     const failedIds = failed.map((t) => t.id).join(", ");
     const msg =
       `Project ${shortProjectId(board.projectId)} is stuck: ${pending} pending task${pending === 1 ? "" : "s"} blocked by failed dep${failed.length === 1 ? "" : "s"} ${failedIds}. ` +
-      `Use \`/hydra planner retask\` (or planner_retask with no taskId) to retry all failed tasks, ` +
+      `Use \`/hydra planner retry\` (or planner_retry with no taskId) to retry all failed tasks, ` +
       `or \`/hydra planner skip <id>\` to accept a failure and unblock dependents that are still reachable.`;
     log.info(
       `project ${shortProjectId(board.projectId)} blocked by failed deps [${failedIds}]; ${pending} pending task${pending === 1 ? "" : "s"} unreachable`,
     );
     this.blockedNotifiedFor.add(board.projectId);
-    void this.emitSyntheticMessage(orchestratorSessionId, msg, {
-      event: "project-blocked-by-failure",
-    });
+    // Resolve the held turn with reason "failed" so the TUI closes
+    // the turn cleanly. If there's no held turn (rehydrated project
+    // in degraded mode), fall back to a synthetic message so the
+    // transcript still carries the notice.
+    if (!resolveHeldTurn(orchestratorSessionId, { reason: "failed", text: msg })) {
+      void this.emitSyntheticMessage(orchestratorSessionId, msg, {
+        event: "project-blocked-by-failure",
+      });
+    }
   }
 
   // Inject board context into user prompts to the orchestrator agent.
@@ -2611,7 +2669,7 @@ export class PlannerBridge {
         // means every pending task is transitively blocked by a failed
         // dep. Without a signal the project sits silently in "running"
         // state forever. Notify once, then leave the board so the
-        // user can /hydra planner retask the failed root(s) to unblock.
+        // user can /hydra planner retry the failed root(s) to unblock.
         if (
           inFlightCount(board) === 0 &&
           board.tasks.some((t) => t.status === "pending")
@@ -3478,7 +3536,7 @@ export class PlannerBridge {
   // Dispose a worker's forwarder, optionally flushing any pending
   // buffered text first. Natural-end paths (task complete / task
   // failed) flush so the user sees whatever the worker was
-  // last thinking; abrupt-end paths (skip / retask / kill / cancel /
+  // last thinking; abrupt-end paths (skip / retry / kill / cancel /
   // remove) dispose without flushing so the abandoned text doesn't
   // appear after the "task ended" line in the transcript.
   private endWorkerForward(workerId: string, opts: { flush?: boolean } = {}): void {
@@ -3563,8 +3621,8 @@ export class PlannerBridge {
           return this.toolResume(req.id, sessionId);
         case "planner_skip":
           return this.toolSkip(req.id, sessionId, args);
-        case "planner_retask":
-          return this.toolRetask(req.id, sessionId, args);
+        case "planner_retry":
+          return this.toolRetry(req.id, sessionId, args);
         case "planner_remove":
           return this.toolRemove(req.id, sessionId);
         default:
@@ -4018,48 +4076,57 @@ export class PlannerBridge {
     this.replyMcpResult(reqId, `Skipped ${taskId}.`);
   }
 
-  private toolRetask(
+  private async toolRetry(
     reqId: number | string,
     sessionId: string,
     args: Record<string, unknown>,
-  ): void {
+  ): Promise<void> {
     const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
     const ctx = this.requireBoardForTool(sessionId);
     if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
     const { board } = ctx;
 
+    let resetIds: string[];
     if (!taskId) {
-      // No taskId → retask every failed task. Mirrors the slash
+      // No taskId → retry every failed task. Mirrors the slash
       // command's no-arg form for the common "stuck behind failed
       // deps" recovery flow.
       const failed = board.tasks.filter((t) => t.status === "failed");
       if (failed.length === 0) {
         return this.replyMcpTextError(
           reqId,
-          "planner_retask: no failed tasks; pass `taskId` to retask a specific task",
+          "planner_retry: no failed tasks; pass `taskId` to retry a specific task",
         );
       }
       for (const task of failed) {
-        this.retaskOne(board, sessionId, task);
+        this.retryOne(board, sessionId, task);
       }
-      saveBoard(board, sessionId);
-      this.emitPlanUpdate(sessionId, board);
-      void this.scheduleEligibleTasks(sessionId, board);
-      const ids = failed.map((t) => t.id).join(", ");
-      this.replyMcpResult(
-        reqId,
-        `Reset ${failed.length} failed task${failed.length === 1 ? "" : "s"} to pending: ${ids}.`,
-      );
-      return;
+      resetIds = failed.map((t) => t.id);
+    } else {
+      const task = board.tasks.find((t) => t.id === taskId);
+      if (!task) return this.replyMcpTextError(reqId, `planner_retry: no task '${taskId}' in this project`);
+      this.retryOne(board, sessionId, task);
+      resetIds = [taskId];
     }
 
-    const task = board.tasks.find((t) => t.id === taskId);
-    if (!task) return this.replyMcpTextError(reqId, `planner_retask: no task '${taskId}' in this project`);
-    this.retaskOne(board, sessionId, task);
     saveBoard(board, sessionId);
     this.emitPlanUpdate(sessionId, board);
-    void this.scheduleEligibleTasks(sessionId, board);
-    this.replyMcpResult(reqId, `Reset ${taskId} to pending.`);
+
+    // Auto-resume if stopped. MCP tool callers don't open held turns
+    // (no commands/invoke reqId to hold), so just flip state +
+    // reattach + schedule.
+    const wasStopped = board.state === "stopped";
+    if (wasStopped) {
+      await this.resumeStoppedBoard(sessionId, board);
+    } else {
+      void this.scheduleEligibleTasks(sessionId, board);
+    }
+
+    const head = resetIds.length === 1
+      ? `Reset ${resetIds[0]} to pending`
+      : `Reset ${resetIds.length} failed tasks to pending: ${resetIds.join(", ")}`;
+    const tail = wasStopped ? " and resumed project." : ".";
+    this.replyMcpResult(reqId, `${head}${tail}`);
   }
 
   private toolRemove(reqId: number | string, sessionId: string): void {

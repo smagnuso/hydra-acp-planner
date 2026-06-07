@@ -167,7 +167,7 @@ daemon connect time so they show up in tab-complete.
 | `/hydra planner status`                              | One-shot snapshot of the current session's board (tasks, states, worker assignments). Doesn't open the live view — safe to type anytime without affecting an in-flight project. |
 | `/hydra planner continue`                            | Open the live view on this session's running project. Plan panel re-renders, worker output streams, banner stays busy until the project completes (or the user amends/cancels). Used both manually and auto-injected by the planner after every amend on `create`/`execute`/`continue`. |
 | `/hydra planner add <description>`                   | Slot a new task into the current project. Asks the orchestrator agent where it fits in the DAG; appends and schedules. |
-| `/hydra planner retask <taskId>`                     | Reset a task to pending. Closes its current worker (if any), bumps `attemptCount`, schedules a fresh attempt. |
+| `/hydra planner retry [<taskId>]`                    | Reset a task to pending and resume work. Closes its current worker (if any), bumps `attemptCount`. If the project was `stopped`, also flips it back to running and re-opens the live view. With no arg, retries every failed task. |
 | `/hydra planner skip <taskId>`                       | Mark a task done without running it (artifacts: `skipped by user`). Frees its worker. |
 | `/hydra planner kill <workerId>`                     | Close a specific worker session. Requeues its current task as pending. |
 | `/hydra planner pause`                               | Stop scheduling new tasks. In-flight workers run to completion; their results land normally but no new tasks dispatch until resume. |
@@ -348,7 +348,7 @@ npm run watch   # rebuild on change
 ## Status
 
 In active development. Functional for create/execute/status/add/skip/
-retask/kill/pause/resume/cancel/remove flows with worker spawning,
+retry/kill/pause/resume/cancel/remove flows with worker spawning,
 dependency-aware scheduling, and restart-rehydration. Rough edges
 around long-tail error cases; open issues at the project repo.
 

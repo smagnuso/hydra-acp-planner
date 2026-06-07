@@ -48,7 +48,7 @@ export interface HeldTurnResolution {
 // continue` so the live view re-engages after the user's amended
 // turn finishes. `/hydra planner status` is a one-shot snapshot
 // that doesn't open a held turn, so it's not in this enum.
-export type HeldTurnVerb = "create" | "execute" | "continue";
+export type HeldTurnVerb = "create" | "execute" | "continue" | "retry";
 
 export interface HeldTurn {
   orchestratorSessionId: string;
