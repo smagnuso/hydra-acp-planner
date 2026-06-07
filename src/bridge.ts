@@ -1219,7 +1219,7 @@ export class PlannerBridge {
       log.info(`killed worker ${workerId}; requeued ${task.id}`);
       void this.emitSyntheticMessage(
         orchestratorId,
-        `Worker ${shortSessionId(workerId)} killed; task requeued`,
+        `Worker ${shortSessionId(workerId)} killed; ${task.id} requeued`,
         { event: "worker-killed", taskId: task.id },
       );
       void this.scheduleEligibleTasks(orchestratorId, board);
@@ -2678,7 +2678,7 @@ export class PlannerBridge {
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `Resuming on worker ${shortSessionId(workerSessionId)}  (${task.title})`,
+      `Resuming ${task.id} on worker ${shortSessionId(workerSessionId)} (${task.title})`,
       { event: "task-resumed", taskId: task.id },
     );
     void (async () => {
@@ -2790,7 +2790,7 @@ export class PlannerBridge {
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `Asking ${shortSessionId(workerSessionId)} for missing hydra-result block`,
+      `Asking ${task.id} worker ${shortSessionId(workerSessionId)} for missing hydra-result block`,
       { event: "task-result-reprompt", taskId: task.id },
     );
     void (async () => {
