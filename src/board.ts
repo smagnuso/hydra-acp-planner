@@ -8,9 +8,16 @@ import {
   projectsDir,
 } from "./paths.js";
 
-export const BOARD_SCHEMA_VERSION = 1;
+export const BOARD_SCHEMA_VERSION = 2;
 
-export type TaskStatus = "pending" | "assigned" | "done" | "failed" | "blocked";
+export type TaskStatus =
+  | "pending"
+  | "assigned"
+  | "awaiting_review"
+  | "done"
+  | "superseded"
+  | "failed"
+  | "blocked";
 // Board state machine:
 //
 //   decomposing → ready → running → done
@@ -67,6 +74,18 @@ export interface Task {
   artifacts?: TaskArtifacts | null;
   startedAt?: string | null;
   finishedAt?: string | null;
+  kind?: "work" | "review";
+  reviews?: string | string[];
+  runOn?: "orchestrator" | "worker";
+  reviewFeedback?: string[];
+  riskLevel?: "low" | "medium" | "high";
+  reviewHint?: "skip" | "optional" | "recommended" | "required";
+  onReject?: {
+    strategy?: "fresh" | "continue" | "escalate";
+    maxAttempts?: number;
+    agent?: string;
+    model?: string;
+  };
 }
 
 export interface WorkerUsage {
@@ -83,7 +102,16 @@ export interface Board {
   state: BoardState;
   createdAt: string;
   updatedAt: string;
-  fleetDefaults: { agent: string | null; model: string | null };
+  fleetDefaults: {
+    agent: string | null;
+    model: string | null;
+    work?: { agent?: string; model?: string };
+    review?: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" };
+  };
+  reviewPolicy?: {
+    mode?: "off" | "hints" | "all" | "high-only";
+    overrideHint?: boolean;
+  };
   tasks: Task[];
   workers: Record<string, {
     currentTaskId: string | null;
@@ -195,10 +223,21 @@ export function newBoard(opts: {
   };
 }
 
+function migrateBoard(b: Board): void {
+  // Schema v1 → v2: add new optional fields that don't have defaults.
+  if (b.version < 2) {
+    for (const t of b.tasks) {
+      t.kind ??= "work";
+    }
+    b.version = 2;
+  }
+}
+
 export function loadBoard(projectId: string): Board | undefined {
   try {
     const raw = readFileSync(boardPath(projectId), "utf8");
     const parsed = JSON.parse(raw) as Board;
+    migrateBoard(parsed);
     return parsed;
   } catch {
     return undefined;
@@ -245,23 +284,33 @@ export function pickEligible(board: Board): Task | undefined {
   const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
   for (const task of board.tasks) {
     if (task.status !== "pending") continue;
-    const blocked = task.deps.some((d) => byId.get(d)?.status !== "done");
+    const blocked = task.deps.some((d) => {
+      const s = byId.get(d)?.status;
+      return s !== "done" && s !== "superseded";
+    });
     if (blocked) continue;
     return task;
   }
   return undefined;
 }
 
-// All tasks are terminal (done or failed). Used to decide when to emit
-// the project-complete message and to stop spawning workers.
+// All tasks are terminal (done, superseded, or failed). Used to decide
+// when to emit the project-complete message and to stop spawning workers.
+// `awaiting_review` is NOT terminal — it's a holding state pending a
+// reviewer decision. `superseded` is terminal: the task was retired in
+// favor of a replacement and won't run again.
 export function allTerminal(board: Board): boolean {
   if (board.tasks.length === 0) return false;
-  return board.tasks.every((t) => t.status === "done" || t.status === "failed");
+  return board.tasks.every(
+    (t) => t.status === "done" || t.status === "failed" || t.status === "superseded",
+  );
 }
 
 // Number of tasks currently in `assigned` state — i.e. workers
 // actively running. The scheduler uses this against board.concurrencyCap
-// to decide whether to spawn another worker.
+// to decide whether to spawn another worker. `awaiting_review` is
+// deliberately NOT counted: the worker has exited and the task is
+// parked waiting for a reviewer; it doesn't consume a concurrency slot.
 export function inFlightCount(board: Board): number {
   let n = 0;
   for (const t of board.tasks) {

@@ -182,7 +182,7 @@ describe("formatStatus", () => {
       board({ tasks: [task("T1", { agent: "code-claude", model: "opus-4-7" })] }),
       true,
     );
-    assert.match(out, /\{code-claude \| opus-4-7\}/);
+    assert.match(out, /\{code-claude·opus-4-7\}/);
   });
 
   it("renders a model-only tag when only model is set", () => {
@@ -205,7 +205,7 @@ describe("formatStatus", () => {
       "hydra_session_ORCHESTRATORXXXX",
     );
     assert.match(out, /Sessions:/);
-    assert.match(out, /ROLE\s+SESSION\s+TASK\s+STATE\s+AGENT\|MODEL\s+DONE\s+COST\s+TOKENS\s+TITLE/);
+    assert.match(out, /ROLE\s+SESSION\s+TASK\s+STATE\s+AGENT·MODEL\s+DONE\s+COST\s+TOKENS\s+TITLE/);
     assert.match(out, /orchestrator/);
     assert.match(out, /worker\s+\S*BBBBBBBB\s+T1/);
   });
@@ -251,6 +251,6 @@ describe("formatSessionsTable", () => {
       }),
       undefined,
     );
-    assert.match(out, /code-claude \| opus/);
+    assert.match(out, /code-claude·opus/);
   });
 });

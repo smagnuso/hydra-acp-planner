@@ -123,7 +123,7 @@ function formatTaskTag(task: Task): string {
   const a = task.agent;
   const m = task.model;
   if (!a && !m) return "";
-  const inner = a && m ? `${a} | ${m}` : (a ?? m);
+  const inner = a && m ? `${a}·${m}` : (a ?? m);
   return ` {${inner}}`;
 }
 
@@ -165,7 +165,7 @@ export function formatSessionsTable(
     const oa = board.orchestratorAgent;
     const om = board.orchestratorModel;
     const orchAgentCell = oa || om
-      ? (oa && om ? `${oa} | ${om}` : (oa ?? om ?? "-"))
+      ? (oa && om ? `${oa}·${om}` : (oa ?? om ?? "-"))
       : "-";
     rows.push({
       role: "orchestrator",
@@ -200,7 +200,7 @@ export function formatSessionsTable(
     }
     const taskTag = t ? formatTaskTag(t).trim().replace(/^\{|\}$/g, "") : "";
     const workerTag = w.agent || w.model
-      ? (w.agent && w.model ? `${w.agent} | ${w.model}` : (w.agent ?? w.model ?? ""))
+      ? (w.agent && w.model ? `${w.agent}·${w.model}` : (w.agent ?? w.model ?? ""))
       : "";
     const agentCell = taskTag.length > 0 ? taskTag : workerTag;
     const totalTasks = w.tasksCompleted.length + (w.currentTaskId ? 1 : 0);
@@ -228,7 +228,7 @@ export function formatSessionsTable(
     session: "SESSION",
     task: "TASK",
     state: "STATE",
-    agent: "AGENT|MODEL",
+    agent: "AGENT·MODEL",
     done: "DONE",
     cost: "COST",
     tokens: "TOKENS",
@@ -261,6 +261,7 @@ export const TASK_STATUS_GLYPH: Record<string, string> = {
   failed: "[!]",
   blocked: "[-]",
   pending: "[ ]",
+  awaiting_review: "\u{1F50D}",
 };
 
 // Render a board as a context preamble injected into the user's prompts
@@ -364,7 +365,31 @@ export function formatStatus(
     return lines.join("\n");
   }
   lines.push("");
+
+  const reviewsByParent = new Map<string, Task[]>();
+  const renderedReviews = new Set<string>();
+  for (const t of board.tasks) {
+    if (t.kind !== "review") continue;
+    const reviewTargets = typeof t.reviews === "string" ? [t.reviews] : Array.isArray(t.reviews) ? t.reviews : [];
+    for (const targetId of reviewTargets) {
+      const arr = reviewsByParent.get(targetId) ?? [];
+      arr.push(t);
+      reviewsByParent.set(targetId, arr);
+    }
+  }
+
   for (const task of board.tasks) {
+    if (task.kind === "review") {
+      if (renderedReviews.has(task.id)) continue;
+      const parents = typeof task.reviews === "string" ? [task.reviews] : Array.isArray(task.reviews) ? task.reviews : [];
+      for (const parentId of parents) {
+        renderedReviews.add(task.id);
+        const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
+        const tag = formatTaskTag(task);
+        lines.push(`     ${glyph} ${task.id}  ${task.title}${tag}`);
+      }
+      continue;
+    }
     const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
     const deps = task.deps.length === 0 ? "" : `  ← ${task.deps.join(", ")}`;
     const worker =
@@ -375,6 +400,15 @@ export function formatStatus(
     const dur = formatTaskDuration(task);
     const durStr = dur ? `  (${dur})` : "";
     lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}${durStr}`);
+    const childReviews = reviewsByParent.get(task.id);
+    if (childReviews) {
+      for (const r of childReviews) {
+        renderedReviews.add(r.id);
+        const glyph = TASK_STATUS_GLYPH[r.status] ?? "?";
+        const tag = formatTaskTag(r);
+        lines.push(`     ${glyph} ${r.id}  ${r.title}${tag}`);
+      }
+    }
   }
 
   const sessionsTable = formatSessionsTable(board, orchestratorSessionId, {

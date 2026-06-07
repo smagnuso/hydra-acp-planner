@@ -85,6 +85,7 @@ import {
   shortSessionId,
   type Board,
   type Task,
+  type TaskArtifacts,
 } from "./board.js";
 import { projectDir } from "./paths.js";
 import {
@@ -100,13 +101,7 @@ import {
   normalizeDecomposition,
   sweepLineConcurrencyCap,
 } from "./decomposition.js";
-import {
-  buildRepromptForResultPrompt,
-  buildResumeTaskPrompt,
-  buildTaskPrompt,
-  extractResultBlock,
-  normalizeResult,
-} from "./task.js";
+import { promptsFor } from "./task.js";
 import {
   clearOrchestratorState,
   clearWorkerState,
@@ -331,7 +326,7 @@ export class PlannerBridge {
   // Cached list of installed specialist agents, populated lazily on
   // first prompt-building call. Refreshed at startup. Decomposition and
   // add-task prompts splice this in so the planner agent only suggests
-  // agents that actually exist.
+   // agents that actually exist.
   private agentChoices: AgentChoice[] | undefined;
   // Per-project guard for the "stuck behind failed deps" notification
   // so we don't re-emit it every time scheduleEligibleTasks is invoked
@@ -2114,7 +2109,7 @@ export class PlannerBridge {
       reason: "cancelled",
       text: `Project ${shortProjectId(board.projectId)} stopped${tail}. Use /hydra planner execute (or planner_execute) to resume.`,
     });
-  }
+   }
 
   // Surface a one-shot "project stuck behind failed dependencies"
   // notice. Called from the scheduler when no task is eligible AND no
@@ -2823,7 +2818,7 @@ export class PlannerBridge {
           method: "session/prompt",
           envelope: buildTextPromptEnvelope({
             sessionId: childSessionId,
-            text: buildTaskPrompt(task, board),
+            text: promptsFor(task.kind ?? 'work').buildPrompt(task, board),
             ancillary: true,
           }),
           route: "chain",
@@ -2878,7 +2873,7 @@ export class PlannerBridge {
           method: "session/prompt",
           envelope: buildTextPromptEnvelope({
             sessionId: workerSessionId,
-            text: buildResumeTaskPrompt(task),
+            text: promptsFor(task.kind ?? 'work').buildResumePrompt(task),
             ancillary: true,
           }),
           route: "chain",
@@ -2990,7 +2985,7 @@ export class PlannerBridge {
           method: "session/prompt",
           envelope: buildTextPromptEnvelope({
             sessionId: workerSessionId,
-            text: buildRepromptForResultPrompt(task),
+            text: promptsFor(task.kind ?? 'work').buildRepromptPrompt(task),
             ancillary: true,
           }),
           route: "chain",
@@ -3059,8 +3054,9 @@ export class PlannerBridge {
       );
       return;
     }
-    const raw = extractResultBlock(workerState.resultAccumulator);
-    const result = raw === undefined ? undefined : normalizeResult(raw);
+    const p = promptsFor(task.kind ?? 'work');
+    const raw = p.extractResult(workerState.resultAccumulator);
+    const result = raw === undefined ? undefined : p.normalizeResult(raw);
 
     if (!result) {
       // Reprompt once before giving up. Common failure: agent did the
@@ -3091,9 +3087,25 @@ export class PlannerBridge {
       return;
     }
 
+    this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
+
+    // Try to refill the freed slot. Completing this task may have also
+    // unblocked dependents — scheduleEligibleTasks loops until it hits
+    // the cap or runs out of eligible work. Also handles the
+    // project-complete transition when no more work remains.
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
+  }
+
+  private markTaskDone(
+    task: Task,
+    artifacts: TaskArtifacts,
+    board: Board,
+    orchestratorSessionId: string,
+    workerSessionId: string,
+  ): void {
     task.status = "done";
     task.finishedAt = nowIso();
-    task.artifacts = result.artifacts;
+    task.artifacts = artifacts;
     task.assignedTo = null;
     const workerEntry = board.workers[workerSessionId];
     if (workerEntry) {
@@ -3103,12 +3115,12 @@ export class PlannerBridge {
     saveBoard(board, orchestratorSessionId);
 
     log.info(
-      `completed ${task.id} on worker …${workerSessionId.slice(-8)} — ${result.artifacts.summary}`,
+      `completed ${task.id} on worker …${workerSessionId.slice(-8)} — ${artifacts.summary}`,
     );
     this.emitPlanUpdate(orchestratorSessionId, board);
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      result.artifacts.summary ?? task.title,
+      artifacts.summary ?? task.title,
       { event: "task-completed", taskId: task.id },
     );
 
@@ -3116,12 +3128,6 @@ export class PlannerBridge {
     clearWorkerState(workerSessionId);
     unregisterWorker(workerSessionId);
     void this.closeWorker(workerSessionId);
-
-    // Try to refill the freed slot. Completing this task may have also
-    // unblocked dependents — scheduleEligibleTasks loops until it hits
-    // the cap or runs out of eligible work. Also handles the
-    // project-complete transition when no more work remains.
-    void this.scheduleEligibleTasks(orchestratorSessionId, board);
   }
 
   private handleTaskFailure(
