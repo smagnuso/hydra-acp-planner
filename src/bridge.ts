@@ -333,6 +333,12 @@ export class PlannerBridge {
   // add-task prompts splice this in so the planner agent only suggests
   // agents that actually exist.
   private agentChoices: AgentChoice[] | undefined;
+  // Per-project guard for the "stuck behind failed deps" notification
+  // so we don't re-emit it every time scheduleEligibleTasks is invoked
+  // (which happens after every completion + cancel + retask). Cleared
+  // when the board exits the blocked state (any pending task becomes
+  // eligible again, e.g. via retask of the failed root).
+  private blockedNotifiedFor = new Set<string>();
 
   private async ensureAgentChoices(): Promise<AgentChoice[] | undefined> {
     if (this.agentChoices !== undefined) return this.agentChoices;
@@ -2088,6 +2094,33 @@ export class PlannerBridge {
     });
   }
 
+  // Surface a one-shot "project stuck behind failed dependencies"
+  // notice. Called from the scheduler when no task is eligible AND no
+  // worker is in flight AND tasks remain pending — i.e. every pending
+  // task is transitively blocked by a `failed` ancestor. Without this
+  // the board sits silently in "running" state and the user has no
+  // signal that they need to /hydra planner retask the failed root(s).
+  // Per-project deduped: re-emitted only if a future call sees the
+  // board unstuck and then stuck again.
+  private notifyBlockedByFailure(orchestratorSessionId: string, board: Board): void {
+    if (this.blockedNotifiedFor.has(board.projectId)) return;
+    const failed = board.tasks.filter((t) => t.status === "failed");
+    if (failed.length === 0) return; // shouldn't happen given the call-site guard
+    const pending = board.tasks.filter((t) => t.status === "pending").length;
+    const failedIds = failed.map((t) => t.id).join(", ");
+    const msg =
+      `Project ${shortProjectId(board.projectId)} is stuck: ${pending} pending task${pending === 1 ? "" : "s"} blocked by failed dep${failed.length === 1 ? "" : "s"} ${failedIds}. ` +
+      `Use \`/hydra planner retask <id>\` (or planner_retask) on the failed task(s) to resume, ` +
+      `or \`/hydra planner skip <id>\` to accept the failure and unblock dependents that are still reachable.`;
+    log.info(
+      `project ${shortProjectId(board.projectId)} blocked by failed deps [${failedIds}]; ${pending} pending task${pending === 1 ? "" : "s"} unreachable`,
+    );
+    this.blockedNotifiedFor.add(board.projectId);
+    void this.emitSyntheticMessage(orchestratorSessionId, msg, {
+      event: "project-blocked-by-failure",
+    });
+  }
+
   // Inject board context into user prompts to the orchestrator agent.
   // Only acts when:
   //   - The session is one we have a board for in memory (i.e. an
@@ -2551,13 +2584,44 @@ export class PlannerBridge {
         // Nothing eligible right now. Either we hit the cap, or
         // remaining work is dep-blocked behind in-flight tasks. The
         // next task completion will retry — no need to poll.
+        // …unless nothing is in flight AND tasks remain pending: that
+        // means every pending task is transitively blocked by a failed
+        // dep. Without a signal the project sits silently in "running"
+        // state forever. Notify once, then leave the board so the
+        // user can /hydra planner retask the failed root(s) to unblock.
+        if (
+          inFlightCount(board) === 0 &&
+          board.tasks.some((t) => t.status === "pending")
+        ) {
+          this.notifyBlockedByFailure(orchestratorSessionId, board);
+        }
         return;
       }
+      // Forward progress is happening — clear the stuck-notice dedup
+      // so if the board ever blocks again later (a future failure
+      // strands new dependents), the user gets a fresh notification.
+      this.blockedNotifiedFor.delete(board.projectId);
       // Spawn synchronously enough to claim the task before the
       // next loop iteration sees it. The actual emit + run is
       // fire-and-forget; on completion it calls back into
       // scheduleEligibleTasks to fill the slot.
       await this.spawnTaskOnNewWorker(orchestratorSessionId, board, task);
+      // Re-check terminal state after the spawn await: a user-cancel
+      // (^C → runProjectStop) can land during one of the spawn's
+      // internal awaits, transitioning the board to "stopped". Without
+      // this check the loop happily picks the next pending task and
+      // spawns another worker the user thinks they cancelled.
+      // (cast: TS narrowed `state` based on the top-of-function guard
+      // and doesn't know runProjectStop can mutate it during the await.)
+      const stateAfter = board.state as Board["state"];
+      if (
+        stateAfter === "done" ||
+        stateAfter === "failed" ||
+        stateAfter === "stopped" ||
+        stateAfter === "paused"
+      ) {
+        return;
+      }
     }
   }
 
@@ -2571,6 +2635,20 @@ export class PlannerBridge {
     board: Board,
     task: Task,
   ): Promise<void> {
+    // Pick the effective agent: per-task override beats fleet default
+    // beats daemon default. Validate against the cached choice list;
+    // unknown ids fall back to the daemon's default with a warning.
+    // Declared at function scope so it remains in scope after the spawn
+    // try-block, where it's recorded on board.workers below.
+    const effectiveAgent = task.agent ?? board.fleetDefaults?.agent ?? null;
+    // Make sure the installed-agent list is populated before we validate
+    // against it. Without this, a fresh transformer process (e.g. after
+    // a restart) has an empty cache and every per-task / fleet-default
+    // agent gets misreported as "unknown" and silently downgraded to
+    // the daemon default.
+    if (effectiveAgent) {
+      await this.ensureAgentChoices();
+    }
     let childSessionId: string;
     try {
       const spawnParams: Record<string, unknown> = {
@@ -2585,10 +2663,6 @@ export class PlannerBridge {
           "hydra-acp": { title: `${task.id}: ${task.title}` },
         },
       };
-      // Pick the effective agent: per-task override beats fleet default
-      // beats daemon default. Validate against the cached choice list;
-      // unknown ids fall back to the daemon's default with a warning.
-      const effectiveAgent = task.agent ?? board.fleetDefaults?.agent ?? null;
       if (effectiveAgent) {
         const known = (this.agentChoices ?? []).some((a) => a.id === effectiveAgent);
         if (known) {
@@ -2632,6 +2706,25 @@ export class PlannerBridge {
       task.status = "failed";
       task.attemptCount += 1;
       saveBoard(board, orchestratorSessionId);
+      return;
+    }
+
+    // Abort the claim if the board was stopped/cancelled while we
+    // were awaiting spawn + attach. The worker session exists at this
+    // point but isn't doing anything yet (no prompt sent); close it and
+    // leave the task pending so a future resume can re-dispatch it.
+    // Without this guard a ^C arriving mid-spawn lets the post-await
+    // code below mark the task assigned and fire the task prompt — the
+    // user's "cancel" then races against a freshly-launched worker.
+    if (
+      board.state === "stopped" ||
+      board.state === "failed" ||
+      board.state === "done"
+    ) {
+      log.info(
+        `task ${task.id}: abandoning spawn — board entered "${board.state}" during spawn`,
+      );
+      void this.closeWorker(childSessionId);
       return;
     }
 
@@ -3048,9 +3141,14 @@ export class PlannerBridge {
     }
     saveBoard(board, orchestratorSessionId);
     this.emitPlanUpdate(orchestratorSessionId, board);
+    // Prefix the user-facing failure line with task id + short worker
+    // session id so a glance at the transcript tells you which task on
+    // which worker died, without having to cross-reference the plan
+    // panel. (The metadata carries taskId separately, but renderers
+    // don't all surface it inline.)
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      reason,
+      `${task.id} on worker ${shortSessionId(workerSessionId)} failed: ${reason}`,
       { event: "task-failed", taskId: task.id },
     );
     this.endWorkerForward(workerSessionId, { flush: true });

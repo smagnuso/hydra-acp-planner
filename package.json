@@ -18,7 +18,7 @@
     "hydra-acp-planner": "dist/index.js"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "npm run lint && tsup",
     "watch": "tsup --watch",
     "start": "node dist/index.js",
     "dev": "tsup && node dist/index.js",
