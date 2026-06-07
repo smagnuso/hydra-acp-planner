@@ -2506,6 +2506,14 @@ export class PlannerBridge {
       const spawnParams: Record<string, unknown> = {
         parentSessionId: orchestratorSessionId,
         // cwd omitted → inherits from parent
+        // Pre-seed the worker's session title so it shows up labelled
+        // in session/list and the picker from the moment it's created.
+        // Without this, the first user prompt (the bulky task prompt)
+        // would seed the title — unscannable. Daemon reads this under
+        // _meta.hydra-acp.title (same shape as session/new).
+        _meta: {
+          "hydra-acp": { title: `${task.id}: ${task.title}` },
+        },
       };
       // Pick the effective agent: per-task override beats fleet default
       // beats daemon default. Validate against the cached choice list;
