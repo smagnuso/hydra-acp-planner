@@ -120,6 +120,7 @@ import {
   clearWorkerState,
   getOrchestratorState,
   getWorkerState,
+  isOrchestrator,
   orchestratorOfWorker,
   registerWorker,
   setOrchestratorState,
@@ -147,6 +148,12 @@ const INTERCEPTS = [
   "lifecycle:session.idle",
   "lifecycle:session.closed",
 ];
+//
+// Agent→client requests like session/request_permission do NOT come
+// through the transformer chain (the daemon broadcasts them only to
+// attached clients). The planner gets visibility into them by also
+// session/attach-ing to each worker as a regular client over the same
+// WebSocket — see attachAsClient + handlePermissionRequest below.
 
 // Worker session_update kinds we forward into the orchestrator's
 // held turn, preserving the original sessionUpdate kind so the TUI
@@ -763,13 +770,15 @@ export class PlannerBridge {
         sessionId: workerId,
       });
       attachedSessions.add(workerId);
-      return true;
     } catch (err) {
       log.warn(
         `activate: transformer/attach failed for ${label}: ${(err as Error).message}`,
       );
       return false;
     }
+    // Also attach as a client for permission forwarding (best-effort).
+    await this.attachAsClient(workerId);
+    return true;
   }
 
   // ── Request dispatch ────────────────────────────────────────────────
@@ -777,6 +786,13 @@ export class PlannerBridge {
   private handleRequest(req: JsonRpcRequest): void {
     if (req.method === "hydra-acp/transformer/message") {
       this.handleTransformerMessage(req);
+      return;
+    }
+    if (req.method === "session/request_permission") {
+      // Delivered to us because we session/attach-ed as a client on
+      // the worker session. Forward to the orchestrator (user's TUI)
+      // and reply with their pick.
+      this.handlePermissionRequest(req);
       return;
     }
     if (req.method === "hydra-acp/commands/invoke") {
@@ -2609,6 +2625,100 @@ export class PlannerBridge {
   // broadcastTurnComplete → recordAndBroadcast, bypassing the response
   // chain. End-of-turn is detected by awaiting the message/emit promise
   // in handleCreate (orchestrator) and spawnTaskOnNewWorker (worker).
+
+  // Handle a session/request_permission delivered to us because we
+  // session/attach-ed as a client on the worker session. The agent
+  // (worker) emitted the request; the daemon broadcasts to attached
+  // clients; we're one of them. Forward to the orchestrator (user's
+  // TUI) and reply with their pick.
+  private handlePermissionRequest(req: JsonRpcRequest): void {
+    const params = (req.params ?? {}) as { sessionId?: unknown };
+    const workerSessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+    if (!workerSessionId) {
+      this.client.replyError(req.id, -32602, "missing sessionId");
+      return;
+    }
+    if (isOrchestrator(workerSessionId)) {
+      // Shouldn't happen — we don't attach as a client to the
+      // orchestrator session. Pass-through reply with cancelled so the
+      // daemon's broadcast can still settle from another client.
+      this.client.replyError(req.id, -32601, "planner does not handle orchestrator-session permissions");
+      return;
+    }
+    const orchestratorId = orchestratorOfWorker(workerSessionId);
+    if (!orchestratorId) {
+      // Worker not registered (race during shutdown, or a session we
+      // don't manage). Reject so a different attached client (if any)
+      // can answer; don't auto-deny.
+      this.client.replyError(req.id, -32601, "planner does not own this worker");
+      return;
+    }
+    void this.forwardPermissionToOrchestrator(req.id, workerSessionId, orchestratorId, req.params);
+  }
+
+  // Forward a worker session/request_permission to the orchestrator
+  // session as a new request, then reply to the worker's request with
+  // the user's selection.
+  private async forwardPermissionToOrchestrator(
+    workerReqId: string | number,
+    workerSessionId: string,
+    orchestratorSessionId: string,
+    workerParams: unknown,
+  ): Promise<void> {
+    const shortWorker = workerSessionId.slice(-8);
+    try {
+      // Ask the daemon to broadcast a session/request_permission on the
+      // orchestrator session to ITS attached clients (the user's TUI).
+      // This endpoint exposes the same broadcast-and-await logic the
+      // agent's own session/request_permission goes through; it isn't
+      // route:"chain" (which would dispatch to the agent, who doesn't
+      // handle this method). The user's pick is the return value.
+      const rewritten = {
+        ...(workerParams as Record<string, unknown>),
+        sessionId: orchestratorSessionId,
+      };
+      const result = await this.client.request<unknown>(
+        "hydra-acp/session/request_permission",
+        rewritten,
+      );
+      this.client.reply(workerReqId, result ?? { outcome: { outcome: "cancelled" } });
+      log.info(`permission forwarded for worker …${shortWorker} → answered`);
+    } catch (err) {
+      log.warn(
+        `permission forward for worker …${shortWorker} failed: ${(err as Error).message}; auto-denying`,
+      );
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `Worker …${shortWorker} permission request auto-denied: ${(err as Error).message}`,
+        { event: "worker-permission-auto-denied", workerSessionId },
+      );
+      this.client.reply(workerReqId, { outcome: { outcome: "cancelled" } });
+    }
+  }
+
+  // Attach to a worker session as a regular ACP client so we receive
+  // agent→client broadcasts (notably session/request_permission). The
+  // planner already runs `transformer/attach` against the same session
+  // for chain visibility; this adds a parallel client attach over the
+  // same WebSocket. Best-effort: a failure here is logged but doesn't
+  // block worker dispatch — only permission forwarding is degraded.
+  private async attachAsClient(sessionId: string): Promise<void> {
+    try {
+      await this.client.request("session/attach", {
+        sessionId,
+        // historyPolicy: "none" — we only care about future
+        // permission requests, not past transcript replay.
+        historyPolicy: "none",
+        clientInfo: { name: PROCESS_NAME, version: "0.0.2" },
+      });
+      log.debug(`session/attach (client) for worker …${sessionId.slice(-8)}`);
+    } catch (err) {
+      log.warn(
+        `session/attach (client) for worker …${sessionId.slice(-8)} failed: ${(err as Error).message}; permission forwarding will be unavailable for this worker`,
+      );
+    }
+  }
+
   private handleUpdateResponse(reqId: number | string, sessionId: string, envelope: unknown): void {
     const orchState = getOrchestratorState(sessionId);
     if (orchState && orchState.awaitingDecomposition) {
@@ -3116,6 +3226,10 @@ export class PlannerBridge {
       saveBoard(board, orchestratorSessionId);
       return;
     }
+    // Also attach as a regular ACP client so the daemon broadcasts
+    // agent→client requests (session/request_permission) to us. Failure
+    // here is non-fatal — only permission forwarding is degraded.
+    await this.attachAsClient(childSessionId);
 
     // Abort the claim if the board was stopped/cancelled while we
     // were awaiting spawn + attach. The worker session exists at this
@@ -4506,7 +4620,12 @@ export class PlannerBridge {
   private async emitSyntheticMessage(
     sessionId: string,
     text: string,
-    plannerEvent?: { event: string; taskId?: string; reviewedTaskId?: string },
+    plannerEvent?: {
+      event: string;
+      taskId?: string;
+      reviewedTaskId?: string;
+      workerSessionId?: string;
+    },
   ): Promise<void> {
     const meta = plannerEvent
       ? {
@@ -4515,6 +4634,9 @@ export class PlannerBridge {
               event: plannerEvent.event,
               ...(plannerEvent.taskId ? { taskId: plannerEvent.taskId } : {}),
               ...(plannerEvent.reviewedTaskId ? { reviewedTaskId: plannerEvent.reviewedTaskId } : {}),
+              ...(plannerEvent.workerSessionId
+                ? { workerSessionId: plannerEvent.workerSessionId }
+                : {}),
             },
           },
         }
