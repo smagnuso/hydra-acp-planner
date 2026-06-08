@@ -4167,9 +4167,23 @@ export class PlannerBridge {
     }
     reviewedTask.assignedTo = null;
 
-    reviewTask.status = "done";
-    reviewTask.finishedAt = nowIso();
-    reviewTask.assignedTo = null;
+    // When we're retasking the work (reviewedStatus === "pending"),
+    // the review task must re-run after the worker re-completes —
+    // otherwise pickEligible won't dispatch it again and the work
+    // will park in awaiting_review forever. Reset it to pending and
+    // clear its run state. In all other cases (approve / amend / fix
+    // / winner / failed-after-max-attempts) the review is terminal.
+    if (reviewedStatus === "pending") {
+      reviewTask.status = "pending";
+      reviewTask.assignedTo = null;
+      reviewTask.startedAt = null;
+      reviewTask.finishedAt = null;
+      reviewTask.artifacts = null;
+    } else {
+      reviewTask.status = "done";
+      reviewTask.finishedAt = nowIso();
+      reviewTask.assignedTo = null;
+    }
 
     saveBoard(board, orchestratorSessionId);
 

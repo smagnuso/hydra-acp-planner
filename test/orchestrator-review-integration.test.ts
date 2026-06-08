@@ -191,7 +191,7 @@ describe("orchestrator-lane review — runReviewOnOrchestrator", () => {
     assert.equal(st.orchestratorReviewAccumulator, "");
   });
 
-  it("reject: work task retasked to pending with feedback; review done", async () => {
+  it("reject: work task retasked to pending with feedback; review reset to pending", async () => {
     const work = workTask("T1", { attemptCount: 1 });
     const rev = reviewTask("R1", "T1");
     const board = makeBoard([work, rev]);
@@ -206,7 +206,9 @@ describe("orchestrator-lane review — runReviewOnOrchestrator", () => {
     const wt = board.tasks.find((t) => t.id === "T1")!;
     const rt = board.tasks.find((t) => t.id === "R1")!;
     assert.equal(wt.status, "pending");
-    assert.equal(rt.status, "done");
+    assert.equal(rt.status, "pending", "review task reset so it runs again after work retry");
+    assert.equal(rt.assignedTo, null);
+    assert.equal(rt.finishedAt, null);
     assert.deepEqual(wt.reviewFeedback, ["missing error handling"]);
   });
 
@@ -227,7 +229,7 @@ describe("orchestrator-lane review — runReviewOnOrchestrator", () => {
     assert.ok(wt.artifacts?.decisions?.some((d) => d === "[review fix] patched directly"));
   });
 
-  it("malformed reply: parse failure treated as reject (review done, work untouched)", async () => {
+  it("malformed reply: parse failure treated as reject (review reset to pending, work retasked)", async () => {
     const work = workTask("T1");
     const rev = reviewTask("R1", "T1");
     const board = makeBoard([work, rev]);
@@ -240,8 +242,9 @@ describe("orchestrator-lane review — runReviewOnOrchestrator", () => {
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
     const rt = board.tasks.find((t) => t.id === "R1")!;
-    assert.equal(rt.status, "done", "review task resolves even on parse failure");
     // Parse failure is treated as reject of the reviewed task (below maxAttempts → retask).
+    // Review task is reset to pending so it re-runs after the work retry completes.
+    assert.equal(rt.status, "pending", "review task reset to pending to re-run after work retry");
     assert.equal(wt.status, "pending");
   });
 });

@@ -190,7 +190,9 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
     const wt = board.tasks.find((t) => t.id === "T1")!;
     const rt = board.tasks.find((t) => t.id === "R1")!;
     assert.equal(wt.status, "pending", "work task should be retasked");
-    assert.equal(rt.status, "done");
+    assert.equal(rt.status, "pending", "review task should be reset to re-run after work retry");
+    assert.equal(rt.assignedTo, null);
+    assert.equal(rt.finishedAt, null);
     assert.deepEqual(wt.reviewFeedback, ["needs error handling"]);
     assert.equal(wt.artifacts, null, "artifacts cleared on retask");
   });
@@ -247,7 +249,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
     const wt = board.tasks.find((t) => t.id === "T1")!;
     const rt = board.tasks.find((t) => t.id === "R1")!;
     assert.equal(wt.status, "pending", "fix should fall through to reject when canApplyFixes=false");
-    assert.equal(rt.status, "done");
+    assert.equal(rt.status, "pending", "review task should be reset to re-run after work retry");
     assert.ok(
       (wt.reviewFeedback ?? []).some((f) => f.includes("canApplyFixes")),
       `expected reject feedback to mention canApplyFixes, got ${JSON.stringify(wt.reviewFeedback)}`,
