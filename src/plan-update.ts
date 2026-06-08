@@ -33,12 +33,15 @@ export function getPlanRenderMode(): PlanRenderMode {
 }
 
 // Map our internal TaskStatus → the ACP plan entry status enum.
-// pending/blocked → "pending"; assigned → "in_progress"; done/failed
-// → "completed". (ACP plan has no "failed" status; we surface failure
+// assigned and awaiting_review → "in_progress" (the task is mid-cycle
+// even when awaiting_review — the work just finished and a review is
+// queued behind it; the user expects the todo to show it as active,
+// not pending); done/failed/superseded → "completed"; pending/blocked
+// → "pending". (ACP plan has no "failed" status; we surface failure
 // in the entry's content text via a "[FAILED] " prefix.)
 function mapStatus(task: Task): "pending" | "in_progress" | "completed" {
-  if (task.status === "assigned") return "in_progress";
-  if (task.status === "done" || task.status === "failed") return "completed";
+  if (task.status === "assigned" || task.status === "awaiting_review") return "in_progress";
+  if (task.status === "done" || task.status === "failed" || task.status === "superseded") return "completed";
   return "pending";
 }
 
