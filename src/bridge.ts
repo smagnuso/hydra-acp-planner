@@ -88,6 +88,7 @@ import {
   saveBoard,
   setBoardState,
   shortProjectId,
+  stopBoardBookkeeping,
   shortSessionId,
   type Board,
   type Task,
@@ -2594,23 +2595,14 @@ export class PlannerBridge {
     // start later resumes the board, pickEligible finds the
     // pending tasks naturally. attemptCount stays incremented from
     // the spawn so retry semantics remain honest.
-    const inFlight: Array<{ workerId: string; taskId: string }> = [];
-    for (const task of board.tasks) {
-      if (task.status === "assigned" && task.assignedTo) {
-        inFlight.push({ workerId: task.assignedTo, taskId: task.id });
-        task.status = "pending";
-        task.assignedTo = null;
-        task.startedAt = null;
-        task.finishedAt = null;
-      }
-    }
+    const { inFlightWorkerIds } = stopBoardBookkeeping(board);
     setBoardState(board, "stopped");
     saveBoard(board, orchestratorSessionId);
 
     log.info(
-      `stopping project ${shortProjectId(board.projectId)} (${source}) — ${inFlight.length} in-flight worker${inFlight.length === 1 ? "" : "s"}`,
+      `stopping project ${shortProjectId(board.projectId)} (${source}) — ${inFlightWorkerIds.length} in-flight worker${inFlightWorkerIds.length === 1 ? "" : "s"}`,
     );
-    for (const { workerId } of inFlight) {
+    for (const workerId of inFlightWorkerIds) {
       // Abandon any buffered text — flushing post-cancel would surface
       // the worker's last thoughts after the cancel summary, which
       // reads as if the work continued.
@@ -2640,8 +2632,8 @@ export class PlannerBridge {
     this.emitPlanUpdate(orchestratorSessionId, board);
 
     const tail =
-      inFlight.length > 0
-        ? `; ${inFlight.length} in-flight task${inFlight.length === 1 ? "" : "s"} reverted to pending`
+      inFlightWorkerIds.length > 0
+        ? `; ${inFlightWorkerIds.length} in-flight task${inFlightWorkerIds.length === 1 ? "" : "s"} reverted to pending`
         : "";
     resolveHeldTurn(orchestratorSessionId, {
       reason: "cancelled",

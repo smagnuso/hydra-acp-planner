@@ -16,6 +16,7 @@ import {
   saveBoard,
   shortProjectId,
   shortSessionId,
+  stopBoardBookkeeping,
   type Board,
   type Task,
 } from "../src/board.ts";
@@ -801,5 +802,157 @@ describe("reviewPolicy and fleetDefaults shape", () => {
   it("reviewPolicy is optional and undefined by default", () => {
     const b = newBoard({ description: "x" });
     assert.equal(b.reviewPolicy, undefined);
+  });
+});
+
+describe("stopBoardBookkeeping", () => {
+  function makeTask(id: string, opts: Partial<Task> = {}): Task {
+    return {
+      id,
+      title: id,
+      deps: opts.deps ?? [],
+      status: opts.status ?? "pending",
+      assignedTo: opts.assignedTo ?? undefined,
+      attemptCount: 0,
+      startedAt: opts.startedAt ?? undefined,
+      finishedAt: opts.finishedAt ?? undefined,
+      ...opts,
+    };
+  }
+
+  it("returns empty array and mutates nothing on an empty board", () => {
+    const b = newBoard({ description: "empty" });
+    const result = stopBoardBookkeeping(b);
+    assert.deepEqual(result, { inFlightWorkerIds: [] });
+    assert.equal(b.tasks.length, 0);
+    assert.deepEqual(b.workers, {});
+  });
+
+  it("reverts one assigned task and clears its worker's currentTaskId", () => {
+    const workerId = "worker-1";
+    const taskId = "T1";
+    const b: Board = {
+      version: 2,
+      projectId: "proj_sbb",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask(taskId, { status: "assigned", assignedTo: workerId, startedAt: "2025-01-01T00:00:00Z", finishedAt: undefined }),
+      ],
+      workers: {
+        [workerId]: { currentTaskId: taskId, tasksCompleted: [] },
+      },
+      concurrencyCap: 1,
+    };
+
+    const result = stopBoardBookkeeping(b);
+
+    assert.deepEqual(result, { inFlightWorkerIds: [workerId] });
+    const task = b.tasks[0]!;
+    assert.equal(task.status, "pending");
+    assert.equal(task.assignedTo, null);
+    assert.equal(task.startedAt, null);
+    assert.equal(task.finishedAt, null);
+    assert.equal(b.workers[workerId].currentTaskId, null);
+  });
+
+  it("reverts multiple assigned tasks on different workers", () => {
+    const w1 = "w-1", w2 = "w-2", w3 = "w-3";
+    const t1 = "T1", t2 = "T2", t3 = "T3";
+    const b: Board = {
+      version: 2,
+      projectId: "proj_sbb_multi",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask(t1, { status: "assigned", assignedTo: w1, startedAt: "2025-01-01T00:00:00Z" }),
+        makeTask("T4", { status: "pending" }),
+        makeTask(t2, { status: "assigned", assignedTo: w2, startedAt: "2025-01-01T00:00:00Z" }),
+        makeTask(t3, { status: "assigned", assignedTo: w3, startedAt: "2025-01-01T00:00:00Z" }),
+      ],
+      workers: {
+        [w1]: { currentTaskId: t1, tasksCompleted: [] },
+        [w2]: { currentTaskId: t2, tasksCompleted: [] },
+        [w3]: { currentTaskId: t3, tasksCompleted: [] },
+      },
+      concurrencyCap: 3,
+    };
+
+    const result = stopBoardBookkeeping(b);
+
+    assert.equal(result.inFlightWorkerIds.length, 3);
+    for (const wid of [w1, w2, w3]) {
+      assert.ok(result.inFlightWorkerIds.includes(wid), `${wid} should be in inFlightWorkerIds`);
+    }
+    assert.equal(b.tasks.find((t) => t.id === t1)?.status, "pending");
+    assert.equal(b.tasks.find((t) => t.id === t2)?.status, "pending");
+    assert.equal(b.tasks.find((t) => t.id === t3)?.status, "pending");
+    assert.equal(b.tasks.find((t) => t.id === "T4")?.status, "pending");
+    assert.equal(b.workers[w1].currentTaskId, null);
+    assert.equal(b.workers[w2].currentTaskId, null);
+    assert.equal(b.workers[w3].currentTaskId, null);
+  });
+
+  it("does NOT touch awaiting_review tasks", () => {
+    const workerId = "worker-ar";
+    const taskId = "T1";
+    const b: Board = {
+      version: 2,
+      projectId: "proj_sbb_ar",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask(taskId, { status: "awaiting_review", assignedTo: workerId }),
+      ],
+      workers: {
+        [workerId]: { currentTaskId: taskId, tasksCompleted: [] },
+      },
+      concurrencyCap: 1,
+    };
+
+    const result = stopBoardBookkeeping(b);
+
+    assert.deepEqual(result, { inFlightWorkerIds: [] });
+    const task = b.tasks[0]!;
+    assert.equal(task.status, "awaiting_review");
+    assert.equal(task.assignedTo, workerId);
+    assert.equal(b.workers[workerId].currentTaskId, taskId);
+  });
+
+  it("handles assigned task with missing worker entry (defensive)", () => {
+    const ghostWorkerId = "ghost-worker";
+    const taskId = "T1";
+    const b: Board = {
+      version: 2,
+      projectId: "proj_sbb_ghost",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask(taskId, { status: "assigned", assignedTo: ghostWorkerId, startedAt: "2025-01-01T00:00:00Z" }),
+      ],
+      workers: {},
+      concurrencyCap: 1,
+    };
+
+    // Should not throw — task is reverted, worker id is in result array
+    const result = stopBoardBookkeeping(b);
+
+    assert.deepEqual(result, { inFlightWorkerIds: [ghostWorkerId] });
+    const task = b.tasks[0]!;
+    assert.equal(task.status, "pending");
+    assert.equal(task.assignedTo, null);
+    assert.equal(task.startedAt, null);
   });
 });

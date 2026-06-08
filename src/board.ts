@@ -435,6 +435,43 @@ export function inFlightCount(board: Board): number {
   return n;
 }
 
+// Revert all in-flight (assigned) tasks back to pending and clear their
+// worker assignments. This is the bookkeeping half of a user-initiated stop:
+// it resets task state so that a subsequent `start` can re-dispatch them,
+// and it clears stale currentTaskId pointers on workers (the root cause of
+// the orphan "task=- state=-" rows the user originally reported after ^C).
+//
+// Only tasks with status === 'assigned' AND assignedTo set are reverted.
+// Tasks in awaiting_review are deliberately NOT touched: those represent
+// completed worker output parked for a reviewer; a user stop is "I'll come
+// back to this" rather than "something broke", so the review pipeline must
+// survive stop→resume intact.
+//
+// This helper does NOT call setBoardState or saveBoard — it mutates tasks
+// and workers in-place only. The caller is responsible for updating
+// board.state (typically to 'stopped') and persisting the board.
+export function stopBoardBookkeeping(board: Board): { inFlightWorkerIds: string[] } {
+  const inFlightWorkerIds: string[] = [];
+
+  for (const task of board.tasks) {
+    if (task.status !== "assigned" || !task.assignedTo) continue;
+    inFlightWorkerIds.push(task.assignedTo);
+    task.status = "pending";
+    task.assignedTo = null;
+    task.startedAt = null;
+    task.finishedAt = null;
+  }
+
+  for (const workerId of inFlightWorkerIds) {
+    const worker = board.workers[workerId];
+    if (worker) {
+      worker.currentTaskId = null;
+    }
+  }
+
+  return { inFlightWorkerIds };
+}
+
 export function listProjects(): ProjectIndexEntry[] {
   const dir = projectsDir();
   let entries: string[] = [];
