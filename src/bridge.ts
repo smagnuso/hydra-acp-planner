@@ -1266,6 +1266,70 @@ export class PlannerBridge {
       `${task.id}${workerTag} reset to pending (attempt #${task.attemptCount + 1} next)`,
       { event: "task-retried", taskId: task.id },
     );
+
+    // If this is a work task with an associated review, the review
+    // also needs to re-run after the retry. findReviewedTask in the
+    // completion path only considers `pending` reviews, so if the
+    // review is in any terminal state (done / failed) the retry would
+    // bypass the gate entirely and the work would be marked done with
+    // no fresh review. Reset every review that targets this task.
+    if (task.kind !== "review") {
+      for (const other of board.tasks) {
+        if (other.kind !== "review") continue;
+        if (other.id === task.id) continue;
+        const refs = other.reviews;
+        const reviewsThisTask =
+          typeof refs === "string"
+            ? refs === task.id
+            : Array.isArray(refs) && refs.includes(task.id);
+        if (!reviewsThisTask) continue;
+        if (other.status === "pending") continue;
+        const prevStatus = other.status;
+        const orchAssigned =
+          other.status === "assigned" && other.assignedTo === "orchestrator";
+        other.status = "pending";
+        other.assignedTo = null;
+        other.startedAt = null;
+        other.finishedAt = null;
+        other.artifacts = null;
+        if (orchAssigned) {
+          const orchState = getOrchestratorState(orchestratorSessionId);
+          if (orchState && orchState.orchestratorReviewTaskId === other.id) {
+            orchState.awaitingOrchestratorReview = false;
+            orchState.orchestratorReviewTaskId = null;
+            orchState.orchestratorReviewAccumulator = "";
+          }
+        }
+        log.info(
+          `retry cascade: reset review ${other.id} (was ${prevStatus}) so it re-runs after ${task.id}`,
+        );
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${other.id} reset to pending (will re-run after ${task.id})`,
+          { event: "task-retried-cascade", taskId: other.id },
+        );
+      }
+    }
+  }
+
+  // Transitive dependency check: does `task` depend (directly or via
+  // a chain of deps) on any task whose id is in `rootIds`? Used by
+  // handleRetry to flag stale downstream work without auto-resetting it.
+  private dependsOnAny(task: Task, rootIds: Set<string>, board: Board): boolean {
+    const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+    const seen = new Set<string>();
+    const stack = [...task.deps];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (rootIds.has(id)) return true;
+      const dep = byId.get(id);
+      if (dep) {
+        for (const d of dep.deps) stack.push(d);
+      }
+    }
+    return false;
   }
 
   // Resume a stopped board: flip state to running, re-attach the
@@ -1337,6 +1401,33 @@ export class PlannerBridge {
     saveBoard(board, orchestratorSessionId);
     this.emitPlanUpdate(orchestratorSessionId, board);
 
+    // Surface (but do NOT auto-reset) any already-done downstream
+    // work tasks that depend, directly or transitively, on a retried
+    // task. Their artifacts may have been produced against the older
+    // result and could now be stale — but resetting them would
+    // silently throw away real work, so leave the decision to the
+    // user. Reviews of the retried task are NOT included here: those
+    // are cascaded automatically in retryOne (a stale review is
+    // meaningless by definition).
+    const resetIdSet = new Set(resetIds);
+    const stale: string[] = [];
+    for (const t of board.tasks) {
+      if (t.status !== "done") continue;
+      if (t.kind === "review") continue;
+      if (resetIdSet.has(t.id)) continue;
+      if (this.dependsOnAny(t, resetIdSet, board)) {
+        stale.push(t.id);
+      }
+    }
+    if (stale.length > 0) {
+      const list = stale.join(", ");
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `Note: ${stale.length} done downstream task${stale.length === 1 ? "" : "s"} (${list}) depend on the retried task${resetIds.length === 1 ? "" : "s"}; their results may be stale. Retry them explicitly if needed.`,
+        { event: "task-retry-stale-downstream" },
+      );
+    }
+
     const wasStopped = board.state === "stopped";
     if (wasStopped) {
       // Auto-resume + open held turn so the user gets the live view
@@ -1347,11 +1438,14 @@ export class PlannerBridge {
       return;
     }
 
+    // Hold a turn for the live view, mirroring execute/continue.
+    // The scheduler runs inside holdAndReply (via the initial plan
+    // snapshot + subsequent task-state handlers), and the held turn
+    // resolves on project completion / failure / cancel — same as
+    // execute. Without this the TUI snaps back to ready immediately
+    // while workers spin in the background, hiding the work.
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
-    const reply = resetIds.length === 1
-      ? `Reset ${resetIds[0]} to pending.`
-      : `Reset ${resetIds.length} failed tasks to pending: ${resetIds.join(", ")}.`;
-    this.client.reply(reqId, { text: reply });
+    await this.holdAndReply(reqId, orchestratorSessionId, board, slashMessageId, "retry");
   }
 
   // /hydra planner kill <workerId>
