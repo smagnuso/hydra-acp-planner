@@ -21,12 +21,26 @@ For each task specify:
   - why: one sentence on user value or system constraint
   - what: one short paragraph describing the desired outcome — NOT the mechanism
   - constraints: hard requirements (compatibility, performance, security, file boundaries)
-                 that bound the solution space without dictating one implementation
+                  that bound the solution space without dictating one implementation
   - deps: array of task ids that must complete before this one can start
   - agent (optional): id of a specialist agent that should execute this task, drawn
-                      from the list below. Omit (or set null) when the default agent fits.
+                       from the list below. Omit (or set null) when the default agent fits.
   - model (optional): model id to apply on the worker session at bootstrap (e.g. a
-                      stronger model for harder tasks). Omit when the default model fits.
+                       stronger model for harder tasks). Omit when the default model fits.
+  - riskLevel: one of "low", "medium", or "high" — how risky is this task?
+  - reviewHint: one of "skip", "optional", "recommended", or "required" — how strongly
+                  should a human review be applied after the work is done?
+
+Rubric for riskLevel / reviewHint:
+  - Schema changes, security-sensitive code, or public-API surface changes → high / required
+  - Integration with new services, complex business logic, or cross-module refactors → medium / recommended
+  - Mechanical refactors (naming, formatting, dead-code removal) → low / skip
+  - When in doubt, default to medium / optional.
+
+When adding onReject configuration to a task, consider these strategies:
+  - continue: use for iterative refinement where review feedback is expected to lead to quick fixes by the same agent — e.g., polishing code, adjusting logic after reviewer comments, or tasks with large context that benefit from keeping the worker session alive.
+  - escalate: use when the current agent or model has hit a capability ceiling — e.g., a task assigned to a generalist that requires specialist knowledge, or a cheap/fast model that produces subpar results on complex reasoning tasks. Swap to a stronger agent/model via escalateTo.
+  - fresh (default): standard retask with same agent/model and a closed worker session. Use when you want a clean slate.
 
 Do NOT specify:
   - library, framework, or algorithm choices
@@ -51,7 +65,9 @@ Reply with ONLY a fenced JSON block matching this schema, and no other prose:
       "constraints": "...",
       "deps": [],
       "agent": null,
-      "model": null
+      "model": null,
+      "riskLevel": "medium",
+      "reviewHint": "optional"
     }
   ]
 }
@@ -73,10 +89,21 @@ export function formatAgentChoices(agents: AgentChoice[] | undefined): string {
 export function buildDecompositionPrompt(
   description: string,
   agents?: AgentChoice[],
+  compete = false,
 ): string {
   const agentsBlock = formatAgentChoices(agents);
   const tail = agentsBlock ? `\n\n${agentsBlock}` : "";
-  return `${DECOMPOSITION_SYSTEM}${tail}\n\nProject to decompose:\n${description}`;
+  const competeBlock = compete
+    ? `
+
+Competition pattern (use when appropriate):
+  When the project has a clear integration point where multiple independent implementations would be valuable, emit a competition:
+    - N sibling work tasks (T1..TN) that each implement the same interface/endpoint independently (same deps, no deps between them).
+    - A review task of kind "review" with reviews set to the array of those sibling ids, title like "Review and pick winner for [feature]". The review picks one implementation as winner; others are superseded.
+  Competition tasks must include all standard fields (id, title, why, what, constraints, deps, riskLevel, reviewHint). The review task's reviews field is a JSON array of strings: ["T1", "T2", ...].
+  Only use competitions when there is a genuine integration point worth evaluating multiple approaches — not for every feature.`
+    : "";
+  return `${DECOMPOSITION_SYSTEM}${tail}${competeBlock}\n\nProject to decompose:\n${description}`;
 }
 
 // Variant of buildDecompositionPrompt used by `/hydra planner execute`:
@@ -87,11 +114,22 @@ export function buildDecompositionPrompt(
 // field is filled in from that summary after parsing.
 export function buildExecuteDecompositionPrompt(
   agents?: AgentChoice[],
+  compete = false,
 ): string {
   const agentsBlock = formatAgentChoices(agents);
   const tail = agentsBlock ? `\n\n${agentsBlock}` : "";
+  const competeBlock = compete
+    ? `
+
+Competition pattern (use when appropriate):
+  When the project has a clear integration point where multiple independent implementations would be valuable, emit a competition:
+    - N sibling work tasks (T1..TN) that each implement the same interface/endpoint independently (same deps, no deps between them).
+    - A review task of kind "review" with reviews set to the array of those sibling ids, title like "Review and pick winner for [feature]". The review picks one implementation as winner; others are superseded.
+  Competition tasks must include all standard fields (id, title, why, what, constraints, deps, riskLevel, reviewHint). The review task's reviews field is a JSON array of strings: ["T1", "T2", ...].
+  Only use competitions when there is a genuine integration point worth evaluating multiple approaches — not for every feature.`
+    : "";
   return [
-    `${DECOMPOSITION_SYSTEM}${tail}`,
+    `${DECOMPOSITION_SYSTEM}${tail}${competeBlock}`,
     ``,
     `You and the user have been discussing a software project in this conversation. Decompose THAT project — what you have been planning together — into the task DAG.`,
     ``,
@@ -101,7 +139,7 @@ export function buildExecuteDecompositionPrompt(
     `{`,
     `  "description": "...",`,
     `  "tasks": [`,
-    `    { "id": "T1", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null }`,
+    `    { "id": "T1", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null, "riskLevel": "medium", "reviewHint": "optional" }`,
     `  ]`,
     `}`,
     "```",
@@ -114,7 +152,15 @@ export function buildExecuteDecompositionPrompt(
 // transcript as takeover; this prompt tells the agent to either
 // re-emit the decomposition it already produced (if it had finished)
 // or continue from where it left off.
-export function buildResumeDecompositionPrompt(description: string): string {
+export function buildResumeDecompositionPrompt(
+  description: string,
+  compete = false,
+): string {
+  const competeBlock = compete
+    ? `
+
+You were asked to use the competition pattern (--compete flag was set). If you had already described competition tasks, re-emit them verbatim. Otherwise, do NOT invent new competition tasks now — only continue or re-emit what was already planned.`
+    : "";
   return [
     `[hydra-acp-planner: resuming decomposition after restart]`,
     ``,
@@ -123,11 +169,12 @@ export function buildResumeDecompositionPrompt(description: string): string {
     `  ${description}`,
     ``,
     `If you already emitted a JSON task DAG, re-emit it verbatim now (don't redo the planning). Otherwise, continue from where you left off.`,
+    competeBlock,
     ``,
     `Reply with ONLY a fenced \`\`\`json block matching the schema:`,
     ``,
     "```json",
-    `{ "tasks": [{ "id": "T1", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [] }] }`,
+    `{ "tasks": [{ "id": "T1", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null, "riskLevel": "medium", "reviewHint": "optional" }] }`,
     "```",
   ].join("\n");
 }
@@ -190,14 +237,15 @@ export function buildAddTaskPrompt(
     `  2. Where does it fit in the dependency graph? (\`deps\` may reference existing task ids: ${existingIds || "(none)"}.)`,
     `  3. What id(s) to use? Continue the existing T-numbering — next free id is T${nextN}.`,
     `  4. Does any task warrant a specialist \`agent\` or a non-default \`model\`? Omit (or null) for the defaults.`,
+   `  5. Assign riskLevel ("low"|"medium"|"high") and reviewHint ("skip"|"optional"|"recommended"|"required") using the same rubric as the decomposition prompt.`,
     ``,
-    `Reply with ONLY a fenced JSON block — same task schema as the original decomposition (id, title, why, what, constraints, deps, optional agent). Do NOT modify any existing task. Do NOT specify implementation mechanism (libraries, algorithms, file structure). Keep the WHAT/WHY/CONSTRAINTS discipline.`,
+    `Reply with ONLY a fenced JSON block — same task schema as the original decomposition (id, title, why, what, constraints, deps, optional agent/model, riskLevel, reviewHint). Do NOT modify any existing task. Do NOT specify implementation mechanism (libraries, algorithms, file structure). Keep the WHAT/WHY/CONSTRAINTS discipline.`,
     ...(agentsBlock ? ["", agentsBlock] : []),
     ``,
     "```hydra-add-task",
     `{`,
     `  "tasks": [`,
-    `    { "id": "T${nextN}", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null }`,
+    `    { "id": "T${nextN}", "title": "...", "why": "...", "what": "...", "constraints": "...", "deps": [], "agent": null, "model": null, "riskLevel": "medium", "reviewHint": "optional" }`,
     `  ]`,
     `}`,
     "```",
@@ -295,6 +343,8 @@ export function normalizeAddedTasks(
       deps,
       agent: typeof t.agent === "string" ? t.agent : null,
       model: typeof t.model === "string" ? t.model : null,
+      riskLevel: validateRiskLevel(t.riskLevel),
+      reviewHint: validateReviewHint(t.reviewHint),
       status: "pending",
       assignedTo: null,
       attemptCount: 0,
@@ -316,6 +366,19 @@ export function normalizeAddedTasks(
 
   if (tasks.length === 0) return undefined;
   return { tasks, warnings };
+}
+
+const VALID_RISK_LEVELS = new Set(["low", "medium", "high"]);
+const VALID_REVIEW_HINTS = new Set(["skip", "optional", "recommended", "required"]);
+
+function validateRiskLevel(v: unknown): "low" | "medium" | "high" {
+  if (typeof v === "string" && VALID_RISK_LEVELS.has(v)) return v as "low" | "medium" | "high";
+  return "medium";
+}
+
+function validateReviewHint(v: unknown): "skip" | "optional" | "recommended" | "required" {
+  if (typeof v === "string" && VALID_REVIEW_HINTS.has(v)) return v as "skip" | "optional" | "recommended" | "required";
+  return "optional";
 }
 
 // Validate and normalize the parsed JSON into Task records. The agent
@@ -359,6 +422,8 @@ export function normalizeDecomposition(raw: unknown): DecompositionResult | unde
       deps,
       agent: typeof t.agent === "string" ? t.agent : null,
       model: typeof t.model === "string" ? t.model : null,
+      riskLevel: validateRiskLevel(t.riskLevel),
+      reviewHint: validateReviewHint(t.reviewHint),
       status: "pending",
       assignedTo: null,
       attemptCount: 0,

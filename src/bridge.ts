@@ -80,6 +80,9 @@ import {
   newBoard,
   nowIso,
   pickEligible,
+  resolveAgent,
+  resolveModel,
+  resolveRunOn,
   saveBoard,
   shortProjectId,
   shortSessionId,
@@ -101,6 +104,7 @@ import {
   normalizeDecomposition,
   sweepLineConcurrencyCap,
 } from "./decomposition.js";
+import type { NormalizedResult } from "./task.js";
 import { promptsFor } from "./task.js";
 import {
   clearOrchestratorState,
@@ -113,6 +117,7 @@ import {
   setWorkerState,
   unregisterWorker,
 } from "./state.js";
+import { type ReviewPolicy, applyReviewPolicy, resolveReviewPolicy } from "./review-policy.js";
 
 const log = logger("planner");
 
@@ -524,12 +529,15 @@ export class PlannerBridge {
       // a slash command; the polling loop below detects that and
       // activates the board (attach + wake workers + resume).
       setOrchestratorState(orchestratorId, {
-        projectId: board.projectId,
-        decompositionAccumulator: "",
-        awaitingDecomposition: board.state === "decomposing",
-        addAccumulator: "",
-        awaitingAdd: false,
-      });
+         projectId: board.projectId,
+         decompositionAccumulator: "",
+         awaitingDecomposition: board.state === "decomposing",
+         addAccumulator: "",
+         awaitingAdd: false,
+         awaitingOrchestratorReview: false,
+         orchestratorReviewTaskId: null,
+         orchestratorReviewAccumulator: "",
+       });
 
       for (const task of board.tasks) {
         if (task.status !== "assigned" || !task.assignedTo) continue;
@@ -550,6 +558,20 @@ export class PlannerBridge {
             emit: this.makeWorkerEmit(workerId),
           }),
         );
+      }
+
+      // Rehydrate in-flight orchestrator-lane reviews: reset them to
+      // pending so the scheduler can reschedule them. The previous
+      // process crashed mid-review; the host session is free again.
+      for (const task of board.tasks) {
+        if (task.kind === "review" && task.status === "assigned" && task.assignedTo === "orchestrator") {
+          task.status = "pending";
+          task.assignedTo = null;
+          task.startedAt = null;
+          log.info(
+            `rehydrated: reset orchestrator review ${task.id} to pending`,
+          );
+        }
       }
 
       pendingActivation.add(orchestratorId);
@@ -975,6 +997,9 @@ export class PlannerBridge {
         awaitingDecomposition: false,
         addAccumulator: "",
         awaitingAdd: false,
+        awaitingOrchestratorReview: false,
+        orchestratorReviewTaskId: null,
+        orchestratorReviewAccumulator: "",
       };
       setOrchestratorState(orchestratorSessionId, state);
     }
@@ -1031,6 +1056,14 @@ export class PlannerBridge {
     // scheduling so an immediate restart picks up the new tasks.
     board.tasks.push(...result.tasks);
     board.concurrencyCap = sweepLineConcurrencyCap(board.tasks);
+    // Synthesize review tasks for the newly added tasks.
+    // Only applies when reviewPolicy is explicitly set on the board.
+    if (board.reviewPolicy) {
+      const updatedBoard = applyReviewPolicy(board, resolveReviewPolicy(board.reviewPolicy));
+      if (updatedBoard !== board) {
+        board.tasks = updatedBoard.tasks;
+      }
+    }
     saveBoard(board, orchestratorSessionId);
     boards.set(orchestratorSessionId, board);
 
@@ -1609,14 +1642,23 @@ export class PlannerBridge {
     }
 
     // Parse leading fleet-override flags off the description string.
-    // Recognized: --workers N, --agent <id>, --model <id>. Unknown flags
-    // are left in the description — the user probably meant them as
+    // Recognized: --workers N, --agent <id>, --model <id>, --review-policy <mode>,
+    // --work-agent <id>, --work-model <id>, --review-agent <id>, --review-model <id>.
+    // Unknown flags are left in the description — the user probably meant them as
     // prose; the orchestrator agent will see them.
     let descRemaining = description;
     let fleetWorkers: number | undefined;
     let fleetAgent: string | null = null;
     let fleetModel: string | null = null;
-    const flagRe = /^--(workers|agent|model)\s+(\S+)\s*/;
+    let workAgent: string | undefined;
+    let workModel: string | undefined;
+    let reviewAgent: string | undefined;
+    let reviewModel: string | undefined;
+    let reviewRunOn: "orchestrator" | "worker" | undefined;
+    let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
+    let overrideHint: boolean | undefined;
+    let compete = false;
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete)\s+(\S+)\s*/;
     while (true) {
       const m = descRemaining.match(flagRe);
       if (!m) break;
@@ -1628,12 +1670,33 @@ export class PlannerBridge {
         fleetAgent = value;
       } else if (key === "model") {
         fleetModel = value;
+      } else if (key === "review-policy") {
+        const validModes = ["off", "hints", "all", "high-only"];
+        if (validModes.includes(value)) {
+          reviewPolicyMode = value as "off" | "hints" | "all" | "high-only";
+        }
+      } else if (key === "work-agent") {
+        workAgent = value;
+      } else if (key === "work-model") {
+        workModel = value;
+      } else if (key === "review-agent") {
+        reviewAgent = value;
+      } else if (key === "review-model") {
+        reviewModel = value;
+      } else if (key === "review-run-on") {
+        if (value === "worker" || value === "orchestrator") {
+          reviewRunOn = value as "orchestrator" | "worker";
+        }
+      } else if (key === "override-hint") {
+        overrideHint = value === "true";
+      } else if (key === "compete") {
+        compete = value === "true";
       }
       descRemaining = descRemaining.slice(m[0].length);
     }
     if (!descRemaining) {
       this.client.reply(reqId, {
-        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] <description>`",
+        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] <description>`",
       });
       return;
     }
@@ -1644,12 +1707,51 @@ export class PlannerBridge {
         log.warn(`--agent "${fleetAgent}" not in installed agent list; workers will spawn with default unless a per-task agent is set`);
       }
     }
+    if (workAgent) {
+      const choices = await this.ensureAgentChoices();
+      const known = (choices ?? []).some((a) => a.id === workAgent);
+      if (!known) {
+        log.warn(`--work-agent "${workAgent}" not in installed agent list; workers will spawn with default unless a per-task agent is set`);
+      }
+    }
+    if (reviewAgent) {
+      const choices = await this.ensureAgentChoices();
+      const known = (choices ?? []).some((a) => a.id === reviewAgent);
+      if (!known) {
+        log.warn(`--review-agent "${reviewAgent}" not in installed agent list; reviews will spawn with default unless a per-task agent is set`);
+      }
+    }
+
+    const boardFleetDefaults: import("./board.js").FleetDefaults = {
+      agent: fleetAgent,
+      model: fleetModel,
+    };
+    if (workAgent !== undefined || workModel !== undefined) {
+      boardFleetDefaults.work = {};
+      if (workAgent !== undefined) boardFleetDefaults.work.agent = workAgent;
+      if (workModel !== undefined) boardFleetDefaults.work.model = workModel;
+    }
+    if (reviewAgent !== undefined || reviewModel !== undefined || reviewRunOn !== undefined) {
+      boardFleetDefaults.review = {};
+      if (reviewAgent !== undefined) boardFleetDefaults.review.agent = reviewAgent;
+      if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
+      if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
+    }
 
     const board = newBoard({
       description: descRemaining,
       concurrencyCap: fleetWorkers,
-      fleetDefaults: { agent: fleetAgent, model: fleetModel },
+      fleetDefaults: boardFleetDefaults,
     });
+    if (reviewPolicyMode || overrideHint !== undefined) {
+      board.reviewPolicy = {
+        mode: reviewPolicyMode ?? "hints",
+        overrideHint: overrideHint ?? false,
+      };
+    }
+    if (compete) {
+      board.compete = true;
+    }
     // create's intent: form the plan, show it, stop. No kickoff —
     // user must run `/hydra planner execute` to start working.
     board.pendingExecute = false;
@@ -1661,13 +1763,20 @@ export class PlannerBridge {
       addAccumulator: "",
       awaitingAdd: false,
       awaitingDecomposition: true,
+      awaitingOrchestratorReview: false,
+      orchestratorReviewTaskId: null,
+      orchestratorReviewAccumulator: "",
     });
 
     log.info(
       `decomposing (plan-only) project ${board.projectId} for session …${sessionId.slice(-8)}: ${descRemaining.slice(0, 80)}` +
         (fleetWorkers ? ` [workers=${fleetWorkers}]` : "") +
         (fleetAgent ? ` [agent=${fleetAgent}]` : "") +
-        (fleetModel ? ` [model=${fleetModel}]` : ""),
+        (fleetModel ? ` [model=${fleetModel}]` : "") +
+        (workAgent ? ` [work-agent=${workAgent}]` : "") +
+        (workModel ? ` [work-model=${workModel}]` : "") +
+        (reviewAgent ? ` [review-agent=${reviewAgent}]` : "") +
+        (reviewModel ? ` [review-model=${reviewModel}]` : ""),
     );
     if (replacedReadyId) {
       // Make the replacement visible in the transcript so the user
@@ -1737,7 +1846,7 @@ export class PlannerBridge {
         method: "session/prompt",
         envelope: buildTextPromptEnvelope({
           sessionId,
-          text: buildDecompositionPrompt(descRemaining, await this.ensureAgentChoices()),
+          text: buildDecompositionPrompt(descRemaining, await this.ensureAgentChoices(), compete),
         }),
         route: "chain",
       });
@@ -1920,7 +2029,15 @@ export class PlannerBridge {
     let fleetWorkers: number | undefined;
     let fleetAgent: string | null = null;
     let fleetModel: string | null = null;
-    const flagRe = /^--(workers|agent|model)\s+(\S+)\s*/;
+    let workAgent: string | undefined;
+    let workModel: string | undefined;
+    let reviewAgent: string | undefined;
+    let reviewModel: string | undefined;
+    let reviewRunOn: "orchestrator" | "worker" | undefined;
+    let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
+    let overrideHint: boolean | undefined;
+    let compete = false;
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete)\s+(\S+)\s*/;
     while (true) {
       const m = argsRemaining.match(flagRe);
       if (!m) break;
@@ -1932,12 +2049,33 @@ export class PlannerBridge {
         fleetAgent = value;
       } else if (key === "model") {
         fleetModel = value;
+      } else if (key === "review-policy") {
+        const validModes = ["off", "hints", "all", "high-only"];
+        if (validModes.includes(value)) {
+          reviewPolicyMode = value as "off" | "hints" | "all" | "high-only";
+        }
+      } else if (key === "work-agent") {
+        workAgent = value;
+      } else if (key === "work-model") {
+        workModel = value;
+      } else if (key === "review-agent") {
+        reviewAgent = value;
+      } else if (key === "review-model") {
+        reviewModel = value;
+      } else if (key === "review-run-on") {
+        if (value === "worker" || value === "orchestrator") {
+          reviewRunOn = value as "orchestrator" | "worker";
+        }
+      } else if (key === "override-hint") {
+        overrideHint = value === "true";
+      } else if (key === "compete") {
+        compete = value === "true";
       }
       argsRemaining = argsRemaining.slice(m[0].length);
     }
     if (argsRemaining.trim().length > 0) {
       this.client.reply(reqId, {
-        text: `planner execute: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner execute [--workers N] [--agent ID] [--model ID]\` (no description — uses the conversation).`,
+        text: `planner execute: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner execute [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker]\` (no description — uses the conversation).`,
       });
       return;
     }
@@ -1948,12 +2086,51 @@ export class PlannerBridge {
         log.warn(`--agent "${fleetAgent}" not in installed agent list; workers will spawn with default unless a per-task agent is set`);
       }
     }
+    if (workAgent) {
+      const choices = await this.ensureAgentChoices();
+      const known = (choices ?? []).some((a) => a.id === workAgent);
+      if (!known) {
+        log.warn(`--work-agent "${workAgent}" not in installed agent list; workers will spawn with default unless a per-task agent is set`);
+      }
+    }
+    if (reviewAgent) {
+      const choices = await this.ensureAgentChoices();
+      const known = (choices ?? []).some((a) => a.id === reviewAgent);
+      if (!known) {
+        log.warn(`--review-agent "${reviewAgent}" not in installed agent list; reviews will spawn with default unless a per-task agent is set`);
+      }
+    }
+
+    const boardFleetDefaults: import("./board.js").FleetDefaults = {
+      agent: fleetAgent,
+      model: fleetModel,
+    };
+    if (workAgent !== undefined || workModel !== undefined) {
+      boardFleetDefaults.work = {};
+      if (workAgent !== undefined) boardFleetDefaults.work.agent = workAgent;
+      if (workModel !== undefined) boardFleetDefaults.work.model = workModel;
+    }
+    if (reviewAgent !== undefined || reviewModel !== undefined || reviewRunOn !== undefined) {
+      boardFleetDefaults.review = {};
+      if (reviewAgent !== undefined) boardFleetDefaults.review.agent = reviewAgent;
+      if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
+      if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
+    }
 
     const board = newBoard({
       description: "(from conversation)",
       concurrencyCap: fleetWorkers,
-      fleetDefaults: { agent: fleetAgent, model: fleetModel },
+      fleetDefaults: boardFleetDefaults,
     });
+    if (reviewPolicyMode || overrideHint !== undefined) {
+      board.reviewPolicy = {
+        mode: reviewPolicyMode ?? "hints",
+        overrideHint: overrideHint ?? false,
+      };
+    }
+    if (compete) {
+      board.compete = true;
+    }
     // execute's intent: decompose + kick off in one step. The flag
     // tells finishDecomposition to transition state to running and
     // schedule workers when the agent's decomposition comes back.
@@ -1966,13 +2143,20 @@ export class PlannerBridge {
       addAccumulator: "",
       awaitingAdd: false,
       awaitingDecomposition: true,
+      awaitingOrchestratorReview: false,
+      orchestratorReviewTaskId: null,
+      orchestratorReviewAccumulator: "",
     });
 
     log.info(
       `decomposing + executing project ${board.projectId} for session …${sessionId.slice(-8)} (from conversation)` +
         (fleetWorkers ? ` [workers=${fleetWorkers}]` : "") +
         (fleetAgent ? ` [agent=${fleetAgent}]` : "") +
-        (fleetModel ? ` [model=${fleetModel}]` : ""),
+        (fleetModel ? ` [model=${fleetModel}]` : "") +
+        (workAgent ? ` [work-agent=${workAgent}]` : "") +
+        (workModel ? ` [work-model=${workModel}]` : "") +
+        (reviewAgent ? ` [review-agent=${reviewAgent}]` : "") +
+        (reviewModel ? ` [review-model=${reviewModel}]` : ""),
     );
 
     // TUI's "⚙ thinking…" placeholder fills the decomposition gap
@@ -2008,7 +2192,7 @@ export class PlannerBridge {
         method: "session/prompt",
         envelope: buildTextPromptEnvelope({
           sessionId,
-          text: buildExecuteDecompositionPrompt(await this.ensureAgentChoices()),
+          text: buildExecuteDecompositionPrompt(await this.ensureAgentChoices(), compete),
         }),
         route: "chain",
       });
@@ -2237,6 +2421,12 @@ export class PlannerBridge {
       this.client.reply(reqId, { action: "continue" });
       return;
     }
+    // Don't inject board context while an orchestrator-lane review is in
+    // flight — the host session is busy with the review turn.
+    if (orchState?.awaitingOrchestratorReview) {
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
 
     const params = (envelope as { params?: unknown })?.params ?? envelope;
     const originalPrompt = (params as { prompt?: unknown })?.prompt;
@@ -2360,6 +2550,26 @@ export class PlannerBridge {
         this.client.reply(reqId, { action: "stop" });
         return;
       }
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
+
+    // Orchestrator-lane review: suppress + accumulate agent_message_chunk
+    // text while an orchestrator review is in flight. The emit promise
+    // (awaited in runReviewOnOrchestrator) marks turn completion; at that
+    // point the accumulated text is parsed as a review result.
+    if (orchState && orchState.awaitingOrchestratorReview) {
+      const kind = updateKind(envelope);
+      if (kind === "agent_message_chunk") {
+        const text = extractUpdateText(envelope);
+        if (text.length > 0) {
+          orchState.orchestratorReviewAccumulator += text;
+        }
+        this.client.reply(reqId, { action: "stop" });
+        return;
+      }
+      // Non-chunk notifications during a review still pass through so
+      // that metadata (usage, model) is captured on the board.
       this.client.reply(reqId, { action: "continue" });
       return;
     }
@@ -2568,6 +2778,16 @@ export class PlannerBridge {
     if (!board.concurrencyCapLocked) {
       board.concurrencyCap = sweepLineConcurrencyCap(result.tasks);
     }
+    // Synthesize review tasks according to the board's review policy.
+    // Only applies when reviewPolicy is explicitly set on the board —
+    // undefined means "don't synthesize" (preserves backward compatibility
+    // with boards that never had a reviewPolicy configured).
+    if (board.reviewPolicy) {
+      const updatedBoard = applyReviewPolicy(board, resolveReviewPolicy(board.reviewPolicy));
+      if (updatedBoard !== board) {
+        board.tasks = updatedBoard.tasks;
+      }
+    }
     // execute seeds the board with a placeholder description and asks
     // the agent to summarize the conversation-driven project in its
     // response (or sets a real description from the tool input). When
@@ -2682,6 +2902,26 @@ export class PlannerBridge {
       // so if the board ever blocks again later (a future failure
       // strands new dependents), the user gets a fresh notification.
       this.blockedNotifiedFor.delete(board.projectId);
+
+// Phase 4a: orchestrator-lane review tasks. Default runOn for
+        // review tasks is "orchestrator"; "worker" is explicit opt-in.
+        // Orchestrator reviews don't count against concurrencyCap and
+        // are single-flight (only one at a time on the host session).
+        if (task.kind === "review") {
+          const runOn = resolveRunOn(task, board.fleetDefaults);
+        if (runOn === "orchestrator") {
+          const orchState = getOrchestratorState(orchestratorSessionId);
+          if (orchState?.awaitingOrchestratorReview) {
+            // Single-flight: a review is already in progress. Leave
+            // this task pending and let the scheduler retry after
+            // the current review completes.
+            continue;
+          }
+          await this.runReviewOnOrchestrator(task, board, orchestratorSessionId);
+          continue;
+        }
+      }
+
       // Spawn synchronously enough to claim the task before the
       // next loop iteration sees it. The actual emit + run is
       // fire-and-forget; on completion it calls back into
@@ -2716,12 +2956,11 @@ export class PlannerBridge {
     board: Board,
     task: Task,
   ): Promise<void> {
-    // Pick the effective agent: per-task override beats fleet default
-    // beats daemon default. Validate against the cached choice list;
-    // unknown ids fall back to the daemon's default with a warning.
+    // Resolve effective agent using the centralized chain: per-task
+    // override → kind-specific fleet default → fleet default → null.
     // Declared at function scope so it remains in scope after the spawn
     // try-block, where it's recorded on board.workers below.
-    const effectiveAgent = task.agent ?? board.fleetDefaults?.agent ?? null;
+    const effectiveAgent = resolveAgent(task, board.fleetDefaults);
     // Make sure the installed-agent list is populated before we validate
     // against it. Without this, a fresh transformer process (e.g. after
     // a restart) has an empty cache and every per-task / fleet-default
@@ -2814,7 +3053,7 @@ export class PlannerBridge {
     // session/set_model on the live session. Fire-and-forget: if the
     // worker's agent doesn't accept the model, log a warning and let
     // the task run on the agent's default model.
-    const effectiveModel = task.model ?? board.fleetDefaults?.model ?? null;
+    const effectiveModel = resolveModel(task, board.fleetDefaults);
     if (effectiveModel) {
       this.client
         .request("session/set_model", {
@@ -2991,7 +3230,7 @@ export class PlannerBridge {
           method: "session/prompt",
           envelope: buildTextPromptEnvelope({
             sessionId: orchestratorSessionId,
-            text: buildResumeDecompositionPrompt(board.description),
+            text: buildResumeDecompositionPrompt(board.description, board.compete),
           }),
           route: "chain",
         });
@@ -3151,6 +3390,61 @@ export class PlannerBridge {
       return;
     }
 
+    const taskKind = task.kind ?? 'work';
+
+    if (taskKind === 'review') {
+      // Review tasks are handled by handleReviewComplete, which
+      // processes the reviewer's decision and updates the reviewed
+      // task accordingly.
+      this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
+      this.handleReviewComplete(task, board, orchestratorSessionId, result);
+      void this.scheduleEligibleTasks(orchestratorSessionId, board);
+      return;
+    }
+
+    // For work tasks: check if any pending review task references
+    // this completed work. If so, transition the work task to
+    // awaiting_review (not done) so its review can run next.
+    const reviewTask = this.findReviewedTask(task.id, board);
+    if (reviewTask) {
+      // Park the work task in awaiting_review; don't mark it done yet.
+      // The review task stays pending so the scheduler picks it up.
+      task.status = "awaiting_review";
+      task.finishedAt = nowIso();
+      task.artifacts = result.artifacts;
+      task.assignedTo = null;
+      const workerEntry = board.workers[workerSessionId];
+      if (workerEntry) {
+        workerEntry.currentTaskId = null;
+        workerEntry.tasksCompleted.push(task.id);
+      }
+      saveBoard(board, orchestratorSessionId);
+
+      log.info(
+        `completed ${task.id} on worker …${workerSessionId.slice(-8)} — awaiting review (${reviewTask.id})`,
+      );
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        result.artifacts.summary ?? task.title,
+        { event: "task-completed", taskId: task.id },
+      );
+
+      const hasContinue = this.hasContinueStrategyReview(task.id, board);
+      if (!hasContinue) {
+        this.endWorkerForward(workerSessionId, { flush: true });
+        clearWorkerState(workerSessionId);
+        unregisterWorker(workerSessionId);
+        void this.closeWorker(workerSessionId);
+      }
+
+      // Try to refill the freed slot — the review task should now
+      // be eligible since its dependency (this work task) is in
+      // awaiting_review (non-terminal but satisfied for deps).
+      void this.scheduleEligibleTasks(orchestratorSessionId, board);
+      return;
+    }
+
     this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
 
     // Try to refill the freed slot. Completing this task may have also
@@ -3178,8 +3472,9 @@ export class PlannerBridge {
     }
     saveBoard(board, orchestratorSessionId);
 
+    const isOrchestratorLane = workerSessionId === "orchestrator";
     log.info(
-      `completed ${task.id} on worker …${workerSessionId.slice(-8)} — ${artifacts.summary}`,
+      `completed ${task.id}${isOrchestratorLane ? " (orchestrator)" : ` on worker …${workerSessionId.slice(-8)}`} — ${artifacts.summary}`,
     );
     this.emitPlanUpdate(orchestratorSessionId, board);
     void this.emitSyntheticMessage(
@@ -3188,10 +3483,536 @@ export class PlannerBridge {
       { event: "task-completed", taskId: task.id },
     );
 
-    this.endWorkerForward(workerSessionId, { flush: true });
-    clearWorkerState(workerSessionId);
-    unregisterWorker(workerSessionId);
-    void this.closeWorker(workerSessionId);
+    if (!isOrchestratorLane) {
+      this.endWorkerForward(workerSessionId, { flush: true });
+      clearWorkerState(workerSessionId);
+      unregisterWorker(workerSessionId);
+      void this.closeWorker(workerSessionId);
+    }
+  }
+
+  // Check whether any pending review task for the given work taskId has
+  // onReject.strategy === 'continue'. Used to decide whether to keep the
+  // worker session alive when the work task enters awaiting_review.
+  private hasContinueStrategyReview(taskId: string, board: Board): boolean {
+    for (const review of board.tasks) {
+      if (review.status !== "pending") continue;
+      if (review.kind !== "review") continue;
+      const reviews = review.reviews;
+      if (!reviews) continue;
+      if (typeof reviews === "string") {
+        if (reviews !== taskId) continue;
+      } else {
+        if (!reviews.includes(taskId)) continue;
+      }
+      if (review.onReject?.strategy === "continue") return true;
+    }
+    return false;
+  }
+
+  // Find a task that is under review by looking for pending review tasks
+  // whose `reviews` field references the given taskId. Returns undefined
+  // if no such review task exists.
+  private findReviewedTask(taskId: string, board: Board): Task | undefined {
+    const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+    for (const review of board.tasks) {
+      if (review.status !== "pending") continue;
+      if (review.kind !== "review") continue;
+      const reviews = review.reviews;
+      if (!reviews) continue;
+      if (typeof reviews === "string") {
+        if (reviews === taskId) return review;
+      } else {
+        if (reviews.includes(taskId)) return review;
+      }
+    }
+    return undefined;
+  }
+
+  // Process the outcome of a review task and update the reviewed task(s).
+  // `normalized` is the parsed review result from the worker's reply; it
+  // carries `review_decision` and `notes` in artifacts. We pass it in
+  // explicitly so callers don't have to round-trip through task.artifacts
+  // (which has the normalized shape and can't be re-parsed by normalizeReview).
+  private handleReviewComplete(
+    reviewTask: Task,
+    board: Board,
+    orchestratorSessionId: string,
+    normalized: NormalizedResult | undefined,
+  ): void {
+    const reviews = reviewTask.reviews;
+    if (!reviews) return;
+
+    if (!normalized) {
+      log.warn(
+        `review ${reviewTask.id}: missing or malformed review result, treating as reject`,
+      );
+      this.handleReviewReject(reviewTask, board, orchestratorSessionId, "missing review result");
+      return;
+    }
+
+    const decision = (normalized.artifacts as Record<string, unknown>).review_decision as string;
+    const notes = (normalized.artifacts as Record<string, unknown>).notes as string ?? "";
+    const isCompetition = Array.isArray(reviews) && reviews.length > 1;
+
+    // Competition reviews only accept "winner" or "synthesize" (which we
+    // treat as winner with no valid winnerId — fails all reviewees). Other
+    // decisions on a competition are reviewer error.
+    if (isCompetition && decision !== "winner" && decision !== "synthesize") {
+      log.warn(
+        `review ${reviewTask.id}: competition received non-winner decision '${decision}', treating as winner with no valid winnerId`,
+      );
+      this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
+      return;
+    }
+
+    switch (decision) {
+      case "approve":
+        this.handleReviewApprove(reviewTask, normalized, board, orchestratorSessionId);
+        break;
+      case "reject":
+        this.handleReviewReject(reviewTask, board, orchestratorSessionId, notes);
+        break;
+      case "amend":
+        this.handleReviewAmend(reviewTask, normalized, notes, board, orchestratorSessionId);
+        break;
+      case "fix":
+        this.handleReviewFix(reviewTask, normalized, notes, board, orchestratorSessionId);
+        break;
+      case "winner":
+      case "synthesize":
+        this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
+        break;
+      default:
+        log.warn(
+          `review ${reviewTask.id}: unrecognized decision '${decision}', treating as reject`,
+        );
+        this.handleReviewReject(reviewTask, board, orchestratorSessionId, `unrecognized decision: ${decision}`);
+        break;
+    }
+  }
+
+  // Approve: mark the reviewed task done with merged artifacts.
+  private handleReviewApprove(
+    reviewTask: Task,
+    normalized: NormalizedResult,
+    board: Board,
+    orchestratorSessionId: string,
+  ): void {
+    const reviewedTask = this.getReviewedTask(reviewTask, board);
+    if (!reviewedTask) return;
+
+    // Merge review notes into the reviewed task's artifacts.
+    const mergedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
+    const reviewNotes = (normalized.artifacts as Record<string, unknown>).notes as string;
+    if (reviewNotes) {
+      if (!mergedArtifacts.decisions) mergedArtifacts.decisions = [];
+      mergedArtifacts.decisions.push(`[review] ${reviewNotes}`);
+    }
+
+    reviewedTask.status = "done";
+    reviewedTask.finishedAt = nowIso();
+    reviewedTask.artifacts = mergedArtifacts;
+    reviewedTask.assignedTo = null;
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(
+      `review ${reviewTask.id}: approved ${reviewedTask.id}`,
+    );
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${reviewTask.id} approved ${reviewedTask.id}`,
+      { event: "task-review-approved", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
+    );
+  }
+
+  // Reject: retask the reviewed task with reviewFeedback. On maxAttempts
+  // exceed, mark the reviewed task as failed.
+  private handleReviewReject(
+    reviewTask: Task,
+    board: Board,
+    orchestratorSessionId: string,
+    feedback: string,
+  ): void {
+    const reviewedTask = this.getReviewedTask(reviewTask, board);
+    if (!reviewedTask) return;
+
+    // Check maxAttempts (default 3).
+    const maxAttempts = reviewTask.onReject?.maxAttempts ?? 3;
+    const attemptCount = reviewedTask.attemptCount;
+
+    if (attemptCount >= maxAttempts) {
+      // Exceeded max attempts — fail the reviewed task with accumulated feedback.
+      reviewedTask.status = "failed";
+      reviewedTask.finishedAt = nowIso();
+      reviewedTask.reviewFeedback = reviewTask.reviewFeedback ?? [];
+      if (!reviewedTask.reviewFeedback.includes(feedback)) {
+        reviewedTask.reviewFeedback.push(feedback);
+      }
+      reviewedTask.assignedTo = null;
+      reviewTask.status = "done";
+      reviewTask.finishedAt = nowIso();
+      reviewTask.assignedTo = null;
+
+      saveBoard(board, orchestratorSessionId);
+
+      log.warn(
+        `review ${reviewTask.id}: max attempts (${maxAttempts}) exceeded for ${reviewedTask.id} — marking failed`,
+      );
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `${reviewedTask.id} failed after ${maxAttempts} review attempts: ${feedback}`,
+        { event: "task-review-max-attempts", taskId: reviewedTask.id },
+      );
+      return;
+    }
+
+    // Apply onReject strategy before retasking.
+    const strategy = reviewTask.onReject?.strategy;
+    if (strategy === "escalate") {
+      const esc = reviewTask.onReject?.escalateTo;
+      if (!esc || !esc.agent || !esc.model) {
+        reviewedTask.status = "failed";
+        reviewedTask.finishedAt = nowIso();
+        reviewedTask.reviewFeedback = reviewTask.reviewFeedback ?? [];
+        if (!reviewedTask.reviewFeedback.includes(feedback)) {
+          reviewedTask.reviewFeedback.push(feedback);
+        }
+        const escMsg = !esc
+          ? "onReject.strategy='escalate' but onReject.escalateTo is missing"
+          : !esc.agent
+            ? "onReject.strategy='escalate' but onReject.escalateTo.agent is missing"
+            : "onReject.strategy='escalate' but onReject.escalateTo.model is missing";
+        reviewedTask.assignedTo = null;
+        reviewTask.status = "done";
+        reviewTask.finishedAt = nowIso();
+        reviewTask.assignedTo = null;
+
+        saveBoard(board, orchestratorSessionId);
+
+        log.error(
+          `review ${reviewTask.id}: escalation target missing for ${reviewedTask.id} — ${escMsg}`,
+        );
+        this.emitPlanUpdate(orchestratorSessionId, board);
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${reviewedTask.id} failed: escalation target unavailable (${escMsg})`,
+          { event: "task-review-escalation-failed", taskId: reviewedTask.id },
+        );
+        return;
+      }
+      reviewedTask.agent = esc.agent;
+      reviewedTask.model = esc.model;
+    }
+
+    // Continue strategy: keep the worker alive, send feedback as next
+    // prompt on the same session. Reset repromptCount and clear
+    // resultAccumulator so the worker starts fresh for the retry.
+    if (strategy === "continue") {
+      const workerId = reviewedTask.assignedTo;
+      if (workerId) {
+        reviewedTask.attemptCount += 1;
+        const ws = getWorkerState(workerId);
+        if (ws) {
+          ws.repromptCount = 0;
+          ws.resultAccumulator = "";
+        }
+        log.info(
+          `review ${reviewTask.id}: continue strategy for ${reviewedTask.id}, reprompting worker …${workerId.slice(-8)}`,
+        );
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${reviewTask.id} rejected ${reviewedTask.id} — asking same worker to retry (attempt #${reviewedTask.attemptCount})`,
+          { event: "task-review-rejected", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
+        );
+        void (async () => {
+          try {
+            await this.client.request("hydra-acp/message/emit", {
+              sessionId: workerId,
+              method: "session/prompt",
+              envelope: buildTextPromptEnvelope({
+                sessionId: workerId,
+                text: promptsFor(reviewedTask.kind ?? 'work').buildPrompt(reviewedTask, board),
+                ancillary: true,
+              }),
+              route: "chain",
+            });
+          } catch (err) {
+            log.error(
+              `continue reprompt for ${reviewedTask.id} on worker ${workerId} failed: ${(err as Error).message}`,
+            );
+          }
+        })();
+      } else {
+        reviewedTask.status = "pending";
+        reviewedTask.assignedTo = null;
+        reviewedTask.startedAt = null;
+        reviewedTask.finishedAt = null;
+        reviewedTask.artifacts = null;
+        saveBoard(board, orchestratorSessionId);
+        log.info(
+          `review ${reviewTask.id}: continue strategy for ${reviewedTask.id} but no worker assigned — retasking`,
+        );
+      }
+      return;
+    }
+
+    // Retask the reviewed task with reviewFeedback.
+    const workerId = reviewedTask.assignedTo;
+    if (reviewedTask.status === "assigned" && workerId) {
+      this.endWorkerForward(workerId);
+      clearWorkerState(workerId);
+      unregisterWorker(workerId);
+      delete board.workers[workerId];
+      void this.closeWorker(workerId);
+    }
+    reviewedTask.status = "pending";
+    reviewedTask.assignedTo = null;
+    reviewedTask.startedAt = null;
+    reviewedTask.finishedAt = null;
+    reviewedTask.artifacts = null;
+    reviewedTask.reviewFeedback = reviewTask.reviewFeedback ?? [];
+    if (!reviewedTask.reviewFeedback.includes(feedback)) {
+      reviewedTask.reviewFeedback.push(feedback);
+    }
+
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(
+      `review ${reviewTask.id}: rejected ${reviewedTask.id}, retasking (attemptCount=${reviewedTask.attemptCount + 1})`,
+    );
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${reviewTask.id} rejected ${reviewedTask.id}, retasking (attempt #${reviewedTask.attemptCount + 1})`,
+      { event: "task-review-rejected", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
+    );
+  }
+
+  // Amend: mark the reviewed task done with notes appended to artifacts.decisions.
+  private handleReviewAmend(
+    reviewTask: Task,
+    normalized: NormalizedResult,
+    notes: string,
+    board: Board,
+    orchestratorSessionId: string,
+  ): void {
+    const reviewedTask = this.getReviewedTask(reviewTask, board);
+    if (!reviewedTask) return;
+
+    reviewedTask.status = "done";
+    reviewedTask.finishedAt = nowIso();
+    reviewedTask.assignedTo = null;
+
+    // Append review notes to the reviewed task's artifacts.decisions.
+    const amendedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
+    if (notes) {
+      if (!amendedArtifacts.decisions) amendedArtifacts.decisions = [];
+      amendedArtifacts.decisions.push(`[review amend] ${notes}`);
+    }
+    reviewedTask.artifacts = amendedArtifacts;
+
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(
+      `review ${reviewTask.id}: amended ${reviewedTask.id}`,
+    );
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${reviewTask.id} amended ${reviewedTask.id}`,
+      { event: "task-review-amended", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
+    );
+  }
+
+  // Fix: reviewer applies corrections directly and marks the task done.
+  // Gated by canApplyFixes — if false (e.g. worker-lane review), treat as reject.
+  private handleReviewFix(
+    reviewTask: Task,
+    normalized: NormalizedResult,
+    notes: string,
+    board: Board,
+    orchestratorSessionId: string,
+  ): void {
+    const reviewedTask = this.getReviewedTask(reviewTask, board);
+    if (!reviewedTask) return;
+
+    // Gate: canApplyFixes defaults to true when runOn='orchestrator', false otherwise.
+    if (reviewTask.canApplyFixes === false) {
+      log.info(
+        `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=false), treating as reject`,
+      );
+      this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane (canApplyFixes=false)`);
+      return;
+    }
+
+    // Merge reviewer notes into the reviewed task's artifacts.decisions.
+    const mergedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
+    if (notes) {
+      if (!mergedArtifacts.decisions) mergedArtifacts.decisions = [];
+      mergedArtifacts.decisions.push(`[review fix] ${notes}`);
+    }
+
+    reviewedTask.status = "done";
+    reviewedTask.finishedAt = nowIso();
+    reviewedTask.artifacts = mergedArtifacts;
+    reviewedTask.assignedTo = null;
+
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(
+      `review ${reviewTask.id}: fixed ${reviewedTask.id}`,
+    );
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${reviewTask.id} fixed ${reviewedTask.id}`,
+      { event: "task-review-fixed", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
+    );
+  }
+
+  // Winner: competition mode — pick the winning task and supersede the rest.
+  private handleReviewWinner(
+    reviewTask: Task,
+    normalized: NormalizedResult,
+    notes: string,
+    board: Board,
+    orchestratorSessionId: string,
+  ): void {
+    const reviews = reviewTask.reviews;
+    if (!reviews) return;
+
+    const winnerId = (normalized.artifacts as Record<string, unknown>).winner as string | undefined;
+
+    // Single reviewee with winner decision — treat like approve.
+    if (typeof reviews === "string") {
+      this.handleReviewApprove(reviewTask, normalized, board, orchestratorSessionId);
+      return;
+    }
+
+    // Competition mode: reviews is string[] > 1.
+    const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+
+    if (winnerId && byId.has(winnerId)) {
+      const winnerTask = byId.get(winnerId)!;
+
+      // Merge review notes into the winner's artifacts.
+      const mergedArtifacts: TaskArtifacts = { ...winnerTask.artifacts };
+      if (notes) {
+        if (!mergedArtifacts.decisions) mergedArtifacts.decisions = [];
+        mergedArtifacts.decisions.push(`[review winner] ${notes}`);
+      }
+
+      winnerTask.status = "done";
+      winnerTask.finishedAt = nowIso();
+      winnerTask.artifacts = mergedArtifacts;
+      winnerTask.assignedTo = null;
+
+      log.info(
+        `review ${reviewTask.id}: competition — declared ${winnerId} the winner`,
+      );
+
+      // Supersede all other reviewees.
+      for (const id of reviews) {
+        if (id === winnerId) continue;
+        const other = byId.get(id);
+        if (!other) continue;
+        if (other.status === "done" || other.status === "superseded") continue;
+        other.status = "superseded";
+        other.finishedAt = nowIso();
+        other.assignedTo = null;
+        log.info(
+          `review ${reviewTask.id}: competition — superseded ${id} in favor of ${winnerId}`,
+        );
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${id} superseded by ${winnerId}`,
+          { event: "task-superseded", taskId: id },
+        );
+      }
+    } else {
+      // No valid winner ID — treat all reviewees as failed.
+      for (const id of reviews) {
+        const other = byId.get(id);
+        if (!other) continue;
+        if (other.status === "done" || other.status === "superseded") continue;
+        other.status = "failed";
+        other.finishedAt = nowIso();
+        other.reviewFeedback = other.reviewFeedback ?? [];
+        other.reviewFeedback.push(`competition review ${reviewTask.id}: no valid winner specified`);
+        other.assignedTo = null;
+        log.warn(
+          `review ${reviewTask.id}: competition — no valid winner; failed ${id}`,
+        );
+      }
+    }
+
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+
+    if (winnerId) {
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `${reviewTask.id} competition: ${winnerId} declared winner; other reviewees superseded`,
+        { event: "task-review-winner", taskId: reviewTask.id, reviewedTaskId: winnerId },
+      );
+    } else {
+      const ids = reviews.join(", ");
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `${reviewTask.id} competition: no valid winner — all reviewees (${ids}) failed`,
+        { event: "task-review-winner-no-valid", taskId: reviewTask.id },
+      );
+    }
+  }
+
+  // Resolve the task(s) that a review task is reviewing. For single
+   // reviewee (reviews is a string), returns that one task. For
+   // competition (reviews is string[]), returns the first pending/assigned
+   // entry or the first in the list.
+  private getReviewedTask(reviewTask: Task, board: Board): Task | undefined {
+    const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+    const reviews = reviewTask.reviews;
+    if (!reviews) return undefined;
+
+    if (typeof reviews === "string") {
+      return byId.get(reviews);
+    }
+
+    // Competition mode: return the first task that is still in flight
+    // or pending, otherwise the first in the list.
+    for (const id of reviews) {
+      const t = byId.get(id);
+      if (t && (t.status === "awaiting_review" || t.status === "pending" || t.status === "assigned")) {
+        return t;
+      }
+    }
+    // Fall back to the first entry.
+    const firstId = reviews[0];
+    if (!firstId) return undefined;
+    return byId.get(firstId);
   }
 
   private handleTaskFailure(
@@ -3250,6 +4071,107 @@ export class PlannerBridge {
 
     // Don't stall on failure — the next eligible task (or project
     // completion when nothing remains) is still the right thing.
+    void this.scheduleEligibleTasks(orchestratorSessionId, board);
+  }
+
+  // Run a review task on the orchestrator session (Phase 4a). Sends the
+  // review prompt through the decomposition channel; on reply, parses via
+  // promptsFor('review') and calls handleReviewComplete. Orchestrator-lane
+  // reviews don't increment inFlightCount and don't go through board.workers.
+  // Single-flight constraint: only one orchestrator review in flight at a
+  // time (host session is serial).
+  private async runReviewOnOrchestrator(
+    reviewTask: Task,
+    board: Board,
+    orchestratorSessionId: string,
+  ): Promise<void> {
+    const state = getOrchestratorState(orchestratorSessionId);
+    if (!state) return;
+
+    // Assign the task to the "orchestrator" sentinel so the plan view
+    // shows what's happening. Orchestrator-lane reviews don't count
+    // against inFlightCount or concurrencyCap.
+    reviewTask.status = "assigned";
+    reviewTask.assignedTo = "orchestrator";
+    reviewTask.startedAt = nowIso();
+    saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+
+    state.awaitingOrchestratorReview = true;
+    state.orchestratorReviewTaskId = reviewTask.id;
+    state.orchestratorReviewAccumulator = "";
+
+    log.info(
+      `review ${reviewTask.id} on orchestrator session …${orchestratorSessionId.slice(-8)}`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `Reviewing ${reviewTask.title}${reviewTask.why ? ` — ${reviewTask.why}` : ""}`,
+      { event: "task-review-orchestrator", taskId: reviewTask.id },
+    );
+
+    try {
+      await this.client.request("hydra-acp/message/emit", {
+        sessionId: orchestratorSessionId,
+        method: "session/prompt",
+        envelope: buildTextPromptEnvelope({
+          sessionId: orchestratorSessionId,
+          text: promptsFor("review").buildPrompt(reviewTask, board),
+        }),
+        route: "chain",
+      });
+    } catch (err) {
+      state.awaitingOrchestratorReview = false;
+      state.orchestratorReviewTaskId = null;
+      state.orchestratorReviewAccumulator = "";
+      if (this.isShutdownError(err)) {
+        log.info(
+          `orchestrator review ${reviewTask.id} aborted (shutdown); leaving as assigned for next-process resume`,
+        );
+        return;
+      }
+      log.error(
+        `orchestrator review turn for ${reviewTask.id} failed: ${(err as Error).message}`,
+      );
+      // Treat failure as a rejection with the error message.
+      reviewTask.status = "done";
+      reviewTask.finishedAt = nowIso();
+      reviewTask.assignedTo = null;
+      const failureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `orchestrator review failed: ${(err as Error).message}` };
+      reviewTask.artifacts = failureArtifacts as typeof reviewTask.artifacts;
+      const failureResult: NormalizedResult = { artifacts: failureArtifacts as TaskArtifacts, warnings: [] };
+      this.handleReviewComplete(reviewTask, board, orchestratorSessionId, failureResult);
+      void this.scheduleEligibleTasks(orchestratorSessionId, board);
+      return;
+    }
+
+    // The emit promise resolved — the agent's turn is complete. Parse the
+    // accumulated reply as a review result and process it.
+    state.awaitingOrchestratorReview = false;
+    const accumulated = state.orchestratorReviewAccumulator;
+    state.orchestratorReviewTaskId = null;
+    state.orchestratorReviewAccumulator = "";
+
+    const raw = promptsFor("review").extractResult(accumulated);
+    const result = raw === undefined ? undefined : promptsFor("review").normalizeResult(raw);
+
+    let effectiveResult: NormalizedResult | undefined = result;
+    if (!result) {
+      log.warn(
+        `orchestrator review ${reviewTask.id}: missing or malformed review result (accumulator length=${accumulated.length})`,
+      );
+      // Treat parse failure as a rejection.
+      reviewTask.status = "done";
+      reviewTask.finishedAt = nowIso();
+      reviewTask.assignedTo = null;
+      const parseFailureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `missing or malformed review result` };
+      reviewTask.artifacts = parseFailureArtifacts as typeof reviewTask.artifacts;
+      effectiveResult = { artifacts: parseFailureArtifacts as TaskArtifacts, warnings: [] };
+    } else {
+      this.markTaskDone(reviewTask, result.artifacts, board, orchestratorSessionId, "orchestrator");
+    }
+
+    this.handleReviewComplete(reviewTask, board, orchestratorSessionId, effectiveResult);
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
   }
 
@@ -3477,7 +4399,7 @@ export class PlannerBridge {
   private async emitSyntheticMessage(
     sessionId: string,
     text: string,
-    plannerEvent?: { event: string; taskId?: string },
+    plannerEvent?: { event: string; taskId?: string; reviewedTaskId?: string },
   ): Promise<void> {
     const meta = plannerEvent
       ? {
@@ -3485,6 +4407,7 @@ export class PlannerBridge {
             planner: {
               event: plannerEvent.event,
               ...(plannerEvent.taskId ? { taskId: plannerEvent.taskId } : {}),
+              ...(plannerEvent.reviewedTaskId ? { reviewedTaskId: plannerEvent.reviewedTaskId } : {}),
             },
           },
         }
@@ -3733,14 +4656,34 @@ export class PlannerBridge {
       }
     }
 
-    // Parse fleet defaults + concurrencyCap from the tool args.
+    // Parse fleet defaults + concurrencyCap + reviewPolicy from the tool args.
     const fleetDefaultsRaw = args.fleetDefaults;
     let fleetAgent: string | null = null;
     let fleetModel: string | null = null;
+    let workAgent: string | undefined;
+    let workModel: string | undefined;
+    let reviewAgent: string | undefined;
+    let reviewModel: string | undefined;
+    let reviewRunOn: "orchestrator" | "worker" | undefined;
     if (fleetDefaultsRaw && typeof fleetDefaultsRaw === "object" && !Array.isArray(fleetDefaultsRaw)) {
       const fd = fleetDefaultsRaw as Record<string, unknown>;
       if (typeof fd.agent === "string") fleetAgent = fd.agent;
       if (typeof fd.model === "string") fleetModel = fd.model;
+      const workRaw = fd.work;
+      if (workRaw && typeof workRaw === "object" && !Array.isArray(workRaw)) {
+        const w = workRaw as Record<string, unknown>;
+        if (typeof w.agent === "string") workAgent = w.agent;
+        if (typeof w.model === "string") workModel = w.model;
+      }
+      const reviewRaw = fd.review;
+      if (reviewRaw && typeof reviewRaw === "object" && !Array.isArray(reviewRaw)) {
+        const r = reviewRaw as Record<string, unknown>;
+        if (typeof r.agent === "string") reviewAgent = r.agent;
+        if (typeof r.model === "string") reviewModel = r.model;
+        if (typeof r.runOn === "string" && (r.runOn === "orchestrator" || r.runOn === "worker")) {
+          reviewRunOn = r.runOn as "orchestrator" | "worker";
+        }
+      }
     }
     const concurrencyCapRaw = args.concurrencyCap;
     const concurrencyCap =
@@ -3748,11 +4691,46 @@ export class PlannerBridge {
         ? Math.floor(concurrencyCapRaw)
         : undefined;
 
+    // Parse reviewPolicy from tool args.
+    const reviewPolicyRaw = args.reviewPolicy;
+    let boardReviewPolicy: ReviewPolicy | undefined;
+    if (reviewPolicyRaw && typeof reviewPolicyRaw === "object" && !Array.isArray(reviewPolicyRaw)) {
+      const rp = reviewPolicyRaw as Record<string, unknown>;
+      const validModes = ["off", "hints", "all", "high-only"];
+      let mode: ReviewPolicy["mode"] = "hints";
+      if (typeof rp.mode === "string" && validModes.includes(rp.mode)) {
+        mode = rp.mode as ReviewPolicy["mode"];
+      }
+      const overrideHint = typeof rp.overrideHint === "boolean" ? rp.overrideHint : false;
+      boardReviewPolicy = { mode, overrideHint };
+    } else {
+      boardReviewPolicy = undefined;
+    }
+
+    const boardFleetDefaults: import("./board.js").FleetDefaults = {
+      agent: fleetAgent,
+      model: fleetModel,
+    };
+    if (workAgent !== undefined || workModel !== undefined) {
+      boardFleetDefaults.work = {};
+      if (workAgent !== undefined) boardFleetDefaults.work.agent = workAgent;
+      if (workModel !== undefined) boardFleetDefaults.work.model = workModel;
+    }
+    if (reviewAgent !== undefined || reviewModel !== undefined || reviewRunOn !== undefined) {
+      boardFleetDefaults.review = {};
+      if (reviewAgent !== undefined) boardFleetDefaults.review.agent = reviewAgent;
+      if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
+      if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
+    }
+
     const board = newBoard({
       description,
       concurrencyCap,
-      fleetDefaults: { agent: fleetAgent, model: fleetModel },
+      fleetDefaults: boardFleetDefaults,
     });
+    if (boardReviewPolicy) {
+      board.reviewPolicy = boardReviewPolicy;
+    }
     board.pendingExecute = false; // ready, awaiting planner_execute
     boards.set(sessionId, board);
     saveBoard(board, sessionId);
@@ -3905,6 +4883,12 @@ export class PlannerBridge {
     const failed = board.tasks.filter((t) => t.status === "failed").length;
     const inFlight = inFlightCount(board);
     const pending = board.tasks.filter((t) => t.status === "pending").length;
+    const reviewsPending = board.tasks.filter(
+      (t) => t.kind === "review" && (t.status === "pending" || t.status === "assigned"),
+    ).length;
+    const awaitingReview = board.tasks.filter(
+      (t) => t.status === "awaiting_review",
+    ).length;
     this.replyMcpResult(reqId, text, {
       hasProject: true,
       projectId: board.projectId,
@@ -3915,6 +4899,8 @@ export class PlannerBridge {
         failed,
         inFlight,
         pending,
+        reviewsPending,
+        awaitingReview,
       },
       inFlightWorkers: board.tasks
         .filter((t) => t.status === "assigned" && t.assignedTo)

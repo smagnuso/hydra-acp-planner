@@ -149,9 +149,20 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   } catch {
     orchestratorSessionId = undefined;
   }
-  process.stdout.write(
-    `Tasks: ${board.tasks.length} total, ${board.tasks.filter((t) => t.status === "done").length} done, ${board.tasks.filter((t) => t.status === "assigned").length} in flight\n`,
-  );
+  const doneCount = board.tasks.filter((t) => t.status === "done").length;
+  const inFlightCount = board.tasks.filter((t) => t.status === "assigned").length;
+  const reviewsPending = board.tasks.filter(
+    (t) => t.kind === "review" && (t.status === "pending" || t.status === "assigned"),
+  ).length;
+  const awaitingReview = board.tasks.filter((t) => t.status === "awaiting_review").length;
+  let taskLine = `Tasks: ${board.tasks.length} total, ${doneCount} done, ${inFlightCount} in flight`;
+  if (reviewsPending > 0 || awaitingReview > 0) {
+    const reviewParts: string[] = [];
+    if (reviewsPending > 0) reviewParts.push(`${reviewsPending} reviews pending`);
+    if (awaitingReview > 0) reviewParts.push(`${awaitingReview} awaiting review`);
+    taskLine += `, ${reviewParts.join(", ")}`;
+  }
+  process.stdout.write(taskLine + "\n");
   process.stdout.write(`Concurrency cap: ${board.concurrencyCap}\n\n`);
 
   const sessionsTable = formatSessionsTable(board, orchestratorSessionId, {

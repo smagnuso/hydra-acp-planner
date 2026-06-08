@@ -1,10 +1,26 @@
 import type { Board, Task, TaskArtifacts } from "./board.js";
 
-// The worker task prompt and the structured result block it must emit.
-// Workers are plain ACP agents that get one user prompt per task — the
-// prompt describes the task in WHAT/WHY/CONSTRAINTS terms and instructs
-// the agent to end its reply with a fenced ```hydra-result block carrying
-// a JSON object the planner parses.
+// ── Types ────────────────────────────────────────────────────────────────
+
+export type TaskKind = "work" | "review";
+
+/** Shape of a review result emitted by a worker agent. */
+export interface ReviewResult {
+  decision: "approve" | "reject" | "amend";
+  notes: string;
+  follow_ups?: string[];
+  applied?: boolean;
+}
+
+export interface PromptRegistryEntry {
+  buildPrompt(task: Task, board: Board): string;
+  extractResult(text: string): unknown;
+  normalizeResult(raw: unknown, reviewsList?: string[]): NormalizedResult | undefined;
+  buildResumePrompt(task: Task): string;
+  buildRepromptPrompt(task: Task): string;
+}
+
+// ── Registry ─────────────────────────────────────────────────────────────
 
 const TASK_SYSTEM = `You are a worker agent on a multi-agent coding project. You have been given one task to complete. Do the work, then end your message with a structured result block so the planner can record what you did.`;
 
@@ -47,106 +63,330 @@ function formatDependencyContext(task: Task, board: Board): string {
   return blocks.join("\n\n");
 }
 
-// Prompt sent when the planner is resuming an in-flight task after a
-// daemon restart. The worker session is cold-resurrected by hydra
-// (which seeds the prior transcript as a takeover prompt), so the
-// agent already has its own conversational memory of what it was
-// doing. This continuation prompt just tells it to pick up — and to
-// be sure to emit the structured result block when done.
-export function buildResumeTaskPrompt(task: Task): string {
-  return [
-    `[hydra-acp-planner: resuming after restart]`,
-    ``,
-    `You were previously working on **${task.id} — ${task.title}**.`,
-    ``,
-    `Continue from where you left off. If you were mid-write, finish that file. If you were already done but never emitted your hydra-result block, emit it now (don't redo the work).`,
-    ``,
-    `When finished, end your message with the same fenced \`\`\`hydra-result block format described earlier:`,
-    ``,
-    "```hydra-result",
-    `{ "summary": "...", "files_changed": [...], "decisions": [...] }`,
-    "```",
-  ].join("\n");
+const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
+  work: {
+    buildPrompt(task: Task, board: Board): string {
+      const parts: string[] = [];
+      parts.push(TASK_SYSTEM);
+      parts.push("");
+      parts.push("## Task");
+      parts.push(`**${task.id} — ${task.title}**`);
+      if (task.why) {
+        parts.push("");
+        parts.push(`**Why:** ${task.why}`);
+      }
+      if (task.what) {
+        parts.push("");
+        parts.push(`**What:** ${task.what}`);
+      }
+      if (task.constraints) {
+        parts.push("");
+        parts.push(`**Constraints:** ${task.constraints}`);
+      }
+      parts.push("");
+      parts.push("## Context from completed dependencies");
+      parts.push(formatDependencyContext(task, board));
+      parts.push("");
+      if (task.attemptCount > 0 && task.reviewFeedback?.length) {
+        parts.push("## Previous attempt feedback");
+        for (const entry of task.reviewFeedback) {
+          parts.push(`- ${entry}`);
+        }
+        parts.push("");
+      }
+      parts.push(RESULT_INSTRUCTIONS);
+      return parts.join("\n");
+    },
+
+    extractResult(text: string): unknown {
+      const labelled = /```hydra-result\s*\n([\s\S]*?)\n```/;
+      const fallback = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+      const m = text.match(labelled);
+      if (m && m[1] !== undefined) {
+        try {
+          return JSON.parse(m[1]);
+        } catch {
+          // fall through to fallback
+        }
+      }
+      let last: string | undefined;
+      for (const match of text.matchAll(fallback)) {
+        if (match[1] !== undefined) {
+          last = match[1];
+        }
+      }
+      if (last === undefined) {
+        return undefined;
+      }
+      try {
+        return JSON.parse(last);
+      } catch {
+        return undefined;
+      }
+    },
+
+    normalizeResult(raw: unknown): NormalizedResult | undefined {
+      if (!raw || typeof raw !== "object") {
+        return undefined;
+      }
+      const obj = raw as Record<string, unknown>;
+      const summary =
+        typeof obj.summary === "string" && obj.summary.trim().length > 0
+          ? obj.summary.trim()
+          : undefined;
+      if (!summary) {
+        return undefined;
+      }
+
+      const warnings: string[] = [];
+      const stringArray = (
+        field: string,
+        value: unknown,
+      ): string[] | undefined => {
+        if (value === undefined || value === null) return undefined;
+        if (!Array.isArray(value)) {
+          warnings.push(`${field} should be an array; ignoring`);
+          return undefined;
+        }
+        const filtered = value.filter((v): v is string => typeof v === "string");
+        if (filtered.length !== value.length) {
+          warnings.push(`${field} had non-string entries; filtered`);
+        }
+        return filtered.length > 0 ? filtered : undefined;
+      };
+
+      const artifacts: TaskArtifacts = { summary };
+      const filesChanged = stringArray("files_changed", obj.files_changed);
+      if (filesChanged) artifacts.files_changed = filesChanged;
+      const decisions = stringArray("decisions", obj.decisions);
+      if (decisions) artifacts.decisions = decisions;
+      const assumptions = stringArray("assumptions", obj.assumptions);
+      if (assumptions) artifacts.assumptions = assumptions;
+      const followUps = stringArray("follow_ups", obj.follow_ups);
+      if (followUps) artifacts.follow_ups = followUps;
+
+      return { artifacts, warnings };
+    },
+
+    buildResumePrompt(task: Task): string {
+      return [
+        `[hydra-acp-planner: resuming after restart]`,
+        ``,
+        `You were previously working on **${task.id} — ${task.title}**.`,
+        ``,
+        `Continue from where you left off. If you were mid-write, finish that file. If you were already done but never emitted your hydra-result block, emit it now (don't redo the work).`,
+        ``,
+        `When finished, end your message with the same fenced \`\`\`hydra-result block format described earlier:`,
+        ``,
+        "```hydra-result",
+        `{ \"summary\": \"...\", \"files_changed\": [...], \"decisions\": [...] }`,
+        "```",
+      ].join("\n");
+    },
+
+    buildRepromptPrompt(task: Task): string {
+      return [
+        `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block.`,
+        ``,
+        `Please emit it now — do NOT redo the work, just emit a structured summary of what you accomplished:`,
+        ``,
+        "```hydra-result",
+        `{ \"summary\": \"<one-line description of what you did>\", \"files_changed\": [...], \"decisions\": [...], \"assumptions\": [...] }`,
+        "```",
+        ``,
+        `If the task itself failed or you couldn't complete it, still emit the block — set "summary" to describe what blocked you.`,
+      ].join("\n");
+    },
+  },
+
+  review: {
+    buildPrompt(task: Task, board: Board): string {
+      const parts: string[] = [];
+      parts.push(TASK_SYSTEM);
+      parts.push("");
+      parts.push("## Task");
+      parts.push(`**${task.id} — ${task.title}**`);
+      if (task.why) {
+        parts.push("");
+        parts.push(`**Why:** ${task.why}`);
+      }
+      if (task.what) {
+        parts.push("");
+        parts.push(`**What:** ${task.what}`);
+      }
+      if (task.constraints) {
+        parts.push("");
+        parts.push(`**Constraints:** ${task.constraints}`);
+      }
+      parts.push("");
+      parts.push("## Context from completed dependencies");
+      parts.push(formatDependencyContext(task, board));
+      parts.push("");
+      parts.push(RESULT_INSTRUCTIONS);
+      parts.push("");
+      const isCompetition = Array.isArray(task.reviews) && task.reviews.length > 1;
+      if (isCompetition) {
+        const reviewees: Task[] = [];
+        for (const revieweeId of task.reviews as string[]) {
+          const reviewee = board.tasks.find((t) => t.id === revieweeId);
+          if (reviewee && reviewee.status === "done" && reviewee.artifacts) {
+            reviewees.push(reviewee);
+          }
+        }
+        parts.push(
+          `## Review instructions`,
+          `You are the judge in a competition. Below are N implementations for this task. Each implementation is listed with its artifacts (summary, files changed, decisions).`,
+          `Choose one of two options:`,
+          `- Pick a **winner**: set \`decision\` to "winner" and \`winner\` to the ID of the winning implementation (e.g. "Tx"). Your \`notes\` must explain why this one wins.`,
+          `- **Synthesize**: set \`decision\` to "synthesize" when no single implementation is clearly best. Your \`notes\` should describe what a combined solution would look like, referencing which parts came from which implementation.`,
+        );
+        for (const rev of reviewees) {
+          parts.push("");
+          parts.push(`### ${rev.id} — ${rev.title}`);
+          parts.push(JSON.stringify(rev.artifacts, null, 2));
+        }
+        return parts.join("\n");
+      }
+      parts.push(
+        `## Review instructions`,
+        `Analyze the work described by this task and produce a structured review result.`,
+        `Your \`decision\` must be one of: "approve", "reject", "amend", or "fix".`,
+        `Your \`notes\` should explain your reasoning in detail.`,
+        `Optionally include \`follow_ups\` (an array of strings) for any follow-on work.`,
+        `Optionally set \`applied\` to true if the review changes were already applied.`,
+        `Use decision="fix" when you can apply corrections directly (e.g., as the orchestrator). This marks the task done without retasking.`,
+      );
+      return parts.join("\n");
+    },
+
+    extractResult(text: string): unknown {
+      const labelled = /```hydra-result\s*\n([\s\S]*?)\n```/;
+      const fallback = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+      const m = text.match(labelled);
+      if (m && m[1] !== undefined) {
+        try {
+          return JSON.parse(m[1]);
+        } catch {
+          // fall through to fallback
+        }
+      }
+      let last: string | undefined;
+      for (const match of text.matchAll(fallback)) {
+        if (match[1] !== undefined) {
+          last = match[1];
+        }
+      }
+      if (last === undefined) {
+        return undefined;
+      }
+      try {
+        return JSON.parse(last);
+      } catch {
+        return undefined;
+      }
+    },
+
+    normalizeResult(raw: unknown, reviewsList?: string[]): NormalizedResult | undefined {
+      if (!raw || typeof raw !== "object") {
+        return undefined;
+      }
+      const obj = raw as Record<string, unknown>;
+      const decision = obj.decision;
+      if (decision !== "approve" && decision !== "reject" && decision !== "amend" && decision !== "fix" && decision !== "winner" && decision !== "synthesize") {
+        return undefined;
+      }
+
+      const warnings: string[] = [];
+      const notes = typeof obj.notes === "string" ? obj.notes : "";
+      if (!notes) {
+        warnings.push("review missing notes");
+      }
+
+      const artifacts: TaskArtifacts & { review_decision?: string; applied?: boolean } = {};
+      artifacts.summary = String(decision);
+      (artifacts as Record<string, unknown>).review_decision = decision;
+      if (notes) {
+        (artifacts as Record<string, unknown>).notes = notes;
+      }
+
+      const followUps = Array.isArray(obj.follow_ups)
+        ? obj.follow_ups.filter((v): v is string => typeof v === "string")
+        : undefined;
+      if (followUps && followUps.length > 0) {
+        artifacts.follow_ups = followUps;
+      }
+
+      const applied = obj.applied;
+      if (typeof applied === "boolean") {
+        (artifacts as Record<string, unknown>).applied = applied;
+      }
+
+      const winner = typeof obj.winner === "string" ? obj.winner : undefined;
+      if (winner) {
+        if (reviewsList && !reviewsList.includes(winner)) {
+          warnings.push(`winner "${winner}" not found in reviews list`);
+        }
+        (artifacts as Record<string, unknown>).winner = winner;
+      }
+
+      return { artifacts, warnings };
+    },
+
+    buildResumePrompt(task: Task): string {
+      return [
+        `[hydra-acp-planner: resuming after restart]`,
+        ``,
+        `You were previously working on **${task.id} — ${task.title}**.`,
+        ``,
+        `Continue from where you left off. If you were mid-review, finish that review. If you were already done but never emitted your hydra-result block, emit it now (don't redo the review).`,
+        ``,
+        `When finished, end your message with the same fenced \`\`\`hydra-result block format described earlier:`,
+        ``,
+        "```hydra-result",
+        `{ \"decision\": \"approve|reject|amend|fix\", \"notes\": \"...\" }`,
+        "```",
+      ].join("\n");
+    },
+
+    buildRepromptPrompt(task: Task): string {
+      return [
+        `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block.`,
+        ``,
+        `Please emit it now — do NOT redo the review, just emit a structured summary of your decision:`,
+        ``,
+        "```hydra-result",
+        `{ \"decision\": \"<approve|reject|amend|fix>\", \"notes\": \"<reasoning>\" }`,
+        "```",
+        ``,
+        `If the task itself failed or you couldn't complete it, still emit the block — set "summary" to describe what blocked you.`,
+      ].join("\n");
+    },
+  },
+};
+
+export { PROMPTS };
+
+// ── Public helpers ───────────────────────────────────────────────────────
+
+/** Resolve a prompt registry entry for the given task kind. */
+export function promptsFor(kind: TaskKind): PromptRegistryEntry {
+  const entry = PROMPTS[kind] ?? PROMPTS.work;
+  if (!entry) {
+    throw new Error(`No prompt registry entry for kind=${kind}`);
+  }
+  return entry;
 }
 
-// Prompt sent when the planner sees an agent reply that's missing the
-// expected hydra-result block. The worker likely finished the work but
-// forgot the format. One reprompt is allowed per attempt; a second
-// miss escalates to failure.
-export function buildRepromptForResultPrompt(task: Task): string {
-  return [
-    `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block.`,
-    ``,
-    `Please emit it now — do NOT redo the work, just emit a structured summary of what you accomplished:`,
-    ``,
-    "```hydra-result",
-    `{ "summary": "<one-line description of what you did>", "files_changed": [...], "decisions": [...], "assumptions": [...] }`,
-    "```",
-    ``,
-    `If the task itself failed or you couldn't complete it, still emit the block — set "summary" to describe what blocked you.`,
-  ].join("\n");
-}
+// ── Legacy top-level exports (thin wrappers) ─────────────────────────────
+// These delegate to PROMPTS.work so that existing call sites in bridge.ts
+// and elsewhere keep compiling without changes.
 
 export function buildTaskPrompt(task: Task, board: Board): string {
-  const parts: string[] = [];
-  parts.push(TASK_SYSTEM);
-  parts.push("");
-  parts.push("## Task");
-  parts.push(`**${task.id} — ${task.title}**`);
-  if (task.why) {
-    parts.push("");
-    parts.push(`**Why:** ${task.why}`);
-  }
-  if (task.what) {
-    parts.push("");
-    parts.push(`**What:** ${task.what}`);
-  }
-  if (task.constraints) {
-    parts.push("");
-    parts.push(`**Constraints:** ${task.constraints}`);
-  }
-  parts.push("");
-  parts.push("## Context from completed dependencies");
-  parts.push(formatDependencyContext(task, board));
-  parts.push("");
-  parts.push(RESULT_INSTRUCTIONS);
-  return parts.join("\n");
+  return promptsFor("work").buildPrompt(task, board);
 }
 
-// Pull a fenced ```hydra-result block out of the agent's reply. The agent
-// is instructed to emit one at end-of-message; we tolerate trailing
-// whitespace / prose. Returns undefined if no parsable block is found.
 export function extractResultBlock(text: string): unknown {
-  // Same shape as decomposition's extractJsonBlock but matches the
-  // hydra-result fence label specifically. We also accept the more
-  // generic ```json label as a fallback since some models will use it
-  // by reflex even when told otherwise.
-  const labelled = /```hydra-result\s*\n([\s\S]*?)\n```/;
-  const fallback = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
-  const m = text.match(labelled);
-  if (m && m[1] !== undefined) {
-    try {
-      return JSON.parse(m[1]);
-    } catch {
-      // fall through to fallback
-    }
-  }
-  // Walk every ```json block, pick the LAST one — instructions say the
-  // result must be at the end, so the last block is the right one.
-  let last: string | undefined;
-  for (const match of text.matchAll(fallback)) {
-    if (match[1] !== undefined) {
-      last = match[1];
-    }
-  }
-  if (last === undefined) {
-    return undefined;
-  }
-  try {
-    return JSON.parse(last);
-  } catch {
-    return undefined;
-  }
+  return promptsFor("work").extractResult(text);
 }
 
 export interface NormalizedResult {
@@ -154,48 +394,36 @@ export interface NormalizedResult {
   warnings: string[];
 }
 
-// Validate and normalize the parsed result into the TaskArtifacts shape
-// the board expects. Tolerates missing optional fields; requires that
-// `summary` be present and non-empty (the agent has to tell us SOMETHING).
 export function normalizeResult(raw: unknown): NormalizedResult | undefined {
-  if (!raw || typeof raw !== "object") {
-    return undefined;
-  }
-  const obj = raw as Record<string, unknown>;
-  const summary =
-    typeof obj.summary === "string" && obj.summary.trim().length > 0
-      ? obj.summary.trim()
-      : undefined;
-  if (!summary) {
-    return undefined;
-  }
+  return promptsFor("work").normalizeResult(raw);
+}
 
-  const warnings: string[] = [];
-  const stringArray = (
-    field: string,
-    value: unknown,
-  ): string[] | undefined => {
-    if (value === undefined || value === null) return undefined;
-    if (!Array.isArray(value)) {
-      warnings.push(`${field} should be an array; ignoring`);
-      return undefined;
-    }
-    const filtered = value.filter((v): v is string => typeof v === "string");
-    if (filtered.length !== value.length) {
-      warnings.push(`${field} had non-string entries; filtered`);
-    }
-    return filtered.length > 0 ? filtered : undefined;
-  };
+export function buildResumeTaskPrompt(task: Task): string {
+  return promptsFor("work").buildResumePrompt(task);
+}
 
-  const artifacts: TaskArtifacts = { summary };
-  const filesChanged = stringArray("files_changed", obj.files_changed);
-  if (filesChanged) artifacts.files_changed = filesChanged;
-  const decisions = stringArray("decisions", obj.decisions);
-  if (decisions) artifacts.decisions = decisions;
-  const assumptions = stringArray("assumptions", obj.assumptions);
-  if (assumptions) artifacts.assumptions = assumptions;
-  const followUps = stringArray("follow_ups", obj.follow_ups);
-  if (followUps) artifacts.follow_ups = followUps;
+export function buildRepromptForResultPrompt(task: Task): string {
+  return promptsFor("work").buildRepromptPrompt(task);
+}
 
-  return { artifacts, warnings };
+// ── Review helpers (thin wrappers) ───────────────────────────────────────
+
+export function buildReviewPrompt(task: Task, board: Board): string {
+  return promptsFor("review").buildPrompt(task, board);
+}
+
+export function extractReviewBlock(text: string): unknown {
+  return promptsFor("review").extractResult(text);
+}
+
+export function normalizeReview(raw: unknown, reviewsList?: string[]): NormalizedResult | undefined {
+  return promptsFor("review").normalizeResult(raw, reviewsList);
+}
+
+export function buildResumeReviewPrompt(task: Task): string {
+  return promptsFor("review").buildResumePrompt(task);
+}
+
+export function buildRepromptForReviewPrompt(task: Task): string {
+  return promptsFor("review").buildRepromptPrompt(task);
 }

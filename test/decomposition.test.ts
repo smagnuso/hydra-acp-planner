@@ -59,6 +59,25 @@ describe("buildDecompositionPrompt", () => {
     assert.match(p, /code-claude — Claude coding agent/);
     assert.match(p, /code-codex/);
   });
+
+  it("omits competition instructions when compete is false (default)", () => {
+    const p = buildDecompositionPrompt("anything");
+    assert.doesNotMatch(p, /Competition pattern/i);
+    assert.doesNotMatch(p, /competition/i);
+  });
+
+  it("includes competition instructions when compete is true", () => {
+    const p = buildDecompositionPrompt("anything", undefined, true);
+    assert.match(p, /Competition pattern/i);
+    assert.match(p, /N sibling work tasks/i);
+    assert.match(p, /review task of kind "review"/i);
+    assert.match(p, /reviews set to the array/i);
+  });
+
+  it("competition block does not appear for non-compete prompts", () => {
+    const p = buildDecompositionPrompt("anything", undefined, false);
+    assert.doesNotMatch(p, /integration point/i);
+  });
 });
 
 describe("buildExecuteDecompositionPrompt", () => {
@@ -85,6 +104,17 @@ describe("buildExecuteDecompositionPrompt", () => {
   it("omits the agent-list block when none provided", () => {
     const p = buildExecuteDecompositionPrompt();
     assert.doesNotMatch(p, /Available specialist agents/);
+  });
+
+  it("omits competition instructions when compete is false (default)", () => {
+    const p = buildExecuteDecompositionPrompt();
+    assert.doesNotMatch(p, /Competition pattern/i);
+  });
+
+  it("includes competition instructions when compete is true", () => {
+    const p = buildExecuteDecompositionPrompt(undefined, true);
+    assert.match(p, /Competition pattern/i);
+    assert.match(p, /N sibling work tasks/i);
   });
 });
 
@@ -321,6 +351,18 @@ describe("buildResumeDecompositionPrompt", () => {
     const p = buildResumeDecompositionPrompt("x");
     assert.match(p, /tasks/);
     assert.match(p, /```json/);
+  });
+
+  it("omits competition hint when compete is false (default)", () => {
+    const p = buildResumeDecompositionPrompt("build a todo app");
+    assert.doesNotMatch(p, /competition/i);
+  });
+
+  it("includes competition context when compete is true", () => {
+    const p = buildResumeDecompositionPrompt("build a todo app", true);
+    assert.match(p, /competition pattern/i);
+    assert.match(p, /compete flag was set/i);
+    assert.match(p, /do NOT invent new competition tasks/i);
   });
 });
 

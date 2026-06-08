@@ -269,6 +269,92 @@ The lifecycle in a nutshell:
 | `/hydra planner status`                       | no change (one-shot snapshot) | unchanged    |
 | `/hydra planner remove`                       | resolved (`removed`) | board deleted     |
 
+## Reviews and Competitions
+
+The planner supports **review tasks** — a second task kind that evaluates
+the output of a work task before it's considered done. A review is a task
+with `kind: "review"` and a `reviews` reference pointing at the work task
+it evaluates.
+
+### Review decisions
+
+When a review completes, the planner reads the decision from the agent's
+response:
+
+| Decision | Effect |
+|----------|--------|
+| `approve` | The reviewed work task transitions to `done`; its dependents unblock. |
+| `reject` | Work task stays pending (or resets per strategy); feedback attaches. |
+| `amend` | Same as reject, but the agent can also supply corrected artifacts. |
+| `fix` | Orchestrator-lane only — the reviewer patches artifacts in-place. |
+
+### Review lanes (`runOn`)
+
+Reviews run on one of two lanes:
+
+| Lane | Worker | Can apply fixes? |
+|------|--------|------------------|
+| `orchestrator` (default) | Host session's agent | Yes (`canApplyFixes=true`) |
+| `worker` | Dedicated review worker | No |
+
+Orchestrator-lane reviews stream into your active chat; the reviewer can
+see the board context and apply fixes without spawning a new worker.
+Worker-lane reviews are fully isolated — useful when you want a separate
+agent to do the review.
+
+### `onReject` strategies
+
+When a review rejects a work task, the planner applies one of three
+strategies (configurable per-task via `onReject.strategy`):
+
+| Strategy | Behavior |
+|----------|----------|
+| `fresh` (default) | Reset the task to pending with accumulated rejection feedback; a worker retries from scratch. |
+| `continue` | Keep the task in its current state but bump `attemptCount`; the next worker sees the feedback and continues from where it left off. |
+| `escalate` | Spawn a new task targeting a different agent/model (requires `onReject.escalateTo`). |
+
+All strategies respect `onReject.maxAttempts` (default 3), after which
+the work task fails with all accumulated review feedback attached.
+
+### Competition pattern
+
+The competition pattern lets multiple workers tackle the same task in
+parallel; the first review to approve wins and the others are marked
+`superseded`. This is useful when you want diverse approaches — e.g.,
+two agents independently designing a database schema, then a single
+reviewer picks the best one.
+
+```text
+  T1  Design auth schema        —  no deps         ← two workers spawn
+  T2  Review T1                 —  reviews: T1      ← competition review
+  T3  Implement signup          —  depends on T1    ← blocked until T1 done
+```
+
+With `--compete true`, the decomposer knows to emit multiple parallel
+work tasks for the same dependency and a single competition review that
+picks a winner. Superseded tasks are persisted but don't block
+dependents.
+
+### CLI flags
+
+| Flag | Effect |
+|------|--------|
+| `--review-policy MODE` | Synthesize review tasks automatically. Modes: `off`, `hints` (default, honors agent hints), `all` (every work task), `high-only` (risk=high tasks). |
+| `--override-hint true\|false` | When `true`, synthesize a review even if the agent's hint says "skip". |
+| `--compete true\|false` | Enable competition pattern instructions in decomposition. |
+| `--review-agent ID` | Agent for spawned review workers (overrides fleet default). |
+| `--review-model ID` | Model for spawned review workers. |
+| `--review-run-on orchestrator\|worker` | Default lane for synthesized reviews. |
+| `--work-agent ID` | Agent for spawned work tasks. |
+| `--work-model ID` | Model for spawned work tasks. |
+
+Examples:
+
+```text
+/hydra planner create --review-policy all --compete true build a todo app with auth
+/hydra planner execute --review-run-on worker --review-agent code-reviewer
+```
+
 ## CLI
 
 The CLI inspects the planner's on-disk state. It works even when the

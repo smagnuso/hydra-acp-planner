@@ -262,6 +262,7 @@ export const TASK_STATUS_GLYPH: Record<string, string> = {
   blocked: "[-]",
   pending: "[ ]",
   awaiting_review: "\u{1F50D}",
+  superseded: "(~)",
 };
 
 // Render a board as a context preamble injected into the user's prompts
@@ -318,6 +319,16 @@ export function formatBoardContext(board: Board): string {
   return lines.join("\n");
 }
 
+// ANSI escape sequences for inline styling. The renderer is CLI-only,
+// so these codes work in any terminal that supports them.
+const ESC_STRIKETHROUGH = "\u{001B}[9m";  // strikethrough on
+const ESC_RESET = "\u{001B}[0m";          // reset all attributes
+
+function applyStatusStyle(text: string, status: string): string {
+  if (status === "superseded") return `${ESC_STRIKETHROUGH}${text}${ESC_RESET}`;
+  return text;
+}
+
 // Render a board as the body of a `/hydra planner status` reply.
 // Multi-line plain text; gets emitted as a synthetic agent_message_chunk
 // by hydra's emitExtensionReply, so it lands cleanly in any client's
@@ -342,6 +353,16 @@ export function formatStatus(
   if (failed > 0) counts.push(`${failed} failed`);
   lines.push(`   Tasks: ${counts.join(", ")}`);
   lines.push(`   Concurrency cap: ${board.concurrencyCap}`);
+  const reviewsPending = board.tasks.filter(
+    (t) => t.kind === "review" && (t.status === "pending" || t.status === "assigned"),
+  ).length;
+  const awaitingReview = board.tasks.filter((t) => t.status === "awaiting_review").length;
+  if (reviewsPending > 0 || awaitingReview > 0) {
+    const reviewParts: string[] = [];
+    if (reviewsPending > 0) reviewParts.push(`${reviewsPending} reviews pending`);
+    if (awaitingReview > 0) reviewParts.push(`${awaitingReview} awaiting review`);
+    lines.push(`   Reviews: ${reviewParts.join(", ")}`);
+  }
   const totals = totalUsage(board);
   const usageParts: string[] = [];
   if (totals.cost > 0) usageParts.push(formatCost(totals.cost, totals.currency));
@@ -381,13 +402,16 @@ export function formatStatus(
   for (const task of board.tasks) {
     if (task.kind === "review") {
       if (renderedReviews.has(task.id)) continue;
-      const parents = typeof task.reviews === "string" ? [task.reviews] : Array.isArray(task.reviews) ? task.reviews : [];
-      for (const parentId of parents) {
-        renderedReviews.add(task.id);
-        const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
-        const tag = formatTaskTag(task);
-        lines.push(`     ${glyph} ${task.id}  ${task.title}${tag}`);
-      }
+      const reviewTargets = typeof task.reviews === "string" ? [task.reviews] : Array.isArray(task.reviews) ? task.reviews : [];
+      const isCompetition = reviewTargets.length > 1;
+      renderedReviews.add(task.id);
+      const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
+      const tag = formatTaskTag(task);
+      const line = `    ${glyph} ${task.id}  ${task.title}${tag}`;
+      const styledLine = isCompetition
+        ? `${line}  reviewees: [${reviewTargets.join(", ")}]`
+        : line;
+      lines.push(applyStatusStyle(styledLine, task.status));
       continue;
     }
     const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
@@ -403,10 +427,11 @@ export function formatStatus(
     const childReviews = reviewsByParent.get(task.id);
     if (childReviews) {
       for (const r of childReviews) {
+        if (renderedReviews.has(r.id)) continue;
         renderedReviews.add(r.id);
         const glyph = TASK_STATUS_GLYPH[r.status] ?? "?";
         const tag = formatTaskTag(r);
-        lines.push(`     ${glyph} ${r.id}  ${r.title}${tag}`);
+        lines.push(applyStatusStyle(`    ${glyph} ${r.id}  ${r.title}${tag}`, r.status));
       }
     }
   }

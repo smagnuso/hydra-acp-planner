@@ -569,7 +569,7 @@ describe("planner_get_status", () => {
     const r = client.lastReply();
     const result = r.result as {
       structuredContent: {
-        counts: { total: number; done: number; failed: number; inFlight: number; pending: number };
+        counts: { total: number; done: number; failed: number; inFlight: number; pending: number; reviewsPending: number; awaitingReview: number };
         inFlightWorkers: Array<{ taskId: string; workerSessionId: string }>;
       };
     };
@@ -579,6 +579,8 @@ describe("planner_get_status", () => {
       failed: 1,
       inFlight: 1,
       pending: 1,
+      reviewsPending: 0,
+      awaitingReview: 0,
     });
     assert.equal(result.structuredContent.inFlightWorkers.length, 1);
     assert.equal(result.structuredContent.inFlightWorkers[0]!.taskId, "T3");

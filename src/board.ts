@@ -85,7 +85,16 @@ export interface Task {
     maxAttempts?: number;
     agent?: string;
     model?: string;
+    escalateTo?: {
+      agent: string;
+      model: string;
+    };
   };
+  // Whether the reviewer is allowed to apply fixes directly (decision='fix').
+  // Defaults to true when runOn='orchestrator', false otherwise. Only
+  // relevant for orchestrator-lane reviews where the host session can
+  // patch artifacts without spawning a new worker.
+  canApplyFixes?: boolean;
 }
 
 export interface WorkerUsage {
@@ -95,6 +104,38 @@ export interface WorkerUsage {
   costCurrency?: string;
 }
 
+export interface FleetDefaults {
+  agent: string | null;
+  model: string | null;
+  work?: { agent?: string; model?: string };
+  review?: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" };
+}
+
+export function resolveAgent(task: Task, fleetDefaults: FleetDefaults): string | null {
+  if (task.agent) return task.agent;
+  const kind = task.kind ?? "work";
+  const kindAgent = kind === "review" ? fleetDefaults.review?.agent : fleetDefaults.work?.agent;
+  if (kindAgent) return kindAgent;
+  if (fleetDefaults.agent) return fleetDefaults.agent;
+  return null;
+}
+
+export function resolveModel(task: Task, fleetDefaults: FleetDefaults): string | null {
+  if (task.model) return task.model;
+  const kind = task.kind ?? "work";
+  const kindModel = kind === "review" ? fleetDefaults.review?.model : fleetDefaults.work?.model;
+  if (kindModel) return kindModel;
+  if (fleetDefaults.model) return fleetDefaults.model;
+  return null;
+}
+
+export function resolveRunOn(task: Task, fleetDefaults: FleetDefaults): "orchestrator" | "worker" {
+  if (task.runOn) return task.runOn;
+  const runOn = fleetDefaults.review?.runOn;
+  if (runOn) return runOn;
+  return "orchestrator";
+}
+
 export interface Board {
   version: number;
   projectId: string;
@@ -102,12 +143,7 @@ export interface Board {
   state: BoardState;
   createdAt: string;
   updatedAt: string;
-  fleetDefaults: {
-    agent: string | null;
-    model: string | null;
-    work?: { agent?: string; model?: string };
-    review?: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" };
-  };
+  fleetDefaults: FleetDefaults;
   reviewPolicy?: {
     mode?: "off" | "hints" | "all" | "high-only";
     overrideHint?: boolean;
@@ -146,6 +182,10 @@ export interface Board {
   // Persisted so a daemon restart mid-decomposition preserves the
   // user's original intent.
   pendingExecute?: boolean;
+  // When true, the decomposer system prompt includes competition
+  // pattern instructions (N sibling work tasks + a review task that
+  // picks a winner). Set by the --compete CLI flag on create/execute.
+  compete?: boolean;
   // Last-observed usage_update snapshot for the orchestrator session
   // itself. Captured the same way as worker usage; rendered on the
   // orchestrator row of the sessions table.
@@ -204,7 +244,7 @@ export function nowIso(): string {
 
 export function newBoard(opts: {
   description: string;
-  fleetDefaults?: { agent: string | null; model: string | null };
+  fleetDefaults?: FleetDefaults;
   concurrencyCap?: number;
 }): Board {
   const now = nowIso();

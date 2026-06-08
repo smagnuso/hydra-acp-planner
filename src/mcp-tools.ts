@@ -89,6 +89,24 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
           description:
             "Optional. Maximum concurrent workers. Defaults to a sweep-line cap derived from DAG shape (the right answer for most cases — adding more workers wouldn't help beyond what dependencies allow). Set explicitly only when the user has stated a constraint ('use 3 workers', '--workers 5').",
         },
+        reviewPolicy: {
+          type: "object",
+          description:
+            "Optional. Controls whether review tasks are synthesized after decomposition. Defaults to { mode: 'hints', overrideHint: false }.",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["off", "hints", "all", "high-only"],
+              description:
+                "Which tasks get review tasks synthesized. 'hints' honors the agent's reviewHint; 'all' reviews everything; 'high-only' reviews only high-risk tasks.",
+            },
+            overrideHint: {
+              type: "boolean",
+              description:
+                "When true, overrides the agent's 'skip' hint to still synthesize a review task.",
+            },
+          },
+        },
         fleetDefaults: {
           type: "object",
           description:

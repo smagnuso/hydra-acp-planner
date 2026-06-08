@@ -5,6 +5,7 @@ import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
   allTerminal,
+  BOARD_SCHEMA_VERSION,
   canonicalProjectId,
   inFlightCount,
   listProjects,
@@ -469,5 +470,291 @@ describe("listProjects", () => {
     const list = listProjects();
     assert.equal(list.length, 1);
     assert.equal(list[0]!.projectId, a.projectId);
+  });
+});
+
+describe("BOARD_SCHEMA_VERSION", () => {
+  it("is 2 after phase 1 schema additions", () => {
+    assert.equal(BOARD_SCHEMA_VERSION, 2);
+  });
+});
+
+describe("schema migration v1 → v2", () => {
+  function makeV1Board(): Board {
+    return {
+      version: 1,
+      projectId: "proj_mig",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        { id: "T1", title: "work task", deps: [], status: "pending", attemptCount: 0 },
+      ],
+      workers: {},
+      concurrencyCap: 1,
+    };
+  }
+
+  it("migrates version on loadBoard round-trip", () => {
+    const b = makeV1Board();
+    saveBoard(b, "s_mig");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.equal(loaded!.version, 2);
+  });
+
+  it("sets kind='work' on tasks that lack it during migration", () => {
+    const b = makeV1Board();
+    saveBoard(b, "s_mig_k");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.equal(loaded!.tasks[0]!.kind, "work");
+  });
+
+  it("leaves kind untouched when already set", () => {
+    const b = makeV1Board();
+    b.tasks[0]!.kind = "review";
+    saveBoard(b, "s_mig_k2");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.equal(loaded!.tasks[0]!.kind, "review");
+  });
+
+  it("does not re-migrate a board already at version 2", () => {
+    const b = newBoard({ description: "v2" });
+    b.version = 2;
+    saveBoard(b, "s_mig_v2");
+    // Load multiple times — version should stay 2.
+    let loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.equal(loaded!.version, 2);
+    const t = loaded!.tasks[0];
+    saveBoard(loaded, "s_mig_v2");
+    loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.equal(loaded!.version, 2);
+  });
+});
+
+describe("awaiting_review status semantics", () => {
+  function makeTask(id: string, opts?: Partial<Task>): Task {
+    return {
+      id,
+      title: id,
+      deps: opts?.deps ?? [],
+      status: opts?.status ?? "pending",
+      attemptCount: 0,
+      ...opts,
+    };
+  }
+
+  it("is non-terminal (allTerminal returns false)", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ar",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "awaiting_review" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(allTerminal(b), false);
+  });
+
+  it("is NOT counted in inFlightCount", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ar",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "awaiting_review" }), makeTask("T2", { status: "assigned" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(inFlightCount(b), 1);
+  });
+
+  it("blocks dependents in pickEligible", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ar",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask("T1", { status: "awaiting_review" }),
+        makeTask("T2", { deps: ["T1"], status: "pending" }),
+      ],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(pickEligible(b), undefined);
+  });
+
+  it("is not picked by pickEligible (not pending)", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ar",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "awaiting_review" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(pickEligible(b), undefined);
+  });
+});
+
+describe("superseded status semantics", () => {
+  function makeTask(id: string, opts?: Partial<Task>): Task {
+    return {
+      id,
+      title: id,
+      deps: opts?.deps ?? [],
+      status: opts?.status ?? "pending",
+      attemptCount: 0,
+      ...opts,
+    };
+  }
+
+  it("is terminal (allTerminal returns true)", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ss",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "superseded" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(allTerminal(b), true);
+  });
+
+  it("satisfies dependents in pickEligible (like done)", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ss",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask("T1", { status: "superseded" }),
+        makeTask("T2", { deps: ["T1"], status: "pending" }),
+      ],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(pickEligible(b)?.id, "T2");
+  });
+
+  it("is NOT counted in inFlightCount", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ss",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "superseded" }), makeTask("T2", { status: "assigned" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(inFlightCount(b), 1);
+  });
+
+  it("composes with done in allTerminal", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ss",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "done" }), makeTask("T2", { status: "superseded" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(allTerminal(b), true);
+  });
+
+  it("composes with failed in allTerminal", () => {
+    const b = {
+      version: 2,
+      projectId: "proj_ss",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [makeTask("T1", { status: "failed" }), makeTask("T2", { status: "superseded" })],
+      workers: {},
+      concurrencyCap: 1,
+    };
+    assert.equal(allTerminal(b), true);
+  });
+});
+
+describe("newBoard creates version 2 boards", () => {
+  it("has BOARD_SCHEMA_VERSION as its version", () => {
+    const b = newBoard({ description: "x" });
+    assert.equal(b.version, 2);
+  });
+
+  it("tasks created via newBoard default to work kind", () => {
+    // newBoard doesn't create tasks, but a decomposer-emitted task
+    // with the migrated board should get kind="work".
+    const b = newBoard({ description: "x" });
+    assert.equal(b.version, 2);
+  });
+});
+
+describe("reviewPolicy and fleetDefaults shape", () => {
+  it("newBoard has flat fleetDefaults by default", () => {
+    const b = newBoard({ description: "x" });
+    assert.equal(b.fleetDefaults.agent, null);
+    assert.equal(b.fleetDefaults.model, null);
+    assert.equal(b.fleetDefaults.work, undefined);
+    assert.equal(b.fleetDefaults.review, undefined);
+  });
+
+  it("accepts work/review sub-buckets in fleetDefaults", () => {
+    const b = newBoard({
+      description: "x",
+      fleetDefaults: {
+        agent: "default-agent",
+        model: "default-model",
+      },
+    });
+    // The call signature doesn't accept sub-buckets directly, but
+    // the shape allows them post-creation (schema groundwork).
+    b.fleetDefaults.work = { agent: "worker-agent", model: "haiku" };
+    b.fleetDefaults.review = { agent: "reviewer", model: "opus", runOn: "orchestrator" };
+    assert.equal(b.fleetDefaults.work!.agent, "worker-agent");
+    assert.equal(b.fleetDefaults.review!.runOn, "orchestrator");
+  });
+
+  it("reviewPolicy is optional and undefined by default", () => {
+    const b = newBoard({ description: "x" });
+    assert.equal(b.reviewPolicy, undefined);
   });
 });

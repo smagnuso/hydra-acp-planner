@@ -24,6 +24,11 @@ export interface OrchestratorState {
   // reply, parse it, then merge into the board.
   addAccumulator: string;
   awaitingAdd: boolean;
+  // Orchestrator-lane review state (Phase 4a). While true, agent_message_chunk
+  // updates are suppressed from clients and accumulated for review parsing.
+  awaitingOrchestratorReview: boolean;
+  orchestratorReviewTaskId: string | null;
+  orchestratorReviewAccumulator: string;
 }
 
 const sessionStates = new Map<string, OrchestratorState>();
@@ -106,13 +111,12 @@ export function rehydrate(orchestratorSessionByProject: Map<string, string>, boa
     sessionStates.set(orchestratorSessionId, {
       projectId,
       decompositionAccumulator: "",
-      // If we crashed mid-decomposition, the next agent reply will be
-      // the resumption — but we don't know that until we see traffic.
-      // M5 (resurrection) revisits this; for now, fresh boot = clean
-      // slate and any partial decomposition is lost.
       awaitingDecomposition: board.state === "decomposing",
       addAccumulator: "",
       awaitingAdd: false,
+      awaitingOrchestratorReview: false,
+      orchestratorReviewTaskId: null,
+      orchestratorReviewAccumulator: "",
     });
     for (const workerId of Object.keys(board.workers)) {
       workerToOrchestrator.set(workerId, orchestratorSessionId);
