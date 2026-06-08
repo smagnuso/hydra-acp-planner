@@ -411,10 +411,9 @@ describe("planner_start", () => {
     assert.match(result.content[0]!.text, /no plan on this session/);
   });
 
-  it("errors when board is running, paused, done, or failed (distinct messages)", async () => {
+  it("errors when board is running, done, or failed (distinct messages)", async () => {
     const cases: Array<{ state: Board["state"]; pattern: RegExp }> = [
       { state: "running", pattern: /already running/ },
-      { state: "paused", pattern: /paused.*planner_resume/ },
       { state: "done", pattern: /done.*planner_set_plan to start a new project/ },
       { state: "failed", pattern: /failed.*planner_set_plan to start a new project/ },
     ];
@@ -429,6 +428,25 @@ describe("planner_start", () => {
       assert.equal(result.isError, true, `state ${c.state} should error`);
       assert.match(result.content[0]!.text, c.pattern, `state ${c.state}`);
     }
+  });
+
+  it("accepts a paused board and reports 'Resumed' rather than 'Kicked off'", async () => {
+    seedBoard("hydra_session_test", {
+      state: "paused",
+      tasks: [
+        { id: "T1", title: "done", status: "done" },
+        { id: "T2", title: "was-assigned", status: "pending", deps: ["T3"] },
+        { id: "T3", title: "blocked", status: "blocked" },
+      ],
+    });
+    dispatch(mkInvoke(38, "planner_start", {}));
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.equal(board.state, "running");
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }>; structuredContent: { state: string } };
+    assert.equal(result.structuredContent.state, "running");
+    assert.match(result.content[0]!.text, /Resumed/);
   });
 
   it("flips ready board to running and asks the scheduler to run", async () => {

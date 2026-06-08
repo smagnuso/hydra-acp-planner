@@ -1369,6 +1369,28 @@ export class PlannerBridge {
     void this.scheduleEligibleTasks(sessionId, board);
   }
 
+  private async resumeBoardToRunning(
+    sessionId: string,
+    board: Board,
+  ): Promise<{ resumedFrom: 'ready' | 'paused' | 'stopped' } | null> {
+    if (board.state === "running" || board.state === "done" || board.state === "failed" || board.state === "decomposing") {
+      return null;
+    }
+    const prevState = board.state as 'ready' | 'paused' | 'stopped';
+    setBoardState(board, "running");
+    saveBoard(board, sessionId);
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(
+        `resumeBoardToRunning: transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
+      );
+    }
+    void this.scheduleEligibleTasks(sessionId, board);
+    return { resumedFrom: prevState };
+  }
+
   // /hydra planner retry [taskId]
   //
   // With <taskId>: reset that one task to pending (closing its worker
@@ -1835,19 +1857,26 @@ export class PlannerBridge {
       });
       return;
     }
-    if (
-      board.state === "done" ||
-      board.state === "failed" ||
-      board.state === "stopped"
-    ) {
-      const tail =
-        board.state === "stopped"
-          ? ` Use \`/hydra planner start\` to resume, or \`/hydra planner status\` for the snapshot.`
-          : ` Use \`/hydra planner status\` for the final snapshot.`;
+    if (board.state === "done" || board.state === "failed") {
       this.client.reply(reqId, {
-        text: `Project ${shortProjectId(board.projectId)} is ${board.state} — nothing to continue.${tail}`,
+        text: `Project ${shortProjectId(board.projectId)} is ${board.state} — nothing to continue. Use \`/hydra planner status\` for the final snapshot.`,
       });
       return;
+    }
+    if (board.state === "ready") {
+      this.client.reply(reqId, {
+        text: `Project ${shortProjectId(board.projectId)} is ready — use \`/hydra planner start\` to begin.`,
+      });
+      return;
+    }
+    if (board.state === "decomposing") {
+      this.client.reply(reqId, {
+        text: `Project ${shortProjectId(board.projectId)} is decomposing — wait for the plan to form, then continue.`,
+      });
+      return;
+    }
+    if (board.state === "paused" || board.state === "stopped") {
+      await this.resumeBoardToRunning(sessionId, board);
     }
     try {
       await this.client.request("hydra-acp/transformer/attach", { sessionId });
@@ -2285,9 +2314,7 @@ export class PlannerBridge {
     const existing = boards.get(sessionId);
     if (
       existing &&
-      (existing.state === "running" ||
-        existing.state === "paused" ||
-        existing.state === "decomposing")
+      (existing.state === "running" || existing.state === "decomposing")
     ) {
       this.client.reply(reqId, {
         text: `planner start: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner stop\` or \`/hydra planner remove\` it first, or run start from a different session.`,
@@ -2295,26 +2322,16 @@ export class PlannerBridge {
       return;
     }
 
-    // Fast path: a `ready` or `stopped` board exists. Ready = first
-    // run after create; stopped = resume after user-initiated stop
-    // (runProjectStop reverted in-flight tasks to pending). Both
-    // paths flip to running and kick the scheduler — no re-decomp.
-    if (existing && (existing.state === "ready" || existing.state === "stopped")) {
+    // Fast path: a `ready`, `stopped`, or `paused` board exists. Ready =
+    // first run after create; stopped = resume after user-initiated stop;
+    // paused = resume after user-initiated pause. All paths flip to running
+    // and kick the scheduler — no re-decomp.
+    if (existing && (existing.state === "ready" || existing.state === "stopped" || existing.state === "paused")) {
+      const resumedFrom = existing.state;
       log.info(
-        `${existing.state === "stopped" ? "resuming stopped" : "executing previously-formed"} plan ${existing.projectId} on session …${sessionId.slice(-8)}`,
+        `${resumedFrom === "stopped" ? "resuming stopped" : resumedFrom === "paused" ? "resuming paused" : "executing previously-formed"} plan ${existing.projectId} on session …${sessionId.slice(-8)}`,
       );
-      setBoardState(existing, "running");
-      saveBoard(existing, sessionId);
-      try {
-        await this.client.request("hydra-acp/transformer/attach", { sessionId });
-        attachedSessions.add(sessionId);
-      } catch (err) {
-        log.warn(
-          `start: transformer/attach failed for ${existing.projectId}: ${(err as Error).message}`,
-        );
-      }
-      // Kick the scheduler so the first batch of workers starts.
-      void this.scheduleEligibleTasks(sessionId, existing);
+      await this.resumeBoardToRunning(sessionId, existing);
       await this.holdAndReply(reqId, sessionId, existing, slashMessageId, "start");
       return;
     }
@@ -5236,12 +5253,6 @@ export class PlannerBridge {
         `planner_start: project ${shortProjectId(board.projectId)} is already running.`,
       );
     }
-    if (board.state === "paused") {
-      return this.replyMcpTextError(
-        reqId,
-        `planner_start: project ${shortProjectId(board.projectId)} is paused. Call planner_resume to continue.`,
-      );
-    }
     if (board.state === "done" || board.state === "failed") {
       return this.replyMcpTextError(
         reqId,
@@ -5252,35 +5263,29 @@ export class PlannerBridge {
     // fresh plan waiting for kickoff; stopped = user halted, in-flight
     // tasks already reverted to pending by runProjectStop. Both flow
     // through the same transition below.
-    if (board.state !== "ready" && board.state !== "stopped") {
+    if (board.state !== "ready" && board.state !== "stopped" && board.state !== "paused") {
       return this.replyMcpTextError(
         reqId,
         `planner_start: project ${shortProjectId(board.projectId)} is ${board.state}; not ready to start.`,
       );
     }
-    // Transition ready → running and kick off the scheduler. The
-    // live view isn't anchored to this tool call (the MCP invoke is
-    // request-response, not a held turn) — plan updates emit as
-    // session/updates regardless, and the user can run
-    // `/hydra planner continue` to open a held live view turn if
-    // they want.
-    const wasStopped = board.state === "stopped";
-    setBoardState(board, "running");
-    saveBoard(board, sessionId);
-    try {
-      await this.client.request("hydra-acp/transformer/attach", { sessionId });
-      attachedSessions.add(sessionId);
-    } catch (err) {
-      log.warn(`start (tool): transformer/attach failed: ${(err as Error).message}`);
+    // Transition ready/paused/stopped → running and kick off the
+    // scheduler. The live view isn't anchored to this tool call (the
+    // MCP invoke is request-response, not a held turn) — plan updates
+    // emit as session/updates regardless, and the user can run
+    // `/hydra planner continue` to open a held live view if they
+    // want.
+    const result = await this.resumeBoardToRunning(sessionId, board);
+    if (!result) {
+      return this.replyMcpTextError(reqId, `planner_start: project ${shortProjectId(board.projectId)} could not be resumed (unexpected state).`);
     }
-    void this.scheduleEligibleTasks(sessionId, board);
     // Inject /hydra planner continue at the head of the session's
     // queue so the TUI opens a held live view automatically. Without
     // this, the MCP tool call returns immediately and the TUI goes
     // idle even though workers are running. The continue command
     // picks up after the agent's current turn ends — natural timing.
     void this.injectContinueAtHead(sessionId);
-    const verb = wasStopped ? "Resumed" : "Kicked off";
+    const verb = result.resumedFrom === 'ready' ? 'Kicked off' : 'Resumed';
     const remaining = board.tasks.filter((t) => t.status !== "done").length;
     this.replyMcpResult(
       reqId,
