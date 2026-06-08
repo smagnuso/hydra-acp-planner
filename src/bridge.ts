@@ -264,23 +264,23 @@ export interface BridgeOptions {
 // imports this; it's a module-private singleton in practice.
 export const boards = new Map<string, Board>(); // orchestratorSessionId -> Board
 
-// Sessions we've successfully attached to via hydra-acp/transformer/attach
-// during this process lifetime. Best-effort: if the daemon restarted
+// Sessions we've successfully attached to (via transformer/attach for
+// orchestrators, or session/attach client mode for workers) during
+// this process lifetime. Best-effort: if the daemon restarted
 // the session or removed us from its chain, this set is wrong, but
 // there's no current way for the planner to know that without
 // querying. Used by `/hydra planner status` to report whether we
 // believe we're observing the session.
 export const attachedSessions = new Set<string>();
 
-// Sessions we've ALSO attached to as a peer client via session/attach
-// (in addition to transformer/attach above). Two roles, one WS
-// connection: transformer-attach plugs us into the chain so we can
-// intercept prompts and updates; session-attach makes us a peer
-// client so we can submit prompts via session/prompt (e.g. to
-// inject /hydra planner status after an amend, restoring the live
-// view at the head of the queue) and receive client broadcasts like
-// hydra-acp/prompt/amended. Mirrors the pattern slack-bridge uses
-// in [slack/src/acp/attach.ts].
+// Sessions we've attached to as a peer client via session/attach.
+// Two roles, one WS connection: transformer-attach (orchestrators)
+// plugs us into the chain so we can intercept prompts and updates;
+// session-attach makes us a peer client so we can submit prompts
+// via session/prompt (e.g. to inject /hydra planner status after an
+// amend, restoring the live view at the head of the queue) and
+// receive client broadcasts like hydra-acp/prompt/amended. Mirrors
+// the pattern slack-bridge uses in [slack/src/acp/attach.ts].
 export const clientAttachedSessions = new Set<string>();
 
 // Boards rehydrated from disk that we haven't yet been able to attach
@@ -734,8 +734,10 @@ export class PlannerBridge {
     }
   }
 
-  // Resurrect a cold worker session, then join its chain as a
-  // transformer. Returns true on full success.
+  // Resurrect a cold worker session and attach as a peer client.
+  // Returns true on success. Worker updates arrive via the
+  // session/update notification path (handled by
+  // handleWorkerSessionUpdate), not through transformer chain intercepts.
   //
   // Important: we do NOT call session/detach after session/load even
   // though session/load implicitly attached us as a client. Workers
@@ -746,12 +748,6 @@ export class PlannerBridge {
   // kill the freshly-resurrected agent — the next session/prompt
   // would fail with "connection is closed". Staying attached as a
   // client keeps attachedCount at 1, blocking the reaper.
-  //
-  // Side effect: the planner's WS receives session/update
-  // notifications as a client in addition to its chain intercepts.
-  // The intercept-side state machine is the source of truth; the
-  // duplicate client-side notifications are routed to
-  // handleNotification which ignores anything it doesn't care about.
   private async wakeAndAttachWorker(
     workerId: string,
     taskId: string,
@@ -763,17 +759,6 @@ export class PlannerBridge {
     } catch (err) {
       log.warn(
         `activate: session/load failed for ${label}: ${(err as Error).message}`,
-      );
-      return false;
-    }
-    try {
-      await this.client.request("hydra-acp/transformer/attach", {
-        sessionId: workerId,
-      });
-      attachedSessions.add(workerId);
-    } catch (err) {
-      log.warn(
-        `activate: transformer/attach failed for ${label}: ${(err as Error).message}`,
       );
       return false;
     }
@@ -2698,11 +2683,9 @@ export class PlannerBridge {
   }
 
   // Attach to a worker session as a regular ACP client so we receive
-  // agent→client broadcasts (notably session/request_permission). The
-  // planner already runs `transformer/attach` against the same session
-  // for chain visibility; this adds a parallel client attach over the
-  // same WebSocket. Best-effort: a failure here is logged but doesn't
-  // block worker dispatch — only permission forwarding is degraded.
+  // agent→client broadcasts (notably session/request_permission).
+  // Best-effort: a failure here is logged but doesn't block worker
+  // dispatch — only permission forwarding is degraded.
   private async attachAsClient(sessionId: string): Promise<void> {
     try {
       await this.client.request("session/attach", {
@@ -2712,11 +2695,85 @@ export class PlannerBridge {
         historyPolicy: "none",
         clientInfo: { name: PROCESS_NAME, version: "0.0.2" },
       });
+      attachedSessions.add(sessionId);
       log.debug(`session/attach (client) for worker …${sessionId.slice(-8)}`);
     } catch (err) {
       log.warn(
         `session/attach (client) for worker …${sessionId.slice(-8)} failed: ${(err as Error).message}; permission forwarding will be unavailable for this worker`,
       );
+    }
+  }
+
+  // Worker-update handler driven from the session/update notification path.
+  // Factor of handleUpdateResponse's worker branch — same accumulation +
+  // forwarding logic, but without this.client.reply() since notifications
+  // have no request id to reply to.
+  private handleWorkerSessionUpdate(sessionId: string, envelope: unknown): void {
+    const workerState = getWorkerState(sessionId);
+    if (!workerState) return;
+
+    const kind = updateKind(envelope);
+    const forwarder = workerForwarders.get(sessionId);
+    if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
+      let text = "";
+      if (kind === "agent_message_chunk") {
+        text = extractUpdateText(envelope);
+        if (text.length > 0) {
+          workerState.resultAccumulator += text;
+        }
+      } else {
+        const content = (envelope as { update?: { content?: { text?: unknown } } } | undefined)
+          ?.update?.content;
+        text = typeof content?.text === "string" ? content.text : "";
+      }
+      if (text.length > 0 && forwarder) {
+        const blockOpenerSeen = /```\s*hydra-result/.test(
+          workerState.resultAccumulator,
+        );
+        if (!blockOpenerSeen) {
+          forwarder.ingestText(text, kind);
+        }
+      }
+      return;
+    }
+    if (
+      kind === "usage_update" ||
+      kind === "session_info_update" ||
+      kind === "current_model_update"
+    ) {
+      const orchestratorId = orchestratorOfWorker(sessionId);
+      const board = orchestratorId ? boards.get(orchestratorId) : undefined;
+      const w = board ? board.workers[sessionId] : undefined;
+      if (board && orchestratorId && w) {
+        let changed = false;
+        if (kind === "usage_update") {
+          const usage = extractUsageUpdate(envelope);
+          if (usage) {
+            w.usage = { ...(w.usage ?? {}), ...usage };
+            changed = true;
+          }
+        } else if (kind === "session_info_update") {
+          const agentId = extractAgentIdUpdate(envelope);
+          if (agentId && agentId !== w.agent) {
+            w.agent = agentId;
+            changed = true;
+          }
+        } else if (kind === "current_model_update") {
+          const model = extractCurrentModelUpdate(envelope);
+          if (model && model !== w.model) {
+            w.model = model;
+            changed = true;
+          }
+        }
+        if (changed) saveBoard(board, orchestratorId);
+      }
+      return;
+    }
+    if (kind === "tool_call" || kind === "tool_call_update") {
+      if (forwarder) {
+        forwarder.ingestToolUpdate(kind, envelope);
+      }
+      return;
     }
   }
 
@@ -2802,103 +2859,6 @@ export class PlannerBridge {
           }
         }
       }
-    }
-
-    const workerState = getWorkerState(sessionId);
-    if (workerState) {
-      const kind = updateKind(envelope);
-      const forwarder = workerForwarders.get(sessionId);
-      if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
-        // Worker prose — whether the agent labels it message or
-        // thought — is forwarded to the orchestrator as a
-        // thought_chunk so the TUI renders it as muted/italic
-        // narration. In a worker context there's no human user the
-        // agent is "speaking to"; all of its prose is internal
-        // narration, so the thought affordance is semantically
-        // right and gives consistent rendering across agents
-        // (Claude emits thoughts, opencode emits messages, codex
-        // varies — users see them all the same way in the
-        // orchestrator). The original kind is preserved in _meta
-        // by WorkerForwarder so future TUI features can distinguish.
-        //
-        // Message chunks additionally accumulate into the worker's
-        // result buffer (hydra-result block parsing); thought
-        // chunks don't.
-        let text = "";
-        if (kind === "agent_message_chunk") {
-          text = extractUpdateText(envelope);
-          if (text.length > 0) {
-            workerState.resultAccumulator += text;
-          }
-        } else {
-          const content = (envelope as { update?: { content?: { text?: unknown } } } | undefined)
-            ?.update?.content;
-          text = typeof content?.text === "string" ? content.text : "";
-        }
-        // Once the worker's hydra-result fence opens, suppress
-        // further forwarding so the structured result block
-        // doesn't leak into the orchestrator transcript.
-        if (text.length > 0 && forwarder) {
-          const blockOpenerSeen = /```\s*hydra-result/.test(
-            workerState.resultAccumulator,
-          );
-          if (!blockOpenerSeen) {
-            forwarder.ingestText(text, kind);
-          }
-        }
-        this.client.reply(reqId, { action: "continue" });
-        return;
-      }
-      if (
-        kind === "usage_update" ||
-        kind === "session_info_update" ||
-        kind === "current_model_update"
-      ) {
-        const orchestratorId = orchestratorOfWorker(sessionId);
-        const board = orchestratorId ? boards.get(orchestratorId) : undefined;
-        const w = board ? board.workers[sessionId] : undefined;
-        if (board && orchestratorId && w) {
-          let changed = false;
-          if (kind === "usage_update") {
-            const usage = extractUsageUpdate(envelope);
-            if (usage) {
-              w.usage = { ...(w.usage ?? {}), ...usage };
-              changed = true;
-            }
-          } else if (kind === "session_info_update") {
-            const agentId = extractAgentIdUpdate(envelope);
-            if (agentId && agentId !== w.agent) {
-              w.agent = agentId;
-              changed = true;
-            }
-          } else if (kind === "current_model_update") {
-            const model = extractCurrentModelUpdate(envelope);
-            if (model && model !== w.model) {
-              w.model = model;
-              changed = true;
-            }
-          }
-          if (changed) saveBoard(board, orchestratorId);
-        }
-        this.client.reply(reqId, { action: "continue" });
-        return;
-      }
-      if (kind === "tool_call" || kind === "tool_call_update") {
-        // Tool updates are atomic — flush pending text first so
-        // order reads naturally, then forward the tool envelope
-        // with kind preserved. The TUI renders as a tool-call panel.
-        if (forwarder) {
-          forwarder.ingestToolUpdate(kind, envelope);
-        }
-        this.client.reply(reqId, { action: "continue" });
-        return;
-      }
-      // Other kinds (worker `plan` updates, mode changes, etc.) — not
-      // forwarded. The orchestrator owns the project-level plan
-      // panel; mode changes are session-local and irrelevant outside
-      // the worker.
-      this.client.reply(reqId, { action: "continue" });
-      return;
     }
 
     this.client.reply(reqId, { action: "continue" });
@@ -3212,22 +3172,7 @@ export class PlannerBridge {
       return;
     }
 
-    try {
-      await this.client.request("hydra-acp/transformer/attach", {
-        sessionId: childSessionId,
-      });
-      attachedSessions.add(childSessionId);
-    } catch (err) {
-      log.error(
-        `transformer/attach to worker ${childSessionId} failed: ${(err as Error).message}`,
-      );
-      void this.closeWorker(childSessionId);
-      task.status = "failed";
-      task.attemptCount += 1;
-      saveBoard(board, orchestratorSessionId);
-      return;
-    }
-    // Also attach as a regular ACP client so the daemon broadcasts
+    // Attach as a regular ACP client so the daemon broadcasts
     // agent→client requests (session/request_permission) to us. Failure
     // here is non-fatal — only permission forwarding is degraded.
     await this.attachAsClient(childSessionId);
@@ -4450,6 +4395,15 @@ export class PlannerBridge {
       this.handleCommandsCancel(sessionId, reason ?? "");
       return;
     }
+    if (note.method === "session/update") {
+      const params = (note.params ?? {}) as { sessionId?: string };
+      const sessionId = params.sessionId;
+      if (typeof sessionId === "string" && getWorkerState(sessionId)) {
+        this.handleWorkerSessionUpdate(sessionId, note.params);
+        return;
+      }
+    }
+
     log.debug(`unhandled notification: ${note.method}`);
   }
 
