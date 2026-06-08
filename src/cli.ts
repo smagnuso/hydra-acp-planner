@@ -163,8 +163,6 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
     process.stdout.write(JSON.stringify(board, null, 2) + "\n");
     return;
   }
-  process.stdout.write(`${shortProjectId(board.projectId)}  (${board.state})\n`);
-  process.stdout.write(`${board.description}\n\n`);
 
   // Show the orchestrator session this project lives in, so the user
   // can hydra-acp --session <id> to attach and chat with it.

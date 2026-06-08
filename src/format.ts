@@ -355,6 +355,7 @@ function applyStatusStyle(text: string, status: string): string {
 export function formatStatusBody(
   board: Board,
   orchestratorSessionId?: string,
+  attachedMarker?: string,
 ): string {
   const lines: string[] = [];
   const done = board.tasks.filter((t) => t.status === "done").length;
@@ -396,6 +397,9 @@ export function formatStatusBody(
     }
     if (compute > 0) parts.push(`task ${formatDurationMs(compute)}`);
     lines.push(`   Duration: ${parts.join(", ")}`);
+  }
+  if (attachedMarker) {
+    lines.push(attachedMarker);
   }
   if (board.tasks.length === 0) {
     return lines.join("\n");
@@ -459,10 +463,5 @@ export function formatStatus(
   attached: boolean,
   orchestratorSessionId?: string,
 ): string {
-  const body = formatStatusBody(board, orchestratorSessionId);
-  const lines = body.split("\n");
-  lines.push(
-    `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`,
-  );
-  return lines.join("\n");
+  return formatStatusBody(board, orchestratorSessionId, `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`);
 }

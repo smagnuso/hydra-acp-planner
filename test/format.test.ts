@@ -214,6 +214,43 @@ describe("formatStatus", () => {
     const out = formatStatus(board(), true);
     assert.doesNotMatch(out, /Sessions:/);
   });
+
+  it("places the Planner line before task list and Sessions header", () => {
+    const out = formatStatus(
+      board({
+        tasks: [task("T1", { status: "pending" })],
+        workers: { hydra_session_WORKER1: { currentTaskId: null, tasksCompleted: [] } },
+      }),
+      true,
+      "hydra_session_ORCHXXXXYYYY",
+    );
+    const lines = out.split("\n");
+    const plannerIdx = lines.findIndex((l) => l.startsWith("   Planner:"));
+    const taskLineIdx = lines.findIndex((l) => /\[ \] T1/.test(l));
+    const sessionsIdx = lines.findIndex((l) => l.startsWith("   Sessions:"));
+    assert.ok(plannerIdx >= 0, "should have a Planner line");
+    assert.ok(taskLineIdx >= 0, "should have a task line");
+    assert.ok(sessionsIdx >= 0, "should have a Sessions header");
+    assert.ok(
+      plannerIdx < taskLineIdx,
+      `Planner line (line ${plannerIdx}) must appear before task list (line ${taskLineIdx})`,
+    );
+    assert.ok(
+      plannerIdx < sessionsIdx,
+      `Planner line (line ${plannerIdx}) must appear before Sessions header (line ${sessionsIdx})`,
+    );
+  });
+
+  it("places the Planner line before task list when no Sessions table", () => {
+    const out = formatStatus(
+      board({ tasks: [task("T1", { status: "pending" })] }),
+      false,
+    );
+    const lines = out.split("\n");
+    const plannerIdx = lines.findIndex((l) => l.startsWith("   Planner:"));
+    const taskLineIdx = lines.findIndex((l) => /\[ \] T1/.test(l));
+    assert.ok(plannerIdx < taskLineIdx, `Planner line (line ${plannerIdx}) must appear before task list (line ${taskLineIdx})`);
+  });
 });
 
 describe("formatSessionsTable", () => {

@@ -2,7 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const bin = resolve(here, "..", "dist", "index.js");
@@ -54,5 +55,40 @@ describe("hydra-acp-planner CLI", () => {
     const r = spawnSync("node", [bin, "archive"], { encoding: "utf8" });
     assert.equal(r.status, 2);
     assert.match(r.stderr, /not implemented yet/);
+  });
+
+  it("info prints project id exactly once (no duplicate header)", () => {
+    const tmpHome = "/tmp/planner-test-home-" + Date.now();
+    const projId = "hydra_plan_smoketest1";
+    const projDir = join(tmpHome, ".hydra-acp", "planner", "projects", projId);
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(join(projDir, "board.json"), JSON.stringify({
+      version: 2,
+      projectId: projId,
+      description: "smoke test board for duplicate-header regression",
+      state: "running",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      fleetDefaults: { agent: null, model: null },
+      tasks: [],
+      workers: {},
+      concurrencyCap: 1,
+    }));
+    writeFileSync(join(projDir, "orchestrator"), "hydra_session_orch123\n");
+
+    const r = spawnSync("node", [bin, "info", projId], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: tmpHome },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+    // The short project id "smoketest1" must appear exactly once — the
+    // header from formatStatusBody. Before the fix (cli.ts:166-167) it
+    // appeared twice: once unindented from cli.ts, once indented from
+    // formatStatusBody.
+    const count = (r.stdout.match(/smoketest1/g) || []).length;
+    assert.equal(count, 1, `expected "smoketest1" to appear exactly once in output, found ${count}. Output:\n${r.stdout}`);
+
+    rmSync(tmpHome, { recursive: true, force: true });
   });
 });
