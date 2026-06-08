@@ -732,6 +732,17 @@ export class PlannerBridge {
         void this.resumeTask(orchestratorId, board, task, workerId);
       }
     }
+
+    // Kick the scheduler. Without this, a board rehydrated mid-flight
+    // can get stuck: e.g. a work task parked in awaiting_review with
+    // its review sitting `pending` (runOn=orchestrator) has no in-flight
+    // worker whose completion would call scheduleEligibleTasks. Same for
+    // any pending task whose deps are already satisfied at rehydrate
+    // time. Cheap and idempotent — guards inside scheduleEligibleTasks
+    // handle terminal/paused/decomposing boards correctly.
+    if (board.state === "running") {
+      void this.scheduleEligibleTasks(orchestratorId, board);
+    }
   }
 
   // Resurrect a cold worker session and attach as a peer client.
