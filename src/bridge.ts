@@ -3082,10 +3082,14 @@ export class PlannerBridge {
         if (runOn === "orchestrator") {
           const orchState = getOrchestratorState(orchestratorSessionId);
           if (orchState?.awaitingOrchestratorReview) {
-            // Single-flight: a review is already in progress. Leave
-            // this task pending and let the scheduler retry after
-            // the current review completes.
-            continue;
+            // Single-flight: a review is already in progress. We must
+            // RETURN, not `continue` — pickEligible is deterministic
+            // and would return this same task on the next loop pass,
+            // creating an infinite CPU-spinning loop. The in-flight
+            // review's completion path calls scheduleEligibleTasks
+            // again, which is when this pending review will get its
+            // chance.
+            return;
           }
           await this.runReviewOnOrchestrator(task, board, orchestratorSessionId);
           continue;
