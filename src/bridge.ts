@@ -3900,11 +3900,19 @@ export class PlannerBridge {
       `completed ${task.id}${isOrchestratorLane ? " (orchestrator)" : ` on worker …${workerSessionId.slice(-8)}`} — ${artifacts.summary}`,
     );
     this.emitPlanUpdate(orchestratorSessionId, board);
-    void this.emitSyntheticMessage(
-      orchestratorSessionId,
-      artifacts.summary ?? task.title,
-      { event: "task-completed", taskId: task.id },
-    );
+    // For review tasks, suppress the bare-summary message — it would
+    // render as a one-word "approve" / "reject" / etc. (the decision
+    // verb is the artifact summary, set by review normalizeResult).
+    // finishReview / handleReviewWinner emit a much nicer per-decision
+    // message like "review-T1 approved T1" right after, so the bare
+    // word would just be ugly noise immediately preceding it.
+    if (task.kind !== "review") {
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        artifacts.summary ?? task.title,
+        { event: "task-completed", taskId: task.id },
+      );
+    }
 
     if (!isOrchestratorLane) {
       this.endWorkerForward(workerSessionId, { flush: true });
