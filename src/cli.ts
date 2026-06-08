@@ -14,9 +14,8 @@ import {
   listProjects,
   loadBoard,
   shortProjectId,
-  shortSessionId,
 } from "./board.js";
-import { formatSessionsTable } from "./format.js";
+import { formatStatusBody } from "./format.js";
 import { orchestratorPointerPath, projectDir } from "./paths.js";
 
 function readVersion(): string {
@@ -149,45 +148,8 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   } catch {
     orchestratorSessionId = undefined;
   }
-  const doneCount = board.tasks.filter((t) => t.status === "done").length;
-  const inFlightCount = board.tasks.filter((t) => t.status === "assigned").length;
-  const reviewsPending = board.tasks.filter(
-    (t) => t.kind === "review" && (t.status === "pending" || t.status === "assigned"),
-  ).length;
-  const awaitingReview = board.tasks.filter((t) => t.status === "awaiting_review").length;
-  let taskLine = `Tasks: ${board.tasks.length} total, ${doneCount} done, ${inFlightCount} in flight`;
-  if (reviewsPending > 0 || awaitingReview > 0) {
-    const reviewParts: string[] = [];
-    if (reviewsPending > 0) reviewParts.push(`${reviewsPending} reviews pending`);
-    if (awaitingReview > 0) reviewParts.push(`${awaitingReview} awaiting review`);
-    taskLine += `, ${reviewParts.join(", ")}`;
-  }
-  process.stdout.write(taskLine + "\n");
-  process.stdout.write(`Concurrency cap: ${board.concurrencyCap}\n\n`);
 
-  const sessionsTable = formatSessionsTable(board, orchestratorSessionId, {
-    indent: "  ",
-  });
-  if (sessionsTable.length > 0) {
-    process.stdout.write("Sessions:\n");
-    process.stdout.write(sessionsTable + "\n\n");
-  }
-  if (board.tasks.length === 0) {
-    process.stdout.write("(no tasks yet)\n");
-    return;
-  }
-  const idW = Math.max(3, ...board.tasks.map((t) => t.id.length));
-  const stateW = Math.max(7, ...board.tasks.map((t) => t.status.length));
-  for (const t of board.tasks) {
-    const deps = t.deps.length === 0 ? "" : `  ← ${t.deps.join(", ")}`;
-    const worker =
-      t.status === "assigned" && t.assignedTo
-        ? `  → ${shortSessionId(t.assignedTo)}`
-        : "";
-    process.stdout.write(
-      `  ${t.id.padEnd(idW)}  ${t.status.padEnd(stateW)}  ${t.title}${deps}${worker}\n`,
-    );
-  }
+  process.stdout.write(formatStatusBody(board, orchestratorSessionId) + "\n");
 }
 
 function runRemove(projectId: string | undefined): void {

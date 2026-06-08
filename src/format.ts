@@ -348,16 +348,12 @@ function applyStatusStyle(text: string, status: string): string {
   return text;
 }
 
-// Render a board as the body of a `/hydra planner status` reply.
-// Multi-line plain text; gets emitted as a synthetic agent_message_chunk
-// by hydra's emitExtensionReply, so it lands cleanly in any client's
-// transcript renderer. The `attached` flag is the planner's
-// best-effort belief about whether it's currently in this session's
-// transformer chain — true if we've called transformer/attach this
-// process lifetime and haven't dropped it.
-export function formatStatus(
+// Render the body of a `/hydra planner status` reply, excluding the
+// attached-marker line. Multi-line plain text; gets emitted as a
+// synthetic agent_message_chunk by hydra's emitExtensionReply, so it
+// lands cleanly in any client's transcript renderer.
+export function formatStatusBody(
   board: Board,
-  attached: boolean,
   orchestratorSessionId?: string,
 ): string {
   const lines: string[] = [];
@@ -401,9 +397,6 @@ export function formatStatus(
     if (compute > 0) parts.push(`task ${formatDurationMs(compute)}`);
     lines.push(`   Duration: ${parts.join(", ")}`);
   }
-  lines.push(
-    `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`,
-  );
   if (board.tasks.length === 0) {
     return lines.join("\n");
   }
@@ -451,5 +444,25 @@ export function formatStatus(
     lines.push("   Sessions:");
     lines.push(sessionsTable);
   }
+  return lines.join("\n");
+}
+
+// Render a board as the body of a `/hydra planner status` reply.
+// Multi-line plain text; gets emitted as a synthetic agent_message_chunk
+// by hydra's emitExtensionReply, so it lands cleanly in any client's
+// transcript renderer. The `attached` flag is the planner's
+// best-effort belief about whether it's currently in this session's
+// transformer chain — true if we've called transformer/attach this
+// process lifetime and haven't dropped it.
+export function formatStatus(
+  board: Board,
+  attached: boolean,
+  orchestratorSessionId?: string,
+): string {
+  const body = formatStatusBody(board, orchestratorSessionId);
+  const lines = body.split("\n");
+  lines.push(
+    `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`,
+  );
   return lines.join("\n");
 }
