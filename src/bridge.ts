@@ -4400,61 +4400,88 @@ export class PlannerBridge {
       { event: "task-review-orchestrator", taskId: reviewTask.id },
     );
 
-    try {
-      await this.client.request("hydra-acp/message/emit", {
-        sessionId: orchestratorSessionId,
-        method: "session/prompt",
-        envelope: buildTextPromptEnvelope({
+    // Initial prompt + up to MAX_REPROMPTS reprompt attempts if the
+    // agent forgets the hydra-result block. Mirrors the worker-lane
+    // behavior in handleTaskComplete (`src/bridge.ts:3630`): chatty
+    // TUI agents commonly write the review in prose and forget the
+    // fence — without a reprompt, every such review parse-fails and
+    // auto-rejects, and the work task ends up in a bogus reject loop
+    // until it hits maxAttempts. The reprompt is cheap and surgical.
+    const MAX_REPROMPTS = 2;
+    let attempt = 0;
+    let result: NormalizedResult | undefined;
+    let accumulated = "";
+
+    while (true) {
+      try {
+        const text =
+          attempt === 0
+            ? promptsFor("review").buildPrompt(reviewTask, board)
+            : promptsFor("review").buildRepromptPrompt(reviewTask);
+        await this.client.request("hydra-acp/message/emit", {
           sessionId: orchestratorSessionId,
-          text: promptsFor("review").buildPrompt(reviewTask, board),
-        }),
-        route: "chain",
-      });
-    } catch (err) {
-      state.awaitingOrchestratorReview = false;
-      state.orchestratorReviewTaskId = null;
-      state.orchestratorReviewAccumulator = "";
-      if (this.isShutdownError(err)) {
-        log.info(
-          `orchestrator review ${reviewTask.id} aborted (shutdown); leaving as assigned for next-process resume`,
+          method: "session/prompt",
+          envelope: buildTextPromptEnvelope({
+            sessionId: orchestratorSessionId,
+            text,
+            ancillary: attempt > 0,
+          }),
+          route: "chain",
+        });
+      } catch (err) {
+        state.awaitingOrchestratorReview = false;
+        state.orchestratorReviewTaskId = null;
+        state.orchestratorReviewAccumulator = "";
+        if (this.isShutdownError(err)) {
+          log.info(
+            `orchestrator review ${reviewTask.id} aborted (shutdown); leaving as assigned for next-process resume`,
+          );
+          return;
+        }
+        log.error(
+          `orchestrator review turn for ${reviewTask.id} failed: ${(err as Error).message}`,
         );
+        reviewTask.status = "done";
+        reviewTask.finishedAt = nowIso();
+        reviewTask.assignedTo = null;
+        const failureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `orchestrator review failed: ${(err as Error).message}` };
+        reviewTask.artifacts = failureArtifacts as typeof reviewTask.artifacts;
+        const failureResult: NormalizedResult = { artifacts: failureArtifacts as TaskArtifacts, warnings: [] };
+        this.handleReviewComplete(reviewTask, board, orchestratorSessionId, failureResult);
+        void this.scheduleEligibleTasks(orchestratorSessionId, board);
         return;
       }
-      log.error(
-        `orchestrator review turn for ${reviewTask.id} failed: ${(err as Error).message}`,
+
+      accumulated = state.orchestratorReviewAccumulator;
+      const raw = promptsFor("review").extractResult(accumulated);
+      result = raw === undefined ? undefined : promptsFor("review").normalizeResult(raw);
+      if (result) break;
+
+      if (attempt >= MAX_REPROMPTS) {
+        log.warn(
+          `orchestrator review ${reviewTask.id}: missing or malformed review result after ${attempt + 1} attempt${attempt === 0 ? "" : "s"} (accumulator length=${accumulated.length})`,
+        );
+        break;
+      }
+      log.info(
+        `orchestrator review ${reviewTask.id}: missing hydra-result block, reprompting (attempt ${attempt + 1}/${MAX_REPROMPTS})`,
       );
-      // Treat failure as a rejection with the error message.
-      reviewTask.status = "done";
-      reviewTask.finishedAt = nowIso();
-      reviewTask.assignedTo = null;
-      const failureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `orchestrator review failed: ${(err as Error).message}` };
-      reviewTask.artifacts = failureArtifacts as typeof reviewTask.artifacts;
-      const failureResult: NormalizedResult = { artifacts: failureArtifacts as TaskArtifacts, warnings: [] };
-      this.handleReviewComplete(reviewTask, board, orchestratorSessionId, failureResult);
-      void this.scheduleEligibleTasks(orchestratorSessionId, board);
-      return;
+      // Clear accumulator before reprompt so the next turn's text is
+      // what we parse — don't append on top of the prior prose-only reply.
+      state.orchestratorReviewAccumulator = "";
+      attempt += 1;
     }
 
-    // The emit promise resolved — the agent's turn is complete. Parse the
-    // accumulated reply as a review result and process it.
     state.awaitingOrchestratorReview = false;
-    const accumulated = state.orchestratorReviewAccumulator;
     state.orchestratorReviewTaskId = null;
     state.orchestratorReviewAccumulator = "";
 
-    const raw = promptsFor("review").extractResult(accumulated);
-    const result = raw === undefined ? undefined : promptsFor("review").normalizeResult(raw);
-
     let effectiveResult: NormalizedResult | undefined = result;
     if (!result) {
-      log.warn(
-        `orchestrator review ${reviewTask.id}: missing or malformed review result (accumulator length=${accumulated.length})`,
-      );
-      // Treat parse failure as a rejection.
       reviewTask.status = "done";
       reviewTask.finishedAt = nowIso();
       reviewTask.assignedTo = null;
-      const parseFailureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `missing or malformed review result` };
+      const parseFailureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `missing or malformed review result after ${MAX_REPROMPTS + 1} attempts` };
       reviewTask.artifacts = parseFailureArtifacts as typeof reviewTask.artifacts;
       effectiveResult = { artifacts: parseFailureArtifacts as TaskArtifacts, warnings: [] };
     } else {

@@ -43,6 +43,61 @@ The block MUST appear at the very end of your reply, after any other prose,
 code blocks, or tool-call output. If you cannot complete the task, still
 emit the block and explain what blocked you in \`summary\`.`;
 
+const REVIEW_SYSTEM = `You are a reviewer agent on a multi-agent coding project. You have been given one completed work task to review. Examine the work, decide whether it meets the spec, then end your message with a structured \`hydra-result\` block recording your decision. The planner CANNOT proceed without that block.`;
+
+// Trailing instructions for the single-reviewee review prompt. This is
+// the last thing the reviewer sees before its turn — placed at the
+// bottom (not mixed in with general result instructions) because chatty
+// TUI agents that write long prose reviews often forget to emit the
+// structured block. Repeating the schema here, after all the review
+// guidance, makes "emit the fence" the freshest instruction in context.
+const REVIEW_RESULT_INSTRUCTIONS = `## How to respond
+
+**THE FINAL CONTENT OF YOUR REPLY MUST BE A \`hydra-result\` BLOCK.** Without
+it the planner cannot record your decision and the work task will be
+re-run from scratch — your review is wasted.
+
+Write whatever prose / evidence-citing you need first, then end with:
+
+\`\`\`hydra-result
+{
+  "decision":   "approve|reject|amend|fix",
+  "notes":      "your reasoning, citing specific evidence from verified_diff",
+  "follow_ups": ["optional: any deferred work to capture (amend only)"],
+  "applied":    true
+}
+\`\`\`
+
+(\`follow_ups\` and \`applied\` are optional. \`applied: true\` is for the
+\`fix\` decision when you've made the corrections yourself this turn.)
+
+This block MUST be the literal last thing in your reply — after any prose,
+tool-call output, or code samples. The fence must be exactly \`\`\`hydra-result
+(not \`\`\`json, not unfenced JSON). The planner parses this fence; nothing
+else.`;
+
+const REVIEW_RESULT_INSTRUCTIONS_COMPETITION = `## How to respond
+
+**THE FINAL CONTENT OF YOUR REPLY MUST BE A \`hydra-result\` BLOCK.** Without
+it the planner cannot record your verdict and the competition is wasted.
+
+Write whatever prose / per-candidate analysis you need first, then end with:
+
+\`\`\`hydra-result
+{
+  "decision": "winner|synthesize",
+  "winner":   "Tx",
+  "notes":    "specific evidence-cited reasoning"
+}
+\`\`\`
+
+(\`winner\` is required for \`decision: "winner"\`; omit for \`synthesize\`.)
+
+This block MUST be the literal last thing in your reply — after any prose,
+tool-call output, or code samples. The fence must be exactly \`\`\`hydra-result
+(not \`\`\`json, not unfenced JSON). The planner parses this fence; nothing
+else.`;
+
 // Render project-level attachments (--attach files) as a context
 // block. Each file's path is shown so the worker knows what it is,
 // followed by its full contents. Returns "" when there are no
@@ -230,7 +285,7 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
   review: {
     buildPrompt(task: Task, board: Board): string {
       const parts: string[] = [];
-      parts.push(TASK_SYSTEM);
+      parts.push(REVIEW_SYSTEM);
       parts.push("");
       parts.push("## Task");
       parts.push(`**${task.id} — ${task.title}**`);
@@ -254,8 +309,6 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       parts.push("");
       parts.push("## Context from completed dependencies");
       parts.push(formatDependencyContext(task, board));
-      parts.push("");
-      parts.push(RESULT_INSTRUCTIONS);
       parts.push("");
       const isCompetition = Array.isArray(task.reviews) && task.reviews.length > 1;
       if (isCompetition) {
@@ -284,6 +337,8 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
           parts.push(`### ${rev.id} — ${rev.title}`);
           parts.push(JSON.stringify(rev.artifacts, null, 2));
         }
+        parts.push("");
+        parts.push(REVIEW_RESULT_INSTRUCTIONS_COMPETITION);
         return parts.join("\n");
       }
       parts.push(
@@ -304,6 +359,8 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         ``,
         `Your \`notes\` must reference concrete evidence from \`verified_diff\` (or the full diff fetch). Generic praise without code-specific reasoning means you didn't do the review.`,
       );
+      parts.push("");
+      parts.push(REVIEW_RESULT_INSTRUCTIONS);
       return parts.join("\n");
     },
 
