@@ -37,7 +37,7 @@ function printHelp(): void {
       "",
       "Usage:",
       "  hydra-acp planner [list]              List active projects (--all includes done/failed)",
-      "  hydra-acp planner info <projectId>    Show one project's board",
+      "  hydra-acp planner info [projectId]    Show one project's board (defaults to the sole active project)",
       "  hydra-acp planner remove <projectId>  Delete a project (closes worker sessions; orchestrator session untouched)",
       "  hydra-acp planner --version",
       "  hydra-acp planner --help",
@@ -121,8 +121,37 @@ function runList(argv: readonly string[]): void {
 
 function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   if (!projectId) {
-    process.stderr.write("hydra-acp-planner info: requires a projectId\n");
-    process.exit(2);
+    // No id given: prefer the sole running project. If there's exactly
+    // one of those, use it. Otherwise fall back to "the only non-terminal
+    // project" (covers single paused/stopped case). Only error when the
+    // choice is genuinely ambiguous.
+    const all = listProjects();
+    const running = all.filter((p) => p.state === "running");
+    const nonTerminal = all.filter((p) => p.state !== "done" && p.state !== "failed");
+    let pick: typeof all[number] | undefined;
+    if (running.length === 1) {
+      pick = running[0];
+    } else if (running.length === 0 && nonTerminal.length === 1) {
+      pick = nonTerminal[0];
+    }
+    if (pick) {
+      projectId = pick.projectId;
+    } else if (nonTerminal.length === 0) {
+      process.stderr.write(
+        "hydra-acp-planner info: no active projects (pass a projectId, or `planner list --all` to see terminal ones)\n",
+      );
+      process.exit(2);
+    } else {
+      const candidates = running.length > 1 ? running : nonTerminal;
+      const label = running.length > 1 ? "running" : "active";
+      process.stderr.write(
+        `hydra-acp-planner info: ${candidates.length} ${label} projects — specify which:\n`,
+      );
+      for (const p of candidates) {
+        process.stderr.write(`  ${shortProjectId(p.projectId)}  ${p.state}  ${p.description}\n`);
+      }
+      process.exit(2);
+    }
   }
   const canonical = canonicalProjectId(projectId);
   const board = loadBoard(canonical);
