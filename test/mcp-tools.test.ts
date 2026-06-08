@@ -128,7 +128,7 @@ function dispatch(req: ReturnType<typeof mkInvoke>) {
 }
 
 // Seed a ready-state board into memory + disk so tests for tools that
-// require a board (get_plan, get_status, execute, pause, etc.) have
+// require a board (get_plan, get_status, start, pause, etc.) have
 // something to operate on. Tasks are simple T1 / T2 with no deps.
 function seedBoard(
   sessionId: string,
@@ -309,7 +309,7 @@ describe("planner_set_plan", () => {
       content: Array<{ text: string }>;
       structuredContent: { taskCount: number; concurrencyCap: number; projectId: string };
     };
-    assert.match(result.content[0]!.text, /Saved 2 tasks .* Call planner_execute when ready/);
+    assert.match(result.content[0]!.text, /Saved 2 tasks .* Call planner_start when ready/);
     assert.equal(result.structuredContent.taskCount, 2);
     assert.equal(result.structuredContent.concurrencyCap, 3);
     assert.equal(result.structuredContent.projectId, board!.projectId);
@@ -399,11 +399,11 @@ describe("planner_set_plan", () => {
   });
 });
 
-// ── planner_execute ────────────────────────────────────────────────
+// ── planner_start ────────────────────────────────────────────────
 
-describe("planner_execute", () => {
+describe("planner_start", () => {
   it("errors when no plan exists on the session", async () => {
-    dispatch(mkInvoke(30, "planner_execute", {}));
+    dispatch(mkInvoke(30, "planner_start", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -422,7 +422,7 @@ describe("planner_execute", () => {
     for (const c of cases) {
       boards.clear();
       seedBoard("hydra_session_test", { state: c.state });
-      dispatch(mkInvoke(id++, "planner_execute", {}));
+      dispatch(mkInvoke(id++, "planner_start", {}));
       await settle();
       const r = client.lastReply();
       const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -439,7 +439,7 @@ describe("planner_execute", () => {
       state: "ready",
       tasks: [{ id: "T1", title: "blocked", status: "blocked" }],
     });
-    dispatch(mkInvoke(35, "planner_execute", {}));
+    dispatch(mkInvoke(35, "planner_start", {}));
     await settle();
     const board = boards.get("hydra_session_test")!;
     assert.equal(board.state, "running");
@@ -465,7 +465,7 @@ describe("planner_execute", () => {
         { id: "T3", title: "blocked", status: "blocked" },
       ],
     });
-    dispatch(mkInvoke(37, "planner_execute", {}));
+    dispatch(mkInvoke(37, "planner_start", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "running");
     const r = client.lastReply();
@@ -484,7 +484,7 @@ describe("planner_execute", () => {
       state: "ready",
       tasks: [{ id: "T1", title: "blocked", status: "blocked" }],
     });
-    dispatch(mkInvoke(36, "planner_execute", {}));
+    dispatch(mkInvoke(36, "planner_start", {}));
     await settle();
     // session/attach is required before session/prompt — verify the
     // lazy attach happened.
@@ -727,7 +727,7 @@ describe("planner_resume", () => {
     dispatch(mkInvoke(91, "planner_resume", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "running");
-    // Same live-view inject as execute — resume also kicks workers,
+    // Same live-view inject as start — resume also kicks workers,
     // so the TUI should go busy.
     const continuePrompt = client.requestsFor("session/prompt").find((r) => {
       const p = r.params as { prompt?: Array<{ text?: string }> };

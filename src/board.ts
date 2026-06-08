@@ -29,7 +29,7 @@ export type TaskStatus =
 //   * decomposing: asked the agent to break the description into a
 //     DAG; awaiting the response.
 //   * ready: decomposition done, plan rendered to the user. No workers
-//     spawned. Awaiting a `/hydra planner execute` call to kick off.
+//     spawned. Awaiting a `/hydra planner start` call to kick off.
 //     This is the resting state after `create`.
 //   * running: scheduler is dispatching workers and reaping completions.
 //   * paused: scheduling halted by the user; in-flight workers run
@@ -38,16 +38,16 @@ export type TaskStatus =
 //   * failed: every task is in a terminal status, at least one failed
 //     (including user-cancel).
 //
-// `create` produces a `ready` board (decompose + show, no execute).
-// `execute` finds the ready board and transitions it to running, OR
+// `create` produces a `ready` board (decompose + show, no start).
+// `start` finds the ready board and transitions it to running, OR
 // decomposes-from-conversation when no board exists and runs in one
-// step (the original execute behavior).
+// step (the original start behavior).
 export type BoardState =
   | "decomposing"
   | "ready"
   | "running"
   | "paused"
-  | "stopped" // user-initiated halt; resumable via execute/set_plan. Workers killed; in-flight tasks reverted to pending.
+  | "stopped" // user-initiated halt; resumable via start/set_plan. Workers killed; in-flight tasks reverted to pending.
   | "done"
   | "failed"; // hard failure (e.g. worker failed to launch); distinct from user stop. NOT auto-resumable.
 
@@ -150,7 +150,7 @@ export function resolveRunOn(task: Task, fleetDefaults: FleetDefaults): "orchest
   return "orchestrator";
 }
 
-// Project-level attachments supplied by the user at create/execute
+// Project-level attachments supplied by the user at create/start
 // time via `--attach <path>` (repeatable). Each entry holds the
 // resolved path (for display) and the file contents read at command
 // time. Inlined into every task's prompt by the prompt builders so
@@ -197,21 +197,21 @@ export interface Board {
   concurrencyCapLocked?: boolean;
   // Determines what finishDecomposition does once parsing completes:
   //   - `true`: transition state to `running` and start scheduling
-  //     workers. The execute verb sets this (decompose-from-
+  //     workers. The start verb sets this (decompose-from-
   //     conversation flow), as does anything else that wants the
   //     project to begin running immediately after decomposition.
   //   - `false` / unset: transition state to `ready`, emit the plan
-  //     panel and a "run execute to start" message, and stop.
+  //     panel and a "run start to begin" message, and stop.
   //     This is what `create` does: form the plan, show it, and
   //     wait for the user to opt into kickoff via `/hydra planner
-  //     execute` once they've reviewed (and optionally re-issued
+  //     start` once they've reviewed (and optionally re-issued
   //     `/hydra planner create` to revise).
   // Persisted so a daemon restart mid-decomposition preserves the
   // user's original intent.
   pendingExecute?: boolean;
   // When true, the decomposer system prompt includes competition
   // pattern instructions (N sibling work tasks + a review task that
-  // picks a winner). Set by the --compete CLI flag on create/execute.
+  // picks a winner). Set by the --compete CLI flag on create/start.
   compete?: boolean;
   // Last-observed usage_update snapshot for the orchestrator session
   // itself. Captured the same way as worker usage; rendered on the
@@ -223,7 +223,7 @@ export interface Board {
   orchestratorAgent?: string | null;
   orchestratorModel?: string | null;
   // Accumulated wall-clock time the project has spent in the `running`
-  // state across all execute/retry cycles. Excludes time spent in
+  // state across all start/retry cycles. Excludes time spent in
   // `ready`, `decomposing` (initial plan + amends), `paused`, and
   // `stopped`. Updated only when transitioning OUT of `running` via
   // setBoardState; the live "currently running" delta is added on top

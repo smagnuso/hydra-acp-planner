@@ -110,7 +110,7 @@ export function buildDecompositionPrompt(
   return `${DECOMPOSITION_SYSTEM}${tail}${competeBlock}\n\nProject to decompose:\n${description}`;
 }
 
-// Variant of buildDecompositionPrompt used by `/hydra planner execute`:
+// Variant of buildDecompositionPrompt used by `/hydra planner start`:
 // instead of taking a verbatim project description, asks the agent to
 // decompose the project it has been discussing with the user in the
 // current conversation, and to include a `description` field
@@ -199,7 +199,7 @@ export interface DecompositionResult {
   tasks: Task[];
   warnings: string[];
   // Optional summary of the project the agent decomposed. Populated only
-  // by the `execute` path, where the user didn't supply a description
+  // by the `start` path, where the user didn't supply a description
   // up front — the agent emits one in the JSON block and we use it as
   // the board's description.
   description?: string;

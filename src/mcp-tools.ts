@@ -38,7 +38,7 @@ Workflow:
      the DAG and call planner_set_plan again. The new plan replaces \
      the old draft.
 
-  5. When the user agrees, call planner_execute to kick off workers.
+  5. When the user agrees, call planner_start to kick off workers.
 
   6. While running, call planner_get_status when the user asks \
      about progress, planner_add_task to slot in mid-flight \
@@ -52,7 +52,7 @@ worker count, fleetDefaults for session-wide preferences, per-task \
 agent/model for specific overrides. Never silently override what \
 the user requested.
 
-Never call planner_execute without the user's explicit go-ahead.\
+Never call planner_start without the user's explicit go-ahead.\
 `;
 
 export interface PlannerMcpTool {
@@ -74,7 +74,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "planner_set_plan",
     description:
-      "Persist a task DAG as a ready plan for this session. Replaces any existing ready plan. Use this when the user has settled on what they want built, or wants to revise a draft. Returns a summary the user-facing turn can narrate. Does NOT start execution — call planner_execute separately when the user agrees.",
+      "Persist a task DAG as a ready plan for this session. Replaces any existing ready plan. Use this when the user has settled on what they want built, or wants to revise a draft. Returns a summary the user-facing turn can narrate. Does NOT start execution — call planner_start separately when the user agrees.",
     inputSchema: {
       type: "object",
       required: ["description", "tasks"],
@@ -176,7 +176,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_execute",
+    name: "planner_start",
     description:
       "Kick off the ready plan on this session. If no ready plan exists, fails with a hint to call planner_set_plan first. Returns when the worker scheduler is started — progress is observable via subsequent planner_get_status calls or via the live plan rendering in the orchestrator's turn.",
     inputSchema: {
@@ -218,9 +218,18 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
+    name: "planner_restart",
+    description:
+      "Reset every task on the board to pending and run the whole plan from scratch. Closes any in-flight workers, clears artifacts and reviewFeedback, and re-engages the scheduler. The plan structure (titles, deps, agents, reviews) stays intact — only per-task runtime state is wiped. Use when the user wants to redo a project end-to-end after the source tree has changed underneath the plan (e.g. stashed/applied a patch).",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
     name: "planner_stop",
     description:
-      "Stop the running project. Force-cancels in-flight workers and reverts those tasks to pending; the project moves to state 'stopped' and is resumable via planner_execute. Use when the user wants to halt work but might come back to it. Distinct from planner_remove (which deletes the project) and planner_pause (which lets in-flight workers finish).",
+      "Stop the running project. Force-cancels in-flight workers and reverts those tasks to pending; the project moves to state 'stopped' and is resumable via planner_start. Use when the user wants to halt work but might come back to it. Distinct from planner_remove (which deletes the project) and planner_pause (which lets in-flight workers finish).",
     inputSchema: {
       type: "object",
       properties: {},

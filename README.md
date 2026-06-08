@@ -162,10 +162,10 @@ daemon connect time so they show up in tab-complete.
 
 | Command                                              | Effect |
 |------------------------------------------------------|--------|
-| `/hydra planner create [flags] <description>`        | **Form a plan** from `<description>`. Asks the host agent to decompose into a task DAG, shows you the plan, and stops — no workers spawned. Review the plan; iterate by running `create` again with a revised description; commit by running `execute` when you're satisfied. See **flags** below. |
-| `/hydra planner execute [flags]`                     | **Run the plan.** If a `create` plan is already ready on this session, kick it off (transition to running, spawn workers, open the live view). If there's no plan yet, decompose from the current conversation and run in one step (the original execute behavior). |
+| `/hydra planner create [flags] <description>`        | **Form a plan** from `<description>`. Asks the host agent to decompose into a task DAG, shows you the plan, and stops — no workers spawned. Review the plan; iterate by running `create` again with a revised description; commit by running `start` when you're satisfied. See **flags** below. |
+| `/hydra planner start [flags]`                     | **Run the plan.** If a `create` plan is already ready on this session, kick it off (transition to running, spawn workers, open the live view). If there's no plan yet, decompose from the current conversation and run in one step (the original start behavior). |
 | `/hydra planner status`                              | One-shot snapshot of the current session's board (tasks, states, worker assignments). Doesn't open the live view — safe to type anytime without affecting an in-flight project. |
-| `/hydra planner continue`                            | Open the live view on this session's running project. Plan panel re-renders, worker output streams, banner stays busy until the project completes (or the user amends/cancels). Used both manually and auto-injected by the planner after every amend on `create`/`execute`/`continue`. |
+| `/hydra planner continue`                            | Open the live view on this session's running project. Plan panel re-renders, worker output streams, banner stays busy until the project completes (or the user amends/cancels). Used both manually and auto-injected by the planner after every amend on `create`/`start`/`continue`. |
 | `/hydra planner add <description>`                   | Slot a new task into the current project. Asks the orchestrator agent where it fits in the DAG; appends and schedules. |
 | `/hydra planner retry [<taskId>]`                    | Reset a task to pending and resume work. Closes its current worker (if any), bumps `attemptCount`. If the project was `stopped`, also flips it back to running and re-opens the live view. With no arg, retries every failed task. |
 | `/hydra planner skip <taskId>`                       | Mark a task done without running it (artifacts: `skipped by user`). Frees its worker. |
@@ -175,7 +175,7 @@ daemon connect time so they show up in tab-complete.
 | `/hydra planner cancel [<projectId>]`                | Force-stop the current session's project (or another by id). Cancels in-flight workers via `force_cancel`; pending tasks freeze on the board; sessions are kept for inspection. |
 | `/hydra planner remove [<projectId>]`                | Delete the current session's project (or another by id) and close its worker sessions. The orchestrator session is left intact. |
 
-### `create` / `execute` flags
+### `create` / `start` flags
 
 Both commands accept a few leading flags that override fleet defaults
 for the spawned workers:
@@ -193,7 +193,7 @@ Examples:
 /hydra planner create --workers 5 build a todo app with auth
 /hydra planner create --agent codex --model gpt-5 implement the spec in SPEC.md
 /hydra planner create --attach ~/.claude/plans/review-gates.md implement the review-gates plan
-/hydra planner execute --workers 2
+/hydra planner start --workers 2
 ```
 
 ### Natural-language Q&A on a board
@@ -211,27 +211,27 @@ preamble. That means you can ask things like:
 …and the agent answers using the board it can see, without needing
 MCP tools. Slash commands (`/hydra …`) are unaffected.
 
-### Workflow: form a plan, then execute
+### Workflow: form a plan, then start
 
 Project lifecycle is two-phase:
 
 1. **Form** with `/hydra planner create <description>`. The planner asks the agent to decompose into a task DAG, saves the plan to disk, shows it to you, and stops. No workers spawned yet. State: `ready`. Revise by running `create` again with a different description — the previous ready plan is replaced.
-2. **Run** with `/hydra planner execute`. Transitions the ready plan to `running`, spawns workers, opens the live view. Banner busy until the project completes.
+2. **Run** with `/hydra planner start`. Transitions the ready plan to `running`, spawns workers, opens the live view. Banner busy until the project completes.
 
-If you skip step 1 and just run `/hydra planner execute` on a fresh session, the planner decomposes from the current conversation and kicks off in one step (the original single-shot behavior).
+If you skip step 1 and just run `/hydra planner start` on a fresh session, the planner decomposes from the current conversation and kicks off in one step (the original single-shot behavior).
 
 ```text
 > /hydra planner create build a Python web scraper
    (decomposes; plan panel shows; turn ends)
    ...you read the plan, decide it looks good...
 
-> /hydra planner execute
+> /hydra planner start
    (workers start, live view engages, banner stays busy)
 ```
 
 ### Live view, yield, and re-acquire
 
-`/hydra planner create` and `/hydra planner execute` open a **held
+`/hydra planner create` and `/hydra planner start` open a **held
 turn** on your session — your slash command stays in flight in
 hydra's queue, plan updates and worker output stream into it, and
 the busy indicator stays on for the project's lifetime.
@@ -354,7 +354,7 @@ Examples:
 
 ```text
 /hydra planner create --review-policy all --compete true build a todo app with auth
-/hydra planner execute --review-run-on worker --review-agent code-reviewer
+/hydra planner start --review-run-on worker --review-agent code-reviewer
 ```
 
 ## CLI
@@ -435,7 +435,7 @@ npm run watch   # rebuild on change
 
 ## Status
 
-In active development. Functional for create/execute/status/add/skip/
+In active development. Functional for create/start/status/add/skip/
 retry/kill/pause/resume/cancel/remove flows with worker spawning,
 dependency-aware scheduling, and restart-rehydration. Rough edges
 around long-tail error cases; open issues at the project repo.

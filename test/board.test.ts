@@ -130,7 +130,7 @@ describe("newBoard", () => {
   });
 
   it("pendingExecute flag persists across save/load", () => {
-    // create sets pendingExecute=false; execute sets true. The flag
+    // create sets pendingExecute=false; start sets true. The flag
     // drives whether finishDecomposition kicks off scheduling or
     // stops at ready. Crash safety: the flag must survive disk
     // round-trip so a daemon restart mid-decomposition resumes with

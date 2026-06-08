@@ -1,6 +1,6 @@
 // Held-turn lifecycle for the orchestrator session.
 //
-// The planner's create/execute slash commands hold their `commands/invoke`
+// The planner's create/start slash commands hold their `commands/invoke`
 // reply open for the entire project lifetime, not just the decomposition
 // turn. That keeps the user's slash-command turn in flight in hydra's
 // queue, which:
@@ -48,12 +48,12 @@ export interface HeldTurnResolution {
 // continue` so the live view re-engages after the user's amended
 // turn finishes. `/hydra planner status` is a one-shot snapshot
 // that doesn't open a held turn, so it's not in this enum.
-export type HeldTurnVerb = "create" | "execute" | "continue" | "retry";
+export type HeldTurnVerb = "create" | "start" | "continue" | "retry" | "restart";
 
 export interface HeldTurn {
   orchestratorSessionId: string;
   projectId: string;
-  // The commands/invoke reqId that handleCreate / handleExecute is
+  // The commands/invoke reqId that handleCreate / handleStart is
   // holding. We reply to it when the project terminates.
   commandsInvokeReqId: number | string;
   // The slash command's user-prompt queue entry messageId — passed
