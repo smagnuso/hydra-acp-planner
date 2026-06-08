@@ -186,20 +186,34 @@ export function formatSessionsTable(
     const orchAgentCell = oa || om
       ? (oa && om ? `${oa}·${om}` : (oa ?? om ?? "-"))
       : "-";
+    // The orchestrator session does double duty: it's the user's chat
+    // session AND it runs orchestrator-lane reviews (runOn="orchestrator",
+    // single-flight). Reflect the review-lane activity in the row so it
+    // doesn't read as idle when reviews are actually running on it.
+    const orchLaneReviews = board.tasks.filter(
+      (t) => t.kind === "review" && t.assignedTo === "orchestrator",
+    );
+    const orchReviewDone = board.tasks.filter(
+      (t) => t.kind === "review" && t.status === "done",
+    ).length;
+    const orchReviewTotal = board.tasks.filter(
+      (t) => t.kind === "review",
+    ).length;
+    const inFlight = orchLaneReviews.find((t) => t.status === "assigned");
     rows.push({
       role: "orchestrator",
       session: shortSessionId(orchestratorSessionId),
-      task: "-",
-      state: board.state,
+      task: inFlight?.id ?? "-",
+      state: inFlight?.status ?? board.state,
       agent: orchAgentCell,
-      done: "-",
+      done: orchReviewTotal > 0 ? `${orchReviewDone}/${orchReviewTotal} reviews` : "-",
       cost: formatCost(ou?.costAmount, ou?.costCurrency),
       tokens: ou?.used !== undefined
         ? (ou.size !== undefined
             ? `${formatTokens(ou.used)}/${formatTokens(ou.size)}`
             : formatTokens(ou.used))
         : "-",
-      title: board.description,
+      title: inFlight?.title ?? board.description,
     });
   }
 
