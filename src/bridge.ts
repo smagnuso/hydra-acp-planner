@@ -70,7 +70,9 @@ import {
 } from "./held-turn.js";
 import { WorkerForwarder } from "./worker-forward.js";
 import { PLANNER_MCP_INSTRUCTIONS, PLANNER_MCP_TOOLS } from "./mcp-tools.js";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve as resolvePath } from "node:path";
 import {
   allTerminal,
   canonicalProjectId,
@@ -169,8 +171,8 @@ const COMMANDS = [
   },
   {
     verb: "create",
-    argsHint: "<description>",
-    description: "Plan a new project from a description and spawn workers (M2+).",
+    argsHint: "[--attach <path>] <description>",
+    description: "Plan a new project from a description and spawn workers (M2+). Use `--attach <path>` (repeatable) to inline a spec/plan file into every worker prompt — useful when workers don't have permission to read it themselves.",
   },
   {
     verb: "status",
@@ -207,8 +209,8 @@ const COMMANDS = [
   },
   {
     verb: "execute",
-    argsHint: "[--workers N] [--agent ID] [--model ID]",
-    description: "Plan from the conversation so far. Asks the orchestrator agent to decompose what you've been discussing into a task DAG and spawns workers.",
+    argsHint: "[--workers N] [--agent ID] [--model ID] [--attach <path>]",
+    description: "Plan from the conversation so far. Asks the orchestrator agent to decompose what you've been discussing into a task DAG and spawns workers. Use `--attach <path>` (repeatable) to inline a spec/plan file into every worker prompt.",
   },
   {
     verb: "pause",
@@ -325,6 +327,28 @@ function orchestratorSessionForProject(projectId: string): string | undefined {
 
 // Formatters moved to ./format.ts for unit-testability without
 // dragging in the PlannerBridge constructor and its WS connection.
+
+// Resolve a list of `--attach <path>` values into Attachment records.
+// Tilde-expands `~/...`, then resolves relative paths against the
+// daemon's cwd. Reads the file synchronously (these are user-supplied
+// at command time — we want to fail loudly before decomposition
+// starts rather than crash a worker mid-task). Returns a list of
+// Attachment records on success, or an error string on the first
+// path that fails to resolve or read.
+function loadAttachments(paths: string[]): { attachments: import("./board.js").Attachment[] } | { error: string } {
+  const out: import("./board.js").Attachment[] = [];
+  for (const raw of paths) {
+    const expanded = raw.startsWith("~/") ? `${homedir()}${raw.slice(1)}` : raw;
+    const absolute = resolvePath(expanded);
+    try {
+      const content = readFileSync(absolute, "utf8");
+      out.push({ path: absolute, content });
+    } catch (err) {
+      return { error: `--attach ${raw}: ${(err as Error).message}` };
+    }
+  }
+  return { attachments: out };
+}
 
 export class PlannerBridge {
   private client: BridgeClient;
@@ -1658,7 +1682,8 @@ export class PlannerBridge {
     let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
     let overrideHint: boolean | undefined;
     let compete = false;
-    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete)\s+(\S+)\s*/;
+    const attachPaths: string[] = [];
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete|attach)\s+(\S+)\s*/;
     while (true) {
       const m = descRemaining.match(flagRe);
       if (!m) break;
@@ -1691,12 +1716,19 @@ export class PlannerBridge {
         overrideHint = value === "true";
       } else if (key === "compete") {
         compete = value === "true";
+      } else if (key === "attach") {
+        attachPaths.push(value);
       }
       descRemaining = descRemaining.slice(m[0].length);
     }
+    const attachResult = loadAttachments(attachPaths);
+    if ("error" in attachResult) {
+      this.client.reply(reqId, { text: `planner create: ${attachResult.error}` });
+      return;
+    }
     if (!descRemaining) {
       this.client.reply(reqId, {
-        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] <description>`",
+        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--attach <path>]... <description>`",
       });
       return;
     }
@@ -1742,6 +1774,7 @@ export class PlannerBridge {
       description: descRemaining,
       concurrencyCap: fleetWorkers,
       fleetDefaults: boardFleetDefaults,
+      attachments: attachResult.attachments,
     });
     if (reviewPolicyMode || overrideHint !== undefined) {
       board.reviewPolicy = {
@@ -2037,7 +2070,8 @@ export class PlannerBridge {
     let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
     let overrideHint: boolean | undefined;
     let compete = false;
-    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete)\s+(\S+)\s*/;
+    const attachPaths: string[] = [];
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete|attach)\s+(\S+)\s*/;
     while (true) {
       const m = argsRemaining.match(flagRe);
       if (!m) break;
@@ -2070,12 +2104,19 @@ export class PlannerBridge {
         overrideHint = value === "true";
       } else if (key === "compete") {
         compete = value === "true";
+      } else if (key === "attach") {
+        attachPaths.push(value);
       }
       argsRemaining = argsRemaining.slice(m[0].length);
     }
+    const attachResult = loadAttachments(attachPaths);
+    if ("error" in attachResult) {
+      this.client.reply(reqId, { text: `planner execute: ${attachResult.error}` });
+      return;
+    }
     if (argsRemaining.trim().length > 0) {
       this.client.reply(reqId, {
-        text: `planner execute: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner execute [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker]\` (no description — uses the conversation).`,
+        text: `planner execute: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner execute [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--attach <path>]...\` (no description — uses the conversation).`,
       });
       return;
     }
@@ -2121,6 +2162,7 @@ export class PlannerBridge {
       description: "(from conversation)",
       concurrencyCap: fleetWorkers,
       fleetDefaults: boardFleetDefaults,
+      attachments: attachResult.attachments,
     });
     if (reviewPolicyMode || overrideHint !== undefined) {
       board.reviewPolicy = {
@@ -3362,11 +3404,15 @@ export class PlannerBridge {
     const result = raw === undefined ? undefined : p.normalizeResult(raw);
 
     if (!result) {
-      // Reprompt once before giving up. Common failure: agent did the
-      // work but forgot to emit the structured block at end-of-message.
-      // Clear the accumulator so the next turn's chunks land in a
-      // fresh slot; bump repromptCount so we don't loop on second miss.
-      if (workerState.repromptCount < 1) {
+      // Reprompt up to twice before giving up. Common failure: agent
+      // did the work but forgot to emit the structured block at
+      // end-of-message; a single sharp reprompt usually recovers it,
+      // and a second shove rescues the model when the first reprompt
+      // turn also drifted (observed with thinking-mode models that
+      // stay in their reasoning channel). Clear the accumulator so
+      // the next turn's chunks land in a fresh slot; bump
+      // repromptCount so we don't loop forever.
+      if (workerState.repromptCount < 2) {
         log.warn(
           `${task.id}: missing hydra-result block on worker …${workerSessionId.slice(-8)} (accumulator length=${workerState.resultAccumulator.length}), reprompting`,
         );

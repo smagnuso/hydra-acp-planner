@@ -79,6 +79,30 @@ describe("buildTaskPrompt", () => {
     assert.match(p, /no satisfied dependencies/);
   });
 
+  it("omits the attached-files section when board.attachments is empty/undefined", () => {
+    const t = task("T1");
+    const p = buildTaskPrompt(t, board([t]));
+    assert.doesNotMatch(p, /## Attached files/);
+  });
+
+  it("inlines attachments into the prompt under '## Attached files'", () => {
+    const t = task("T1");
+    const b = board([t]);
+    b.attachments = [
+      { path: "/abs/path/spec.md", content: "# spec\n\nphase 1: do the thing" },
+      { path: "/abs/path/plan.md", content: "phase 2: review" },
+    ];
+    const p = buildTaskPrompt(t, b);
+    assert.match(p, /## Attached files/);
+    assert.match(p, /### \/abs\/path\/spec\.md/);
+    assert.match(p, /phase 1: do the thing/);
+    assert.match(p, /### \/abs\/path\/plan\.md/);
+    assert.match(p, /phase 2: review/);
+    // Warns the worker not to try reading it via tools (the common
+    // failure mode this feature exists to fix).
+    assert.match(p, /do NOT try to open them with the read tool/);
+  });
+
   it("inlines artifacts from completed dependencies", () => {
     const dep = task("T1", {
       status: "done",
@@ -142,17 +166,23 @@ describe("buildResumeTaskPrompt", () => {
 describe("buildRepromptForResultPrompt", () => {
   it("identifies the task that's missing its result", () => {
     const p = buildRepromptForResultPrompt(task("T5"));
-    assert.match(p, /T5 didn't end with the required `hydra-result` block/);
+    assert.match(p, /T5 did not end with a `hydra-result` block/);
   });
 
-  it("explicitly says don't redo the work", () => {
+  it("explicitly tells the worker not to redo the task", () => {
     const p = buildRepromptForResultPrompt(task("T1"));
-    assert.match(p, /do NOT redo the work/);
+    assert.match(p, /Do NOT redo the task/);
   });
 
   it("covers the failed-task case", () => {
     const p = buildRepromptForResultPrompt(task("T1"));
-    assert.match(p, /If the task itself failed/);
+    assert.match(p, /Even if the task failed or was blocked/);
+  });
+
+  it("forbids tool calls and prose so a thinking-mode model emits only the block", () => {
+    const p = buildRepromptForResultPrompt(task("T1"));
+    assert.match(p, /Do NOT call any tools/);
+    assert.match(p, /Do NOT explain/);
   });
 });
 

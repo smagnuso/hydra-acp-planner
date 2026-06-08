@@ -136,10 +136,23 @@ export function resolveRunOn(task: Task, fleetDefaults: FleetDefaults): "orchest
   return "orchestrator";
 }
 
+// Project-level attachments supplied by the user at create/execute
+// time via `--attach <path>` (repeatable). Each entry holds the
+// resolved path (for display) and the file contents read at command
+// time. Inlined into every task's prompt by the prompt builders so
+// workers don't have to read the source file themselves — useful for
+// spec / plan docs that live outside the project's worker permission
+// scope (e.g. `~/.claude/plans/*`).
+export interface Attachment {
+  path: string;
+  content: string;
+}
+
 export interface Board {
   version: number;
   projectId: string;
   description: string;
+  attachments?: Attachment[];
   state: BoardState;
   createdAt: string;
   updatedAt: string;
@@ -246,12 +259,14 @@ export function newBoard(opts: {
   description: string;
   fleetDefaults?: FleetDefaults;
   concurrencyCap?: number;
+  attachments?: Attachment[];
 }): Board {
   const now = nowIso();
   return {
     version: BOARD_SCHEMA_VERSION,
     projectId: newProjectId(),
     description: opts.description,
+    attachments: opts.attachments && opts.attachments.length > 0 ? opts.attachments : undefined,
     state: "decomposing",
     createdAt: now,
     updatedAt: now,

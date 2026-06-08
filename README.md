@@ -185,12 +185,14 @@ for the spawned workers:
 | `--workers N`    | Cap concurrent workers at N (overrides the sweep-line analysis of the DAG). |
 | `--agent ID`     | Agent id used when spawning workers (defaults to the orchestrator's agent). Must match an entry in `hydra-acp agents list`. |
 | `--model ID`     | Model id passed through to spawned workers. |
+| `--attach <path>`| Read `<path>` at command time and inline its contents into every worker's prompt under an "Attached files" section. Repeatable. Useful for spec/plan docs that live outside the worker's filesystem permission scope (e.g. `~/.claude/plans/foo.md`) — workers will see the contents directly rather than needing to `read` the file themselves. Tilde (`~`) is expanded. |
 
 Examples:
 
 ```text
 /hydra planner create --workers 5 build a todo app with auth
 /hydra planner create --agent codex --model gpt-5 implement the spec in SPEC.md
+/hydra planner create --attach ~/.claude/plans/review-gates.md implement the review-gates plan
 /hydra planner execute --workers 2
 ```
 

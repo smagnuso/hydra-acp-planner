@@ -43,6 +43,29 @@ The block MUST appear at the very end of your reply, after any other prose,
 code blocks, or tool-call output. If you cannot complete the task, still
 emit the block and explain what blocked you in \`summary\`.`;
 
+// Render project-level attachments (--attach files) as a context
+// block. Each file's path is shown so the worker knows what it is,
+// followed by its full contents. Returns "" when there are no
+// attachments so callers can conditionally include the section
+// header. Inlined ahead of dependency context so spec/plan docs
+// frame the task before per-dependency artifacts narrow it down.
+function formatAttachments(board: Board): string {
+  if (!board.attachments || board.attachments.length === 0) return "";
+  const parts: string[] = [];
+  parts.push("## Attached files");
+  parts.push(
+    "These files were attached at project create time. They are the source of truth for the project's spec / plan / context. Read them here — do NOT try to open them with the read tool; you likely don't have permission to their original paths.",
+  );
+  for (const att of board.attachments) {
+    parts.push("");
+    parts.push(`### ${att.path}`);
+    parts.push("```");
+    parts.push(att.content);
+    parts.push("```");
+  }
+  return parts.join("\n");
+}
+
 // Render a task's dependency artifacts as context the worker can read.
 // Each completed dependency's artifacts are inlined verbatim so the
 // worker has the same view of "what other workers decided" that the
@@ -82,6 +105,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       if (task.constraints) {
         parts.push("");
         parts.push(`**Constraints:** ${task.constraints}`);
+      }
+      const attachments = formatAttachments(board);
+      if (attachments) {
+        parts.push("");
+        parts.push(attachments);
       }
       parts.push("");
       parts.push("## Context from completed dependencies");
@@ -186,15 +214,15 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
 
     buildRepromptPrompt(task: Task): string {
       return [
-        `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block.`,
+        `STOP. Your last reply for ${task.id} did not end with a \`hydra-result\` block. The planner cannot record your work without it.`,
         ``,
-        `Please emit it now — do NOT redo the work, just emit a structured summary of what you accomplished:`,
+        `Do NOT redo the task. Do NOT call any tools. Do NOT explain. Reply with exactly one fenced block and nothing else:`,
         ``,
         "```hydra-result",
-        `{ \"summary\": \"<one-line description of what you did>\", \"files_changed\": [...], \"decisions\": [...], \"assumptions\": [...] }`,
+        `{"summary":"<one-line description of what you did or what blocked you>","files_changed":[],"decisions":[],"assumptions":[],"follow_ups":[]}`,
         "```",
         ``,
-        `If the task itself failed or you couldn't complete it, still emit the block — set "summary" to describe what blocked you.`,
+        `The block must be the entire content of your next reply. Even if the task failed or was blocked, emit the block — use "summary" to describe the outcome.`,
       ].join("\n");
     },
   },
@@ -217,6 +245,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       if (task.constraints) {
         parts.push("");
         parts.push(`**Constraints:** ${task.constraints}`);
+      }
+      const attachments = formatAttachments(board);
+      if (attachments) {
+        parts.push("");
+        parts.push(attachments);
       }
       parts.push("");
       parts.push("## Context from completed dependencies");
