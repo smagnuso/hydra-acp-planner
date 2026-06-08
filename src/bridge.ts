@@ -84,6 +84,7 @@ import {
   pickEligible,
   resolveAgent,
   resolveModel,
+  resolveReviewLane,
   resolveRunOn,
   saveBoard,
   setBoardState,
@@ -3272,8 +3273,19 @@ export class PlannerBridge {
         // review tasks is "orchestrator"; "worker" is explicit opt-in.
         // Orchestrator reviews don't count against concurrencyCap and
         // are single-flight (only one at a time on the host session).
+        //
+        // Smart routing: resolveReviewLane sends reviews to the worker
+        // lane whenever a review-targeted agent/model is configured (so
+        // the configured values are actually honored), and defaults to
+        // the orchestrator lane otherwise. Explicit runOn always wins.
         if (task.kind === "review") {
-          const runOn = resolveRunOn(task, board.fleetDefaults);
+          const { lane, reason } = resolveReviewLane(task, board);
+          if (reason === "configured-agent" || reason === "configured-model") {
+            log.info(
+              `review ${task.id}: routing to worker lane (${reason}) — configured ${reason === "configured-agent" ? "agent" : "model"} only takes effect on worker lane`,
+            );
+          }
+          const runOn = lane;
         if (runOn === "orchestrator") {
           const orchState = getOrchestratorState(orchestratorSessionId);
           if (orchState?.awaitingOrchestratorReview) {
