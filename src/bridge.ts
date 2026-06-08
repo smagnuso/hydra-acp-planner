@@ -91,6 +91,7 @@ import {
   type Board,
   type Task,
   type TaskArtifacts,
+  type TaskStatus,
 } from "./board.js";
 import { projectDir } from "./paths.js";
 import {
@@ -348,6 +349,25 @@ function loadAttachments(paths: string[]): { attachments: import("./board.js").A
     }
   }
   return { attachments: out };
+}
+
+interface FinishReviewOpts {
+  reviewedTask: Task;
+  reviewTask: Task;
+  board: Board;
+  orchestratorSessionId: string;
+  /** Status to set on the reviewed task (default: "done") */
+  reviewedStatus?: TaskStatus;
+  /** Merge decision-specific content into reviewed task artifacts */
+  mergeArtifacts?: (artifacts: TaskArtifacts, normalized: NormalizedResult | undefined) => void;
+  /** Custom log message */
+  logMessage: string;
+  /** Synthetic event message text */
+  eventMessage: string;
+  /** Event tag for the synthetic message metadata */
+  eventTag: string;
+  /** Extra event metadata properties */
+  extraEventProps?: Record<string, unknown>;
 }
 
 export class PlannerBridge {
@@ -3648,38 +3668,27 @@ export class PlannerBridge {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
-    // Merge review notes into the reviewed task's artifacts.
-    const mergedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
     const reviewNotes = (normalized.artifacts as Record<string, unknown>).notes as string;
-    if (reviewNotes) {
-      if (!mergedArtifacts.decisions) mergedArtifacts.decisions = [];
-      mergedArtifacts.decisions.push(`[review] ${reviewNotes}`);
-    }
-
-    reviewedTask.status = "done";
-    reviewedTask.finishedAt = nowIso();
-    reviewedTask.artifacts = mergedArtifacts;
-    reviewedTask.assignedTo = null;
-    reviewTask.status = "done";
-    reviewTask.finishedAt = nowIso();
-    reviewTask.assignedTo = null;
-
-    saveBoard(board, orchestratorSessionId);
-
-    log.info(
-      `review ${reviewTask.id}: approved ${reviewedTask.id}`,
-    );
-    this.emitPlanUpdate(orchestratorSessionId, board);
-    void this.emitSyntheticMessage(
+    this.finishReview({
+      reviewedTask,
+      reviewTask,
+      board,
       orchestratorSessionId,
-      `${reviewTask.id} approved ${reviewedTask.id}`,
-      { event: "task-review-approved", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
-    );
+      mergeArtifacts: (artifacts) => {
+        if (reviewNotes) {
+          if (!artifacts.decisions) artifacts.decisions = [];
+          artifacts.decisions.push(`[review] ${reviewNotes}`);
+        }
+      },
+      logMessage: `review ${reviewTask.id}: approved ${reviewedTask.id}`,
+      eventMessage: `${reviewTask.id} approved ${reviewedTask.id}`,
+      eventTag: "task-review-approved",
+    });
   }
 
   // Reject: retask the reviewed task with reviewFeedback. On maxAttempts
   // exceed, mark the reviewed task as failed.
-  private handleReviewReject(
+    private handleReviewReject(
     reviewTask: Task,
     board: Board,
     orchestratorSessionId: string,
@@ -3693,29 +3702,20 @@ export class PlannerBridge {
     const attemptCount = reviewedTask.attemptCount;
 
     if (attemptCount >= maxAttempts) {
-      // Exceeded max attempts — fail the reviewed task with accumulated feedback.
-      reviewedTask.status = "failed";
-      reviewedTask.finishedAt = nowIso();
       reviewedTask.reviewFeedback = reviewTask.reviewFeedback ?? [];
       if (!reviewedTask.reviewFeedback.includes(feedback)) {
         reviewedTask.reviewFeedback.push(feedback);
       }
-      reviewedTask.assignedTo = null;
-      reviewTask.status = "done";
-      reviewTask.finishedAt = nowIso();
-      reviewTask.assignedTo = null;
-
-      saveBoard(board, orchestratorSessionId);
-
-      log.warn(
-        `review ${reviewTask.id}: max attempts (${maxAttempts}) exceeded for ${reviewedTask.id} — marking failed`,
-      );
-      this.emitPlanUpdate(orchestratorSessionId, board);
-      void this.emitSyntheticMessage(
+      this.finishReview({
+        reviewedTask,
+        reviewTask,
+        board,
         orchestratorSessionId,
-        `${reviewedTask.id} failed after ${maxAttempts} review attempts: ${feedback}`,
-        { event: "task-review-max-attempts", taskId: reviewedTask.id },
-      );
+        reviewedStatus: "failed",
+        logMessage: `review ${reviewTask.id}: max attempts (${maxAttempts}) exceeded for ${reviewedTask.id} — marking failed`,
+        eventMessage: `${reviewedTask.id} failed after ${maxAttempts} review attempts: ${feedback}`,
+        eventTag: "task-review-max-attempts",
+      });
       return;
     }
 
@@ -3724,8 +3724,6 @@ export class PlannerBridge {
     if (strategy === "escalate") {
       const esc = reviewTask.onReject?.escalateTo;
       if (!esc || !esc.agent || !esc.model) {
-        reviewedTask.status = "failed";
-        reviewedTask.finishedAt = nowIso();
         reviewedTask.reviewFeedback = reviewTask.reviewFeedback ?? [];
         if (!reviewedTask.reviewFeedback.includes(feedback)) {
           reviewedTask.reviewFeedback.push(feedback);
@@ -3735,22 +3733,16 @@ export class PlannerBridge {
           : !esc.agent
             ? "onReject.strategy='escalate' but onReject.escalateTo.agent is missing"
             : "onReject.strategy='escalate' but onReject.escalateTo.model is missing";
-        reviewedTask.assignedTo = null;
-        reviewTask.status = "done";
-        reviewTask.finishedAt = nowIso();
-        reviewTask.assignedTo = null;
-
-        saveBoard(board, orchestratorSessionId);
-
-        log.error(
-          `review ${reviewTask.id}: escalation target missing for ${reviewedTask.id} — ${escMsg}`,
-        );
-        this.emitPlanUpdate(orchestratorSessionId, board);
-        void this.emitSyntheticMessage(
+        this.finishReview({
+          reviewedTask,
+          reviewTask,
+          board,
           orchestratorSessionId,
-          `${reviewedTask.id} failed: escalation target unavailable (${escMsg})`,
-          { event: "task-review-escalation-failed", taskId: reviewedTask.id },
-        );
+          reviewedStatus: "failed",
+          logMessage: `review ${reviewTask.id}: escalation target missing for ${reviewedTask.id} — ${escMsg}`,
+          eventMessage: `${reviewedTask.id} failed: escalation target unavailable (${escMsg})`,
+          eventTag: "task-review-escalation-failed",
+        });
         return;
       }
       reviewedTask.agent = esc.agent;
@@ -3809,7 +3801,7 @@ export class PlannerBridge {
       return;
     }
 
-    // Retask the reviewed task with reviewFeedback.
+    // Default: retask the reviewed task with reviewFeedback.
     const workerId = reviewedTask.assignedTo;
     if (reviewedTask.status === "assigned" && workerId) {
       this.endWorkerForward(workerId);
@@ -3818,31 +3810,23 @@ export class PlannerBridge {
       delete board.workers[workerId];
       void this.closeWorker(workerId);
     }
-    reviewedTask.status = "pending";
-    reviewedTask.assignedTo = null;
     reviewedTask.startedAt = null;
-    reviewedTask.finishedAt = null;
     reviewedTask.artifacts = null;
     reviewedTask.reviewFeedback = reviewTask.reviewFeedback ?? [];
     if (!reviewedTask.reviewFeedback.includes(feedback)) {
       reviewedTask.reviewFeedback.push(feedback);
     }
 
-    reviewTask.status = "done";
-    reviewTask.finishedAt = nowIso();
-    reviewTask.assignedTo = null;
-
-    saveBoard(board, orchestratorSessionId);
-
-    log.info(
-      `review ${reviewTask.id}: rejected ${reviewedTask.id}, retasking (attemptCount=${reviewedTask.attemptCount + 1})`,
-    );
-    this.emitPlanUpdate(orchestratorSessionId, board);
-    void this.emitSyntheticMessage(
+    this.finishReview({
+      reviewedTask,
+      reviewTask,
+      board,
       orchestratorSessionId,
-      `${reviewTask.id} rejected ${reviewedTask.id}, retasking (attempt #${reviewedTask.attemptCount + 1})`,
-      { event: "task-review-rejected", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
-    );
+      reviewedStatus: "pending",
+      logMessage: `review ${reviewTask.id}: rejected ${reviewedTask.id}, retasking (attemptCount=${reviewedTask.attemptCount + 1})`,
+      eventMessage: `${reviewTask.id} rejected ${reviewedTask.id}, retasking (attempt #${reviewedTask.attemptCount + 1})`,
+      eventTag: "task-review-rejected",
+    });
   }
 
   // Amend: mark the reviewed task done with notes appended to artifacts.decisions.
@@ -3856,33 +3840,21 @@ export class PlannerBridge {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
-    reviewedTask.status = "done";
-    reviewedTask.finishedAt = nowIso();
-    reviewedTask.assignedTo = null;
-
-    // Append review notes to the reviewed task's artifacts.decisions.
-    const amendedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
-    if (notes) {
-      if (!amendedArtifacts.decisions) amendedArtifacts.decisions = [];
-      amendedArtifacts.decisions.push(`[review amend] ${notes}`);
-    }
-    reviewedTask.artifacts = amendedArtifacts;
-
-    reviewTask.status = "done";
-    reviewTask.finishedAt = nowIso();
-    reviewTask.assignedTo = null;
-
-    saveBoard(board, orchestratorSessionId);
-
-    log.info(
-      `review ${reviewTask.id}: amended ${reviewedTask.id}`,
-    );
-    this.emitPlanUpdate(orchestratorSessionId, board);
-    void this.emitSyntheticMessage(
+    this.finishReview({
+      reviewedTask,
+      reviewTask,
+      board,
       orchestratorSessionId,
-      `${reviewTask.id} amended ${reviewedTask.id}`,
-      { event: "task-review-amended", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
-    );
+      mergeArtifacts: (artifacts) => {
+        if (notes) {
+          if (!artifacts.decisions) artifacts.decisions = [];
+          artifacts.decisions.push(`[review amend] ${notes}`);
+        }
+      },
+      logMessage: `review ${reviewTask.id}: amended ${reviewedTask.id}`,
+      eventMessage: `${reviewTask.id} amended ${reviewedTask.id}`,
+      eventTag: "task-review-amended",
+    });
   }
 
   // Fix: reviewer applies corrections directly and marks the task done.
@@ -3906,33 +3878,21 @@ export class PlannerBridge {
       return;
     }
 
-    // Merge reviewer notes into the reviewed task's artifacts.decisions.
-    const mergedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
-    if (notes) {
-      if (!mergedArtifacts.decisions) mergedArtifacts.decisions = [];
-      mergedArtifacts.decisions.push(`[review fix] ${notes}`);
-    }
-
-    reviewedTask.status = "done";
-    reviewedTask.finishedAt = nowIso();
-    reviewedTask.artifacts = mergedArtifacts;
-    reviewedTask.assignedTo = null;
-
-    reviewTask.status = "done";
-    reviewTask.finishedAt = nowIso();
-    reviewTask.assignedTo = null;
-
-    saveBoard(board, orchestratorSessionId);
-
-    log.info(
-      `review ${reviewTask.id}: fixed ${reviewedTask.id}`,
-    );
-    this.emitPlanUpdate(orchestratorSessionId, board);
-    void this.emitSyntheticMessage(
+    this.finishReview({
+      reviewedTask,
+      reviewTask,
+      board,
       orchestratorSessionId,
-      `${reviewTask.id} fixed ${reviewedTask.id}`,
-      { event: "task-review-fixed", taskId: reviewTask.id, reviewedTaskId: reviewedTask.id },
-    );
+      mergeArtifacts: (artifacts) => {
+        if (notes) {
+          if (!artifacts.decisions) artifacts.decisions = [];
+          artifacts.decisions.push(`[review fix] ${notes}`);
+        }
+      },
+      logMessage: `review ${reviewTask.id}: fixed ${reviewedTask.id}`,
+      eventMessage: `${reviewTask.id} fixed ${reviewedTask.id}`,
+      eventTag: "task-review-fixed",
+    });
   }
 
   // Winner: competition mode — pick the winning task and supersede the rest.
@@ -3960,21 +3920,21 @@ export class PlannerBridge {
     if (winnerId && byId.has(winnerId)) {
       const winnerTask = byId.get(winnerId)!;
 
-      // Merge review notes into the winner's artifacts.
-      const mergedArtifacts: TaskArtifacts = { ...winnerTask.artifacts };
-      if (notes) {
-        if (!mergedArtifacts.decisions) mergedArtifacts.decisions = [];
-        mergedArtifacts.decisions.push(`[review winner] ${notes}`);
-      }
-
-      winnerTask.status = "done";
-      winnerTask.finishedAt = nowIso();
-      winnerTask.artifacts = mergedArtifacts;
-      winnerTask.assignedTo = null;
-
-      log.info(
-        `review ${reviewTask.id}: competition — declared ${winnerId} the winner`,
-      );
+      this.finishReview({
+        reviewedTask: winnerTask,
+        reviewTask,
+        board,
+        orchestratorSessionId,
+        mergeArtifacts: (artifacts) => {
+          if (notes) {
+            if (!artifacts.decisions) artifacts.decisions = [];
+            artifacts.decisions.push(`[review winner] ${notes}`);
+          }
+        },
+        logMessage: `review ${reviewTask.id}: competition — declared ${winnerId} the winner`,
+        eventMessage: `${reviewTask.id} competition: ${winnerId} declared winner; other reviewees superseded`,
+        eventTag: "task-review-winner",
+      });
 
       // Supersede all other reviewees.
       for (const id of reviews) {
@@ -4009,22 +3969,14 @@ export class PlannerBridge {
           `review ${reviewTask.id}: competition — no valid winner; failed ${id}`,
         );
       }
-    }
 
-    reviewTask.status = "done";
-    reviewTask.finishedAt = nowIso();
-    reviewTask.assignedTo = null;
+      reviewTask.status = "done";
+      reviewTask.finishedAt = nowIso();
+      reviewTask.assignedTo = null;
 
-    saveBoard(board, orchestratorSessionId);
-    this.emitPlanUpdate(orchestratorSessionId, board);
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
 
-    if (winnerId) {
-      void this.emitSyntheticMessage(
-        orchestratorSessionId,
-        `${reviewTask.id} competition: ${winnerId} declared winner; other reviewees superseded`,
-        { event: "task-review-winner", taskId: reviewTask.id, reviewedTaskId: winnerId },
-      );
-    } else {
       const ids = reviews.join(", ");
       void this.emitSyntheticMessage(
         orchestratorSessionId,
@@ -4059,6 +4011,36 @@ export class PlannerBridge {
     const firstId = reviews[0];
     if (!firstId) return undefined;
     return byId.get(firstId);
+  }
+
+  private finishReview(opts: FinishReviewOpts): void {
+    const { reviewedTask, reviewTask, board, orchestratorSessionId, mergeArtifacts, logMessage, eventMessage, eventTag, extraEventProps, reviewedStatus = "done" } = opts;
+
+    if (mergeArtifacts) {
+      const mergedArtifacts: TaskArtifacts = { ...reviewedTask.artifacts };
+      mergeArtifacts(mergedArtifacts, undefined);
+      reviewedTask.artifacts = mergedArtifacts;
+    }
+
+    reviewedTask.status = reviewedStatus;
+    if (reviewedStatus === "done" || reviewedStatus === "failed") {
+      reviewedTask.finishedAt = nowIso();
+    }
+    reviewedTask.assignedTo = null;
+
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+
+    log.info(logMessage);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      eventMessage,
+      { event: eventTag, taskId: reviewTask.id, reviewedTaskId: reviewedTask.id, ...extraEventProps },
+    );
   }
 
   private handleTaskFailure(

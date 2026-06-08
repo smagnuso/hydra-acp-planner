@@ -2,6 +2,7 @@
 // no daemon calls — so they're directly unit-testable.
 
 import { shortProjectId, shortSessionId, type Board, type Task, type WorkerUsage } from "./board.js";
+import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
 
 // Format a cost amount with the worker's reported currency. Falls back
 // to a bare numeric when no currency is known; treats "USD" specially
@@ -387,31 +388,16 @@ export function formatStatus(
   }
   lines.push("");
 
-  const reviewsByParent = new Map<string, Task[]>();
+  const reviewsByParent = buildReviewsByParent(board.tasks);
   const renderedReviews = new Set<string>();
-  for (const t of board.tasks) {
-    if (t.kind !== "review") continue;
-    const reviewTargets = typeof t.reviews === "string" ? [t.reviews] : Array.isArray(t.reviews) ? t.reviews : [];
-    for (const targetId of reviewTargets) {
-      const arr = reviewsByParent.get(targetId) ?? [];
-      arr.push(t);
-      reviewsByParent.set(targetId, arr);
-    }
-  }
 
   for (const task of board.tasks) {
     if (task.kind === "review") {
-      if (renderedReviews.has(task.id)) continue;
-      const reviewTargets = typeof task.reviews === "string" ? [task.reviews] : Array.isArray(task.reviews) ? task.reviews : [];
-      const isCompetition = reviewTargets.length > 1;
-      renderedReviews.add(task.id);
-      const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
-      const tag = formatTaskTag(task);
-      const line = `    ${glyph} ${task.id}  ${task.title}${tag}`;
-      const styledLine = isCompetition
-        ? `${line}  reviewees: [${reviewTargets.join(", ")}]`
-        : line;
-      lines.push(applyStatusStyle(styledLine, task.status));
+      const line = renderReviewTask(task, renderedReviews, {
+        indent: "    ",
+        renderTaskTag: formatTaskTag,
+      });
+      if (line) lines.push(line);
       continue;
     }
     const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
@@ -427,11 +413,11 @@ export function formatStatus(
     const childReviews = reviewsByParent.get(task.id);
     if (childReviews) {
       for (const r of childReviews) {
-        if (renderedReviews.has(r.id)) continue;
-        renderedReviews.add(r.id);
-        const glyph = TASK_STATUS_GLYPH[r.status] ?? "?";
-        const tag = formatTaskTag(r);
-        lines.push(applyStatusStyle(`    ${glyph} ${r.id}  ${r.title}${tag}`, r.status));
+        const line = renderReviewTask(r, renderedReviews, {
+          indent: "    ",
+          renderTaskTag: formatTaskTag,
+        });
+        if (line) lines.push(line);
       }
     }
   }

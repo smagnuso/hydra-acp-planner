@@ -73,6 +73,19 @@ Reply with ONLY a fenced JSON block matching this schema, and no other prose:
 }
 \`\`\``;
 
+// Competition-pattern instruction block, inlined verbatim into prompt
+// builders that support the --compete flag. Defined once to keep the
+// three callers (buildDecompositionPrompt, buildExecuteDecompositionPrompt,
+// and the resume variant) in sync without pulling a full renderer.
+const COMPETITION_PROMPT_BLOCK = `
+
+Competition pattern (use when appropriate):
+  When the project has a clear integration point where multiple independent implementations would be valuable, emit a competition:
+    - N sibling work tasks (T1..TN) that each implement the same interface/endpoint independently (same deps, no deps between them).
+    - A review task of kind "review" with reviews set to the array of those sibling ids, title like "Review and pick winner for [feature]". The review picks one implementation as winner; others are superseded.
+  Competition tasks must include all standard fields (id, title, why, what, constraints, deps, riskLevel, reviewHint). The review task's reviews field is a JSON array of strings: ["T1", "T2", ...].
+  Only use competitions when there is a genuine integration point worth evaluating multiple approaches — not for every feature.`;
+
 // Render an "Available agents:" block to splice into a prompt. Returns
 // an empty string when no agents are known so the prompt can be built
 // either way.
@@ -93,16 +106,7 @@ export function buildDecompositionPrompt(
 ): string {
   const agentsBlock = formatAgentChoices(agents);
   const tail = agentsBlock ? `\n\n${agentsBlock}` : "";
-  const competeBlock = compete
-    ? `
-
-Competition pattern (use when appropriate):
-  When the project has a clear integration point where multiple independent implementations would be valuable, emit a competition:
-    - N sibling work tasks (T1..TN) that each implement the same interface/endpoint independently (same deps, no deps between them).
-    - A review task of kind "review" with reviews set to the array of those sibling ids, title like "Review and pick winner for [feature]". The review picks one implementation as winner; others are superseded.
-  Competition tasks must include all standard fields (id, title, why, what, constraints, deps, riskLevel, reviewHint). The review task's reviews field is a JSON array of strings: ["T1", "T2", ...].
-  Only use competitions when there is a genuine integration point worth evaluating multiple approaches — not for every feature.`
-    : "";
+  const competeBlock = compete ? COMPETITION_PROMPT_BLOCK : "";
   return `${DECOMPOSITION_SYSTEM}${tail}${competeBlock}\n\nProject to decompose:\n${description}`;
 }
 
@@ -118,16 +122,7 @@ export function buildExecuteDecompositionPrompt(
 ): string {
   const agentsBlock = formatAgentChoices(agents);
   const tail = agentsBlock ? `\n\n${agentsBlock}` : "";
-  const competeBlock = compete
-    ? `
-
-Competition pattern (use when appropriate):
-  When the project has a clear integration point where multiple independent implementations would be valuable, emit a competition:
-    - N sibling work tasks (T1..TN) that each implement the same interface/endpoint independently (same deps, no deps between them).
-    - A review task of kind "review" with reviews set to the array of those sibling ids, title like "Review and pick winner for [feature]". The review picks one implementation as winner; others are superseded.
-  Competition tasks must include all standard fields (id, title, why, what, constraints, deps, riskLevel, reviewHint). The review task's reviews field is a JSON array of strings: ["T1", "T2", ...].
-  Only use competitions when there is a genuine integration point worth evaluating multiple approaches — not for every feature.`
-    : "";
+  const competeBlock = compete ? COMPETITION_PROMPT_BLOCK : "";
   return [
     `${DECOMPOSITION_SYSTEM}${tail}${competeBlock}`,
     ``,

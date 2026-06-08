@@ -22,6 +22,7 @@ import {
   type UpdateEnvelope,
 } from "./util/text.js";
 import { shortProjectId } from "./board.js";
+import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
 
 export type PlanRenderMode = "plan" | "ascii";
 
@@ -97,17 +98,6 @@ const STATUS_GLYPH: Record<string, string> = {
   superseded: "(~)",
 };
 
-// ANSI escape sequences for inline styling. buildAsciiPlanText is a
-// plain-text fallback, but strikethrough gives superseded items a clear
-// visual "deleted" feel even in raw terminal output.
-const ESC_STRIKETHROUGH = "\u{001B}[9m";  // strikethrough on
-const ESC_RESET = "\u{001B}[0m";          // reset all attributes
-
-function applyStatusStyle(text: string, status: string): string {
-  if (status === "superseded") return `${ESC_STRIKETHROUGH}${text}${ESC_RESET}`;
-  return text;
-}
-
 // Render the board as an ASCII checklist with a leading rule and a
 // summary count, suitable for emitting as an agent_message_chunk in
 // clients that don't render ACP `plan` updates well. The leading
@@ -126,30 +116,13 @@ export function buildAsciiPlanText(board: Board): string {
   if (failed > 0) counts.push(`${failed} failed`);
   lines.push(`── ${shortProjectId(board.projectId)} (${board.state}) — ${counts.join(", ")} ──`);
 
-  const reviewsByParent = new Map<string, Task[]>();
+  const reviewsByParent = buildReviewsByParent(board.tasks);
   const renderedReviews = new Set<string>();
-  for (const t of board.tasks) {
-    if (t.kind !== "review") continue;
-    const reviewTargets = typeof t.reviews === "string" ? [t.reviews] : Array.isArray(t.reviews) ? t.reviews : [];
-    for (const targetId of reviewTargets) {
-      const arr = reviewsByParent.get(targetId) ?? [];
-      arr.push(t);
-      reviewsByParent.set(targetId, arr);
-    }
-  }
 
   for (const t of board.tasks) {
     if (t.kind === "review") {
-      if (renderedReviews.has(t.id)) continue;
-      const reviewTargets = typeof t.reviews === "string" ? [t.reviews] : Array.isArray(t.reviews) ? t.reviews : [];
-      const isCompetition = reviewTargets.length > 1;
-      renderedReviews.add(t.id);
-      const glyph = STATUS_GLYPH[t.status] ?? "?";
-      const line = `    ${glyph} ${t.id}  ${t.title}`;
-      const styledLine = isCompetition
-        ? `${line}  reviewees: [${reviewTargets.join(", ")}]`
-        : line;
-      lines.push(applyStatusStyle(styledLine, t.status));
+      const line = renderReviewTask(t, renderedReviews, { indent: "    " });
+      if (line) lines.push(line);
       continue;
     }
     const glyph = STATUS_GLYPH[t.status] ?? "?";
@@ -157,10 +130,8 @@ export function buildAsciiPlanText(board: Board): string {
     const childReviews = reviewsByParent.get(t.id);
     if (childReviews) {
       for (const r of childReviews) {
-        if (renderedReviews.has(r.id)) continue;
-        renderedReviews.add(r.id);
-        const reviewGlyph = STATUS_GLYPH[r.status] ?? "?";
-        lines.push(applyStatusStyle(`    ${reviewGlyph} ${r.id}  ${r.title}`, r.status));
+        const line = renderReviewTask(r, renderedReviews, { indent: "    " });
+        if (line) lines.push(line);
       }
     }
   }
