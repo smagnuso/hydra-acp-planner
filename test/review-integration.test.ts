@@ -343,6 +343,93 @@ describe("review integration — competition guard", () => {
   });
 });
 
+describe("review integration — onReject strategies", () => {
+  it("continue: keeps worker alive, bumps attemptCount, work stays awaiting_review", async () => {
+    const work = workTask("T1", { assignedTo: "worker-cont", attemptCount: 1 });
+    const rev = reviewTask("R1", "T1", { onReject: { strategy: "continue" } });
+    const board = makeBoard([work, rev]);
+    // Pause so the post-reject scheduler pass doesn't re-dispatch.
+    board.state = "paused";
+    primeWorkerForReview(
+      "R1",
+      '```hydra-result\n{"decision":"reject","notes":"add validation"}\n```',
+    );
+
+    await complete(board, rev);
+    await settle();
+
+    const wt = board.tasks.find((t) => t.id === "T1")!;
+    const rt = board.tasks.find((t) => t.id === "R1")!;
+    assert.equal(wt.status, "awaiting_review", "continue keeps the task in review with worker alive");
+    assert.equal(wt.assignedTo, "worker-cont", "continue must not tear down the worker");
+    assert.equal(wt.attemptCount, 2, "continue bumps attemptCount for the reprompt");
+    assert.equal(rt.status, "done");
+  });
+
+  it("continue with no worker assigned falls back to standard retask", async () => {
+    const work = workTask("T1", { assignedTo: null, attemptCount: 1 });
+    const rev = reviewTask("R1", "T1", { onReject: { strategy: "continue" } });
+    const board = makeBoard([work, rev]);
+    board.state = "paused";
+    primeWorkerForReview(
+      "R1",
+      '```hydra-result\n{"decision":"reject","notes":"needs work"}\n```',
+    );
+
+    await complete(board, rev);
+    await settle();
+
+    const wt = board.tasks.find((t) => t.id === "T1")!;
+    assert.equal(wt.status, "pending", "continue with no live worker → standard retask");
+    assert.equal(wt.assignedTo, null);
+  });
+
+  it("escalate: swaps agent/model to escalation targets and retasks", async () => {
+    const work = workTask("T1", {
+      assignedTo: "worker-esc",
+      attemptCount: 1,
+      agent: "cheap-agent",
+      model: "cheap-model",
+    } as Partial<Task>);
+    const rev = reviewTask("R1", "T1", {
+      onReject: { strategy: "escalate", escalateTo: { agent: "capable-agent", model: "capable-model" } },
+    });
+    const board = makeBoard([work, rev]);
+    board.state = "paused";
+    primeWorkerForReview(
+      "R1",
+      '```hydra-result\n{"decision":"reject","notes":"needs better approach"}\n```',
+    );
+
+    await complete(board, rev);
+    await settle();
+
+    const wt = board.tasks.find((t) => t.id === "T1")! as Task & { agent?: string; model?: string };
+    assert.equal(wt.status, "pending");
+    assert.equal(wt.agent, "capable-agent", "escalate swaps the agent before retask");
+    assert.equal(wt.model, "capable-model", "escalate swaps the model before retask");
+    assert.deepEqual(wt.reviewFeedback, ["needs better approach"]);
+  });
+
+  it("escalate with missing escalateTo hard-fails the task", async () => {
+    const work = workTask("T1", { assignedTo: "worker-esc2", attemptCount: 1 });
+    const rev = reviewTask("R1", "T1", { onReject: { strategy: "escalate" } });
+    const board = makeBoard([work, rev]);
+    board.state = "paused";
+    primeWorkerForReview(
+      "R1",
+      '```hydra-result\n{"decision":"reject","notes":"broken"}\n```',
+    );
+
+    await complete(board, rev);
+    await settle();
+
+    const wt = board.tasks.find((t) => t.id === "T1")!;
+    assert.equal(wt.status, "failed", "escalate without a target is a hard fail, not a retask");
+    assert.ok((wt.reviewFeedback ?? []).includes("broken"));
+  });
+});
+
 // Suppress unused warning — getWorkerState is exported for diagnostic
 // use within tests if needed.
 void getWorkerState;
