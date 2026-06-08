@@ -268,10 +268,16 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         }
         parts.push(
           `## Review instructions`,
-          `You are the judge in a competition. Below are N implementations for this task. Each implementation is listed with its artifacts (summary, files changed, decisions).`,
-          `Choose one of two options:`,
-          `- Pick a **winner**: set \`decision\` to "winner" and \`winner\` to the ID of the winning implementation (e.g. "Tx"). Your \`notes\` must explain why this one wins.`,
-          `- **Synthesize**: set \`decision\` to "synthesize" when no single implementation is clearly best. Your \`notes\` should describe what a combined solution would look like, referencing which parts came from which implementation.`,
+          `You are the judge in a competition. Below are N implementations for this task. Each implementation is listed with its artifacts, including \`verified_diff\` — the daemon-audited list of files each worker actually edited plus a sample of the hunks.`,
+          ``,
+          `**Do this in order:**`,
+          `  1. Read the reviewed task's \`what\` / \`why\` / \`constraints\` for the spec the competitors were given.`,
+          `  2. For each implementation, look at \`verified_diff.files\` and \`verified_diff.sample\`. The worker's \`summary\` and \`files_changed\` are claims; \`verified_diff\` is evidence.`,
+          `  3. If you need the full diff for any candidate, fetch \`hydra session diff <workerSessionId> --json\` for that worker. Compare them on correctness against the spec, not stylistic preference.`,
+          ``,
+          `**Decisions:**`,
+          `- \`winner\` — pick the best implementation. Set \`winner\` to its task ID (e.g. "Tx"). \`notes\` MUST cite specific evidence from \`verified_diff\` for why it wins (and ideally why the others fall short).`,
+          `- \`synthesize\` — no single implementation is clearly best; describe what a combined solution would look like, naming which parts come from which candidate.`,
         );
         for (const rev of reviewees) {
           parts.push("");
@@ -282,12 +288,21 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       }
       parts.push(
         `## Review instructions`,
-        `Analyze the work described by this task and produce a structured review result.`,
-        `Your \`decision\` must be one of: "approve", "reject", "amend", or "fix".`,
-        `Your \`notes\` should explain your reasoning in detail.`,
-        `Optionally include \`follow_ups\` (an array of strings) for any follow-on work.`,
-        `Optionally set \`applied\` to true if the review changes were already applied.`,
-        `Use decision="fix" when you can apply corrections directly (e.g., as the orchestrator). This marks the task done without retasking.`,
+        `You are reviewing the work that the reviewed task ABOVE (under "Context from completed dependencies") performed. Your job is to verify the actual code change matches the task's spec — not to rubber-stamp the worker's self-report.`,
+        ``,
+        `**Do this in order:**`,
+        `  1. Read the reviewed task's \`what\` / \`why\` / \`constraints\` carefully — this is the spec the worker was given.`,
+        `  2. Look at \`artifacts.verified_diff\` on the reviewed task. This is the daemon-audited, per-session list of files actually edited (\`files\`), the total \`hunkCount\`, and a \`sample\` preview. It is NOT self-reported — it comes from the recorded tool-call history.`,
+        `  3. Compare. The worker also self-reports \`artifacts.files_changed\` and \`artifacts.summary\` — those are claims, not evidence. If \`files_changed\` lists paths but \`verified_diff.files\` is empty or different, that is a red flag: the worker may have lied or produced nothing.`,
+        `  4. If you need to see the full diff (the sample is truncated), fetch it directly: \`hydra session diff <workerSessionId> --json\` — the worker session id is the key under which the worker is registered. Look at the actual oldText/newText hunks and judge whether they implement the spec.`,
+        ``,
+        `**Decisions:**`,
+        `  - \`approve\` — diff implements the spec, no follow-up needed.`,
+        `  - \`reject\` — diff is wrong, missing, or contradicts the spec. \`notes\` MUST cite the specific gap (e.g. "spec asked for X but verified_diff shows only Y").`,
+        `  - \`amend\` — diff is acceptable but needs follow-on work captured in \`follow_ups\`. Task gets marked done with notes appended.`,
+        `  - \`fix\` — you applied the corrections yourself in this turn (only valid for orchestrator-lane reviews where you can edit the workspace). Set \`applied: true\`.`,
+        ``,
+        `Your \`notes\` must reference concrete evidence from \`verified_diff\` (or the full diff fetch). Generic praise without code-specific reasoning means you didn't do the review.`,
       );
       return parts.join("\n");
     },

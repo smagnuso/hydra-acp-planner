@@ -595,8 +595,9 @@ describe("buildReviewPrompt — competition mode", () => {
     });
     const p = buildReviewPrompt(judge, board([impl1, impl2, judge]));
     assert.match(p, /You are the judge in a competition/);
-    assert.match(p, /Pick a.*winner/i);
-    assert.match(p, /Synthesize|synthesize/i);
+    assert.match(p, /pick the best implementation/i);
+    assert.match(p, /winner/i);
+    assert.match(p, /synthesize/i);
   });
 
   it("lists each implementation's artifacts under its id", () => {

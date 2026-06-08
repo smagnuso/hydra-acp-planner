@@ -57,6 +57,20 @@ export interface TaskArtifacts {
   decisions?: string[];
   assumptions?: string[];
   follow_ups?: string[];
+  // Filesystem-level audit of the worker session's actual edits,
+  // fetched from the daemon's GET /v1/sessions/:id/diff endpoint at
+  // task completion. files = unique paths from the diff; hunkCount =
+  // sum across files; sample = a compact human-readable preview
+  // (paths + first hunk) for reviewer prompts. Undefined when the
+  // audit was skipped (orchestrator-lane review) or the fetch failed
+  // (older daemon, network error). Renders through
+  // formatDependencyContext (JSON.stringify) so downstream reviewers
+  // see it without prompt changes.
+  verified_diff?: {
+    files: string[];
+    hunkCount: number;
+    sample?: string;
+  };
 }
 
 export interface Task {

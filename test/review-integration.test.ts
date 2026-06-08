@@ -54,6 +54,10 @@ beforeEach(() => {
     daemonWsUrl: "ws://unused",
     token: "unused",
     client: new FakeClient(),
+    // Stub the diff audit — review tests don't care about verified_diff
+    // and a real fetch against ws://unused would just log and return
+    // undefined anyway. Explicit stub keeps the test signal clean.
+    fetchSessionDiff: async () => undefined,
   });
   setOrchestratorState(ORCH, {
     projectId: "p-int",
@@ -130,12 +134,12 @@ function primeWorkerForReview(taskId: string, reviewerReply: string) {
   });
 }
 
-// Bypass `private` for direct invocation. handleTaskComplete is sync but
-// schedules fire-and-forget closeWorker / emitSyntheticMessage promises;
-// `settle` drains them so the test runner doesn't see post-test activity.
-function complete(board: Board, task: Task) {
-  (bridge as unknown as {
-    handleTaskComplete: (orch: string, worker: string, b: Board, t: Task) => void;
+// Bypass `private` for direct invocation. handleTaskComplete is async
+// (audits the worker's session diff before dispatching). Tests must
+// await its promise before asserting board state.
+async function complete(board: Board, task: Task) {
+  await (bridge as unknown as {
+    handleTaskComplete: (orch: string, worker: string, b: Board, t: Task) => Promise<void>;
   }).handleTaskComplete(ORCH, WORKER, board, task);
 }
 
@@ -155,7 +159,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       'Looking good.\n```hydra-result\n{"decision":"approve","notes":"LGTM"}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
@@ -180,7 +184,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       '```hydra-result\n{"decision":"reject","notes":"needs error handling"}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
@@ -200,7 +204,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       '```hydra-result\n{"decision":"amend","notes":"tweak the logic"}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
@@ -219,7 +223,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       '```hydra-result\n{"decision":"fix","notes":"patched","applied":true}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
@@ -237,7 +241,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       '```hydra-result\n{"decision":"fix","notes":"tried to patch","applied":true}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
@@ -265,7 +269,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       repromptCount: 1,
     });
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const rt = board.tasks.find((t) => t.id === "R1")!;
@@ -287,7 +291,7 @@ describe("review integration — handleTaskComplete → handleReviewComplete", (
       '```hydra-result\n{"decision":"reject","notes":"still wrong"}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     const wt = board.tasks.find((t) => t.id === "T1")!;
@@ -307,7 +311,7 @@ describe("review integration — competition guard", () => {
       '```hydra-result\n{"decision":"approve","notes":"both look fine"}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     // approve on a competition is reviewer error. The dispatcher should
@@ -330,7 +334,7 @@ describe("review integration — competition guard", () => {
       '```hydra-result\n{"decision":"winner","winner":"T2","notes":"T2 wins"}\n```',
     );
 
-    complete(board, rev);
+    await complete(board, rev);
     await settle();
 
     assert.equal(board.tasks.find((t) => t.id === "T1")!.status, "superseded");

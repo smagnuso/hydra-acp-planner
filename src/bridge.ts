@@ -95,6 +95,12 @@ import {
 } from "./board.js";
 import { projectDir } from "./paths.js";
 import {
+  fetchSessionDiff,
+  httpBaseFromWsUrl,
+  summarizeDiff,
+  type DiffFile,
+} from "./util/session-diff.js";
+import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
   buildExecuteDecompositionPrompt,
@@ -235,6 +241,12 @@ export interface BridgeOptions {
   // constructing a TransformerClient. Lets tests inject a fake that
   // records request/reply calls without opening a real WebSocket.
   client?: BridgeClient;
+  // Test seam: when provided, the verified_diff audit calls this
+  // instead of hitting the daemon's HTTP API. Lets tests exercise
+  // the audit logic without a live daemon.
+  fetchSessionDiff?: (
+    sessionId: string,
+  ) => Promise<import("./util/session-diff.js").DiffFile[] | undefined>;
 }
 
 // Track active boards in memory so we don't reload from disk on every
@@ -372,6 +384,17 @@ interface FinishReviewOpts {
 
 export class PlannerBridge {
   private client: BridgeClient;
+  // Daemon HTTP base URL and bearer token. Derived from BridgeOptions
+  // and used by the verified_diff audit (which hits /v1/sessions/:id/diff
+  // directly rather than going through the ACP WS channel).
+  private daemonHttpBase: string;
+  private daemonToken: string;
+  // Test seam: swap in a fake fetcher so tests don't need a live
+  // daemon. When undefined, the production fetchSessionDiff path
+  // is used.
+  private fetchDiffOverride:
+    | ((sessionId: string) => Promise<import("./util/session-diff.js").DiffFile[] | undefined>)
+    | undefined;
   // Cached list of installed specialist agents, populated lazily on
   // first prompt-building call. Refreshed at startup. Decomposition and
   // add-task prompts splice this in so the planner agent only suggests
@@ -410,6 +433,9 @@ export class PlannerBridge {
   }
 
   constructor(opts: BridgeOptions) {
+    this.daemonHttpBase = httpBaseFromWsUrl(opts.daemonWsUrl);
+    this.daemonToken = opts.token;
+    this.fetchDiffOverride = opts.fetchSessionDiff;
     this.client =
       opts.client ??
       new TransformerClient({
@@ -3208,7 +3234,7 @@ export class PlannerBridge {
         return;
       }
       if (this.shuttingDown) return; // skip completion processing during shutdown
-      this.handleTaskComplete(orchestratorSessionId, childSessionId, board, task);
+      await this.handleTaskComplete(orchestratorSessionId, childSessionId, board, task);
     })();
   }
 
@@ -3263,7 +3289,7 @@ export class PlannerBridge {
         return;
       }
       if (this.shuttingDown) return;
-      this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
+      await this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
     })();
   }
 
@@ -3375,19 +3401,19 @@ export class PlannerBridge {
         return;
       }
       if (this.shuttingDown) return;
-      this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
+      await this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
     })();
   }
 
   // Called when the worker's session/prompt turn completes. Parses the
   // hydra-result block from the accumulated reply, persists artifacts,
   // closes the worker session, and schedules the next task.
-  private handleTaskComplete(
+  private async handleTaskComplete(
     orchestratorSessionId: string,
     workerSessionId: string,
     board: Board,
     task: Task,
-  ): void {
+  ): Promise<void> {
     // Cancellation guard: runProjectStop marks every in-flight task
     // `failed` and force-cancels its worker. If force_cancel arrived
     // too late and the agent's turn completed successfully anyway,
@@ -3456,6 +3482,16 @@ export class PlannerBridge {
       return;
     }
 
+    // Audit the worker's actual edits against its self-reported
+    // files_changed. Attaches verified_diff to artifacts BEFORE any
+    // downstream code reads them (reviewer prompts, markTaskDone
+    // persistence) so reviewers always see the truth. Skipped on the
+    // orchestrator lane — that session is the user's main session and
+    // carries unrelated edits.
+    if (workerSessionId !== "orchestrator") {
+      await this.auditTaskDiff(task, result.artifacts, workerSessionId, orchestratorSessionId);
+    }
+
     const taskKind = task.kind ?? 'work';
 
     if (taskKind === 'review') {
@@ -3518,6 +3554,49 @@ export class PlannerBridge {
     // the cap or runs out of eligible work. Also handles the
     // project-complete transition when no more work remains.
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
+  }
+
+  // Pull the worker's actual session diff from the daemon and attach it
+  // to the task's artifacts as verified_diff. Emits a synthetic
+  // 'task-diff-mismatch' message when the worker claimed files_changed
+  // but the diff is empty — surfaces silent no-ops without auto-failing.
+  // Best-effort: a fetch failure (older daemon, network error) leaves
+  // verified_diff undefined and the rest of the pipeline proceeds.
+  private async auditTaskDiff(
+    task: Task,
+    artifacts: TaskArtifacts,
+    workerSessionId: string,
+    orchestratorSessionId: string,
+  ): Promise<void> {
+    const fetcher = this.fetchDiffOverride ?? ((sid: string) =>
+      fetchSessionDiff(sid, {
+        daemonHttpBase: this.daemonHttpBase,
+        token: this.daemonToken,
+      }));
+    let diff: DiffFile[] | undefined;
+    try {
+      diff = await fetcher(workerSessionId);
+    } catch (err) {
+      log.debug(`audit ${task.id}: fetcher threw: ${(err as Error).message}`);
+      return;
+    }
+    if (!diff) return;
+    const files = diff.map((f) => f.path);
+    const hunkCount = diff.reduce((n, f) => n + f.hunks.length, 0);
+    artifacts.verified_diff = {
+      files,
+      hunkCount,
+      sample: summarizeDiff(diff),
+    };
+    const claimed = artifacts.files_changed ?? [];
+    if (claimed.length > 0 && files.length === 0) {
+      const msg = `task ${task.id} claimed files_changed=[${claimed.join(", ")}] but session diff shows no edits`;
+      log.warn(msg);
+      void this.emitSyntheticMessage(orchestratorSessionId, `audit: ${msg}`, {
+        event: "task-diff-mismatch",
+        taskId: task.id,
+      });
+    }
   }
 
   private markTaskDone(
