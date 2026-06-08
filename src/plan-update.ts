@@ -22,6 +22,7 @@ import {
   type UpdateEnvelope,
 } from "./util/text.js";
 import { shortProjectId } from "./board.js";
+import { formatTaskTag } from "./format.js";
 import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
 
 export type PlanRenderMode = "plan" | "ascii";
@@ -72,7 +73,7 @@ export function buildPlanUpdateEnvelope(opts: {
   }
   const entries = board.tasks.map((t) => {
     const failedPrefix = t.status === "failed" ? "[FAILED] " : "";
-    const content = `${failedPrefix}${t.id}  ${t.title}`;
+    const content = `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}`;
     return {
       content,
       priority: taskPriority(t, blockedByCount),
@@ -119,18 +120,19 @@ export function buildAsciiPlanText(board: Board): string {
   const reviewsByParent = buildReviewsByParent(board.tasks);
   const renderedReviews = new Set<string>();
 
+  const tagFor = (t: Task) => formatTaskTag(t, board);
   for (const t of board.tasks) {
     if (t.kind === "review") {
-      const line = renderReviewTask(t, renderedReviews, { indent: "    " });
+      const line = renderReviewTask(t, renderedReviews, { indent: "    ", renderTaskTag: tagFor });
       if (line) lines.push(line);
       continue;
     }
     const glyph = STATUS_GLYPH[t.status] ?? "?";
-    lines.push(`  ${glyph} ${t.id}  ${t.title}`);
+    lines.push(`  ${glyph} ${t.id}  ${t.title}${tagFor(t)}`);
     const childReviews = reviewsByParent.get(t.id);
     if (childReviews) {
       for (const r of childReviews) {
-        const line = renderReviewTask(r, renderedReviews, { indent: "    " });
+        const line = renderReviewTask(r, renderedReviews, { indent: "    ", renderTaskTag: tagFor });
         if (line) lines.push(line);
       }
     }

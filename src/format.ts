@@ -1,7 +1,7 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { shortProjectId, shortSessionId, type Board, type Task, type WorkerUsage } from "./board.js";
+import { resolveAgent, resolveModel, shortProjectId, shortSessionId, type Board, type Task, type WorkerUsage } from "./board.js";
 import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
 
 // Format a cost amount with the worker's reported currency. Falls back
@@ -116,16 +116,34 @@ export function wallClockMs(board: Board, now: number = Date.now()): number {
   return Math.max(0, end - start);
 }
 
-// Inline overrides tag for a task: " {agent-id}", " {agent-id|model}",
-// or "" when neither is set. Same shape in both formatters so a task
-// reads identically across the board-context preamble and the
-// /status view.
-function formatTaskTag(task: Task): string {
-  const a = task.agent;
-  const m = task.model;
+// Inline agent/model tag for a task: " {agent}", " {agent·model}",
+// " {model}", or "" when neither can be determined. Resolves the
+// effective values through fleetDefaults so the rendered tag shows the
+// agent/model the task will actually execute with — not just the
+// per-task override. Same shape across the board-context preamble,
+// the /status view, and the plan panel.
+export function formatTaskTag(task: Task, board?: Board): string {
+  const fleet = board?.fleetDefaults;
+  const a = fleet ? resolveAgent(task, fleet) : (task.agent ?? null);
+  const m = fleet ? resolveModel(task, fleet) : (task.model ?? null);
   if (!a && !m) return "";
   const inner = a && m ? `${a}·${m}` : (a ?? m);
   return ` {${inner}}`;
+}
+
+// Execution-time accounting. Counts only the time the project has
+// spent in `running` state across all execute/retry cycles. Excludes
+// time in ready/decomposing/paused/stopped — i.e. amend/review pauses
+// and the pre-execute window don't accrue.
+export function executionTimeMs(board: Board, now: number = Date.now()): number {
+  let total = board.executionMs ?? 0;
+  if (board.state === "running" && board.executionStartedAt) {
+    const start = Date.parse(board.executionStartedAt);
+    if (Number.isFinite(start)) {
+      total += Math.max(0, now - start);
+    }
+  }
+  return total;
 }
 
 // Tabular render of the sessions involved in a project: the
@@ -199,7 +217,7 @@ export function formatSessionsTable(
       const lastId = w.tasksCompleted[w.tasksCompleted.length - 1];
       t = lastId ? taskById.get(lastId) : undefined;
     }
-    const taskTag = t ? formatTaskTag(t).trim().replace(/^\{|\}$/g, "") : "";
+    const taskTag = t ? formatTaskTag(t, board).trim().replace(/^\{|\}$/g, "") : "";
     const workerTag = w.agent || w.model
       ? (w.agent && w.model ? `${w.agent}·${w.model}` : (w.agent ?? w.model ?? ""))
       : "";
@@ -297,7 +315,7 @@ export function formatBoardContext(board: Board): string {
         task.status === "assigned" && task.assignedTo
           ? `, worker: ${shortSessionId(task.assignedTo)}`
           : "";
-      const tag = formatTaskTag(task);
+      const tag = formatTaskTag(task, board);
       const dur = formatTaskDuration(task);
       const durTag = dur ? `, duration: ${dur}` : "";
       lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${task.status}${deps}${worker}${durTag}]`);
@@ -372,11 +390,14 @@ export function formatStatus(
     const n = Object.keys(board.workers).length;
     lines.push(`   Usage: ${usageParts.join(", ")} (orchestrator + ${n} worker${n === 1 ? "" : "s"})`);
   }
-  const wall = wallClockMs(board);
+  const exec = executionTimeMs(board);
   const compute = totalTaskDurationMs(board);
-  if (wall > 0 || compute > 0) {
+  if (exec > 0 || compute > 0) {
     const parts: string[] = [];
-    if (wall > 0) parts.push(`wall ${formatDurationMs(wall)}`);
+    if (exec > 0) {
+      const live = board.state === "running" ? "+" : "";
+      parts.push(`exec ${formatDurationMs(exec)}${live}`);
+    }
     if (compute > 0) parts.push(`task ${formatDurationMs(compute)}`);
     lines.push(`   Duration: ${parts.join(", ")}`);
   }
@@ -395,7 +416,7 @@ export function formatStatus(
     if (task.kind === "review") {
       const line = renderReviewTask(task, renderedReviews, {
         indent: "    ",
-        renderTaskTag: formatTaskTag,
+        renderTaskTag: (t) => formatTaskTag(t, board),
       });
       if (line) lines.push(line);
       continue;
@@ -406,7 +427,7 @@ export function formatStatus(
       task.status === "assigned" && task.assignedTo
         ? `  → ${shortSessionId(task.assignedTo)}`
         : "";
-    const tag = formatTaskTag(task);
+    const tag = formatTaskTag(task, board);
     const dur = formatTaskDuration(task);
     const durStr = dur ? `  (${dur})` : "";
     lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}${durStr}`);
@@ -415,7 +436,7 @@ export function formatStatus(
       for (const r of childReviews) {
         const line = renderReviewTask(r, renderedReviews, {
           indent: "    ",
-          renderTaskTag: formatTaskTag,
+          renderTaskTag: (t) => formatTaskTag(t, board),
         });
         if (line) lines.push(line);
       }

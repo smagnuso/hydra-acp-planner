@@ -86,6 +86,7 @@ import {
   resolveModel,
   resolveRunOn,
   saveBoard,
+  setBoardState,
   shortProjectId,
   shortSessionId,
   type Board,
@@ -593,7 +594,7 @@ export class PlannerBridge {
         log.warn(
           `retiring orphaned board ${shortProjectId(orphan.projectId)} (orchestrator …${orchestratorId.slice(-8)} already has newer board ${shortProjectId(board.projectId)})`,
         );
-        orphan.state = "failed";
+        setBoardState(orphan, "failed");
         saveBoard(orphan, orchestratorId);
       }
 
@@ -1278,7 +1279,7 @@ export class PlannerBridge {
   // schedule; caller is responsible for opening the held turn.
   private async resumeStoppedBoard(sessionId: string, board: Board): Promise<void> {
     log.info(`resuming stopped plan ${board.projectId} on session …${sessionId.slice(-8)} (via retry)`);
-    board.state = "running";
+    setBoardState(board, "running");
     saveBoard(board, sessionId);
     try {
       await this.client.request("hydra-acp/transformer/attach", { sessionId });
@@ -1549,7 +1550,7 @@ export class PlannerBridge {
       });
       return;
     }
-    board.state = "paused";
+    setBoardState(board, "paused");
     saveBoard(board, sessionId);
     const inFlight = inFlightCount(board);
     const tail = inFlight > 0
@@ -1574,7 +1575,7 @@ export class PlannerBridge {
       });
       return;
     }
-    board.state = "running";
+    setBoardState(board, "running");
     saveBoard(board, sessionId);
     this.client.reply(reqId, {
       text: `Resumed ${shortProjectId(board.projectId)}.`,
@@ -1907,7 +1908,7 @@ export class PlannerBridge {
       log.error(
         `transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
       );
-      board.state = "failed";
+      setBoardState(board, "failed");
       saveBoard(board, sessionId);
       const errState = getOrchestratorState(sessionId);
       if (errState) errState.awaitingDecomposition = false;
@@ -1958,7 +1959,7 @@ export class PlannerBridge {
       );
       const failedState = getOrchestratorState(sessionId);
       if (failedState) failedState.awaitingDecomposition = false;
-      board.state = "failed";
+      setBoardState(board, "failed");
       saveBoard(board, sessionId);
       await this.emitSyntheticMessage(
         sessionId,
@@ -2101,7 +2102,7 @@ export class PlannerBridge {
       log.info(
         `${existing.state === "stopped" ? "resuming stopped" : "executing previously-formed"} plan ${existing.projectId} on session …${sessionId.slice(-8)}`,
       );
-      existing.state = "running";
+      setBoardState(existing, "running");
       saveBoard(existing, sessionId);
       try {
         await this.client.request("hydra-acp/transformer/attach", { sessionId });
@@ -2278,7 +2279,7 @@ export class PlannerBridge {
       log.error(
         `transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
       );
-      board.state = "failed";
+      setBoardState(board, "failed");
       saveBoard(board, sessionId);
       const errState = getOrchestratorState(sessionId);
       if (errState) errState.awaitingDecomposition = false;
@@ -2313,7 +2314,7 @@ export class PlannerBridge {
       );
       const failedState = getOrchestratorState(sessionId);
       if (failedState) failedState.awaitingDecomposition = false;
-      board.state = "failed";
+      setBoardState(board, "failed");
       saveBoard(board, sessionId);
       await this.emitSyntheticMessage(
         sessionId,
@@ -2404,7 +2405,7 @@ export class PlannerBridge {
         task.finishedAt = null;
       }
     }
-    board.state = "stopped";
+    setBoardState(board, "stopped");
     saveBoard(board, orchestratorSessionId);
 
     log.info(
@@ -2933,7 +2934,7 @@ export class PlannerBridge {
 
     if (!result) {
       log.warn(`decomposition parse failed for ${board.projectId}; accumulator length=${state.decompositionAccumulator.length}`);
-      board.state = "failed";
+      setBoardState(board, "failed");
       saveBoard(board, sessionId);
       void this.emitSyntheticMessage(
         sessionId,
@@ -2995,7 +2996,7 @@ export class PlannerBridge {
       board.description = result.description;
     }
     const willKickoff = board.pendingExecute === true;
-    board.state = willKickoff ? "running" : "ready";
+    setBoardState(board, willKickoff ? "running" : "ready");
     board.pendingExecute = undefined;
     saveBoard(board, sessionId);
 
@@ -3055,7 +3056,7 @@ export class PlannerBridge {
     // transition state, resolve the held turn (if any) with a success
     // summary so handleCreate/Execute replies to commands/invoke.
     if (allTerminal(board)) {
-      board.state = "done";
+      setBoardState(board, "done");
       saveBoard(board, orchestratorSessionId);
       this.emitPlanUpdate(orchestratorSessionId, board);
       const failed = board.tasks.filter((t) => t.status === "failed").length;
@@ -3448,7 +3449,7 @@ export class PlannerBridge {
         );
         const state = getOrchestratorState(orchestratorSessionId);
         if (state) state.awaitingDecomposition = false;
-        board.state = "failed";
+        setBoardState(board, "failed");
         saveBoard(board, orchestratorSessionId);
         await this.emitSyntheticMessage(
           orchestratorSessionId,
@@ -5037,7 +5038,7 @@ export class PlannerBridge {
     // `/hydra planner continue` to open a held live view turn if
     // they want.
     const wasStopped = board.state === "stopped";
-    board.state = "running";
+    setBoardState(board, "running");
     saveBoard(board, sessionId);
     try {
       await this.client.request("hydra-acp/transformer/attach", { sessionId });
@@ -5226,7 +5227,7 @@ export class PlannerBridge {
         `planner_pause: project is ${board.state}; can only pause a running project.`,
       );
     }
-    board.state = "paused";
+    setBoardState(board, "paused");
     saveBoard(board, sessionId);
     const inFlight = inFlightCount(board);
     this.replyMcpResult(
@@ -5244,7 +5245,7 @@ export class PlannerBridge {
         `planner_resume: project is ${board.state}, not paused.`,
       );
     }
-    board.state = "running";
+    setBoardState(board, "running");
     saveBoard(board, sessionId);
     void this.scheduleEligibleTasks(sessionId, board);
     // Same rationale as toolExecute — re-open the live view so the

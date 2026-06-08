@@ -222,6 +222,36 @@ export interface Board {
   // current_model_update (currentModel).
   orchestratorAgent?: string | null;
   orchestratorModel?: string | null;
+  // Accumulated wall-clock time the project has spent in the `running`
+  // state across all execute/retry cycles. Excludes time spent in
+  // `ready`, `decomposing` (initial plan + amends), `paused`, and
+  // `stopped`. Updated only when transitioning OUT of `running` via
+  // setBoardState; the live "currently running" delta is added on top
+  // at render time via executionTimeMs.
+  executionMs?: number;
+  // ISO timestamp of when the project most recently entered `running`.
+  // Set on transition into running, cleared on transition out. When
+  // set, the project is actively accruing execution time.
+  executionStartedAt?: string | null;
+}
+
+// Centralize state transitions so we can maintain the execution timer
+// (executionMs / executionStartedAt) without having to remember at each
+// call site. Use this instead of assigning board.state directly.
+export function setBoardState(board: Board, next: BoardState): void {
+  const prev = board.state;
+  if (prev === next) return;
+  if (prev === "running" && board.executionStartedAt) {
+    const start = Date.parse(board.executionStartedAt);
+    if (Number.isFinite(start)) {
+      board.executionMs = (board.executionMs ?? 0) + Math.max(0, Date.now() - start);
+    }
+    board.executionStartedAt = null;
+  }
+  if (next === "running") {
+    board.executionStartedAt = nowIso();
+  }
+  board.state = next;
 }
 
 export const PROJECT_ID_PREFIX = "hydra_plan_";
