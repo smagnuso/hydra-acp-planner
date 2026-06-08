@@ -383,9 +383,26 @@ export function pickEligible(board: Board): Task | undefined {
   const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
   for (const task of board.tasks) {
     if (task.status !== "pending") continue;
+    // A review task whose `reviews` target is parked in awaiting_review
+    // is eligible — that holding state exists precisely so the review
+    // can run. Non-review dependents wait for the dep to reach a
+    // terminal state (done / superseded) so they don't race ahead of
+    // any reviewer-requested fixes.
+    const reviewsSet =
+      task.kind === "review"
+        ? new Set(
+            Array.isArray(task.reviews)
+              ? task.reviews
+              : task.reviews
+                ? [task.reviews]
+                : [],
+          )
+        : null;
     const blocked = task.deps.some((d) => {
       const s = byId.get(d)?.status;
-      return s !== "done" && s !== "superseded";
+      if (s === "done" || s === "superseded") return false;
+      if (s === "awaiting_review" && reviewsSet?.has(d)) return false;
+      return true;
     });
     if (blocked) continue;
     return task;

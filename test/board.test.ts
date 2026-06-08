@@ -279,6 +279,51 @@ describe("pickEligible", () => {
     ]);
     assert.equal(pickEligible(b)?.id, "T5");
   });
+
+  it("treats awaiting_review dep as satisfied for the review task targeting it", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "awaiting_review" }),
+      makeTask("review-T1", {
+        deps: ["T1"],
+        kind: "review",
+        reviews: "T1",
+      }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "review-T1");
+  });
+
+  it("also accepts reviews declared as an array", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "awaiting_review" }),
+      makeTask("T2", { status: "done" }),
+      makeTask("review-bundle", {
+        deps: ["T1", "T2"],
+        kind: "review",
+        reviews: ["T1", "T2"],
+      }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "review-bundle");
+  });
+
+  it("still blocks non-review dependents whose dep is awaiting_review", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "awaiting_review" }),
+      makeTask("T2", { deps: ["T1"] }),
+    ]);
+    assert.equal(pickEligible(b), undefined);
+  });
+
+  it("blocks a review task whose dep is awaiting_review but isn't its review target", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "awaiting_review" }),
+      makeTask("review-T2", {
+        deps: ["T1"],
+        kind: "review",
+        reviews: "T2",
+      }),
+    ]);
+    assert.equal(pickEligible(b), undefined);
+  });
 });
 
 describe("inFlightCount", () => {
