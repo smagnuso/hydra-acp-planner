@@ -493,25 +493,33 @@ export function inFlightCount(board: Board): number {
 // and workers in-place only. The caller is responsible for updating
 // board.state (typically to 'stopped') and persisting the board.
 export function stopBoardBookkeeping(board: Board): { inFlightWorkerIds: string[] } {
-  const inFlightWorkerIds: string[] = [];
+  const ids = new Set<string>();
 
+  // Primary: tasks currently in `assigned` state. Revert to pending and
+  // collect the worker each references via task.assignedTo.
   for (const task of board.tasks) {
-    if (task.status !== "assigned" || !task.assignedTo) continue;
-    inFlightWorkerIds.push(task.assignedTo);
+    if (task.status !== "assigned") continue;
+    if (task.assignedTo) ids.add(task.assignedTo);
     task.status = "pending";
     task.assignedTo = null;
     task.startedAt = null;
     task.finishedAt = null;
   }
 
-  for (const workerId of inFlightWorkerIds) {
-    const worker = board.workers[workerId];
-    if (worker) {
+  // Secondary: workers with currentTaskId set but no task points back
+  // to them. This catches orphaned/shadow workers — e.g. a duplicate-
+  // spawn race where two workers were assigned to the same task and
+  // only the second's id ended up on task.assignedTo, leaving the
+  // first invisible to the task-level pass above. Without this they'd
+  // keep running on the daemon after a user-initiated stop.
+  for (const [workerId, worker] of Object.entries(board.workers)) {
+    if (worker.currentTaskId) {
+      ids.add(workerId);
       worker.currentTaskId = null;
     }
   }
 
-  return { inFlightWorkerIds };
+  return { inFlightWorkerIds: [...ids] };
 }
 
 export function listProjects(): ProjectIndexEntry[] {

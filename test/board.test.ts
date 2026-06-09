@@ -900,6 +900,10 @@ describe("stopBoardBookkeeping", () => {
   });
 
   it("does NOT touch awaiting_review tasks", () => {
+    // In production, when a task enters awaiting_review, the worker's
+    // currentTaskId is cleared by handleTaskComplete (the worker is
+    // either closed or kept alive for a continue-strategy review, but
+    // either way its currentTaskId is null). Mirror that here.
     const workerId = "worker-ar";
     const taskId = "T1";
     const b: Board = {
@@ -914,7 +918,7 @@ describe("stopBoardBookkeeping", () => {
         makeTask(taskId, { status: "awaiting_review", assignedTo: workerId }),
       ],
       workers: {
-        [workerId]: { currentTaskId: taskId, tasksCompleted: [] },
+        [workerId]: { currentTaskId: null, tasksCompleted: [taskId] },
       },
       concurrencyCap: 1,
     };
@@ -925,7 +929,7 @@ describe("stopBoardBookkeeping", () => {
     const task = b.tasks[0]!;
     assert.equal(task.status, "awaiting_review");
     assert.equal(task.assignedTo, workerId);
-    assert.equal(b.workers[workerId].currentTaskId, taskId);
+    assert.equal(b.workers[workerId].currentTaskId, null);
   });
 
   it("handles assigned task with missing worker entry (defensive)", () => {
@@ -954,5 +958,46 @@ describe("stopBoardBookkeeping", () => {
     assert.equal(task.status, "pending");
     assert.equal(task.assignedTo, null);
     assert.equal(task.startedAt, null);
+  });
+
+  it("catches orphaned shadow workers whose task.assignedTo points elsewhere", () => {
+    // Repro of the duplicate-spawn race: two workers were assigned to
+    // the same task (the second's id overwrote task.assignedTo), so
+    // the task-level walk only sees the second one. The first lives on
+    // in board.workers with currentTaskId still set and must also be
+    // collected and cleared by stopBoardBookkeeping.
+    const primary = "worker-primary";
+    const shadow = "worker-shadow";
+    const taskId = "T1";
+    const b: Board = {
+      version: 2,
+      projectId: "proj_sbb_shadow",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks: [
+        makeTask(taskId, {
+          status: "assigned",
+          assignedTo: primary,
+          startedAt: "2025-01-01T00:00:00Z",
+        }),
+      ],
+      workers: {
+        [primary]: { currentTaskId: taskId, tasksCompleted: [] },
+        [shadow]: { currentTaskId: taskId, tasksCompleted: [] },
+      },
+      concurrencyCap: 1,
+    };
+
+    const result = stopBoardBookkeeping(b);
+
+    const ids = [...result.inFlightWorkerIds].sort();
+    assert.deepEqual(ids, [primary, shadow].sort());
+    assert.equal(b.tasks[0]!.status, "pending");
+    assert.equal(b.tasks[0]!.assignedTo, null);
+    assert.equal(b.workers[primary].currentTaskId, null);
+    assert.equal(b.workers[shadow].currentTaskId, null);
   });
 });

@@ -3359,6 +3359,21 @@ export class PlannerBridge {
     // Declared at function scope so it remains in scope after the spawn
     // try-block, where it's recorded on board.workers below.
     const effectiveAgent = resolveAgent(task, board.fleetDefaults);
+    const effectiveModel = resolveModel(task, board.fleetDefaults);
+
+    // Claim the task SYNCHRONOUSLY before any await. Without this,
+    // two concurrent invocations of scheduleEligibleTasks both
+    // pickEligible the same task (still "pending"), both enter this
+    // function, both await ensureAgentChoices/spawn, and both end up
+    // spawning a worker. assignedTo stays null until we have the real
+    // childSessionId; pickEligible's `status === "pending"` test is
+    // what gates duplicate selection, so this is sufficient.
+    task.status = "assigned";
+    task.assignedTo = null;
+    task.startedAt = nowIso();
+    task.attemptCount += 1;
+    saveBoard(board, orchestratorSessionId);
+
     // Make sure the installed-agent list is populated before we validate
     // against it. Without this, a fresh transformer process (e.g. after
     // a restart) has an empty cache and every per-task / fleet-default
@@ -3400,8 +3415,11 @@ export class PlannerBridge {
       log.error(
         `failed to spawn worker for ${task.id}: ${(err as Error).message}`,
       );
+      // Claim was synchronous earlier; this is the spawn-failure path,
+      // so flip to `failed` (attemptCount was already bumped).
       task.status = "failed";
-      task.attemptCount += 1;
+      task.assignedTo = null;
+      task.startedAt = null;
       saveBoard(board, orchestratorSessionId);
       void this.emitSyntheticMessage(
         orchestratorSessionId,
@@ -3419,10 +3437,10 @@ export class PlannerBridge {
     // Abort the claim if the board was stopped/cancelled while we
     // were awaiting spawn + attach. The worker session exists at this
     // point but isn't doing anything yet (no prompt sent); close it and
-    // leave the task pending so a future resume can re-dispatch it.
+    // revert the task to pending so a future resume can re-dispatch it.
     // Without this guard a ^C arriving mid-spawn lets the post-await
-    // code below mark the task assigned and fire the task prompt — the
-    // user's "cancel" then races against a freshly-launched worker.
+    // code below fire the task prompt — the user's "cancel" then races
+    // against a freshly-launched worker.
     if (
       board.state === "stopped" ||
       board.state === "failed" ||
@@ -3431,6 +3449,16 @@ export class PlannerBridge {
       log.info(
         `task ${task.id}: abandoning spawn — board entered "${board.state}" during spawn`,
       );
+      // Revert the synchronous claim so resume can re-dispatch.
+      // stopBoardBookkeeping only runs on tasks with assignedTo set, so
+      // an assigned-but-unattached task wouldn't get reverted by it;
+      // do it explicitly here.
+      if (board.state === "stopped") {
+        task.status = "pending";
+        task.assignedTo = null;
+        task.startedAt = null;
+        saveBoard(board, orchestratorSessionId);
+      }
       void this.closeWorker(childSessionId);
       return;
     }
@@ -3440,7 +3468,6 @@ export class PlannerBridge {
     // session/set_model on the live session. Fire-and-forget: if the
     // worker's agent doesn't accept the model, log a warning and let
     // the task run on the agent's default model.
-    const effectiveModel = resolveModel(task, board.fleetDefaults);
     if (effectiveModel) {
       this.client
         .request("session/set_model", {
@@ -3454,13 +3481,10 @@ export class PlannerBridge {
         });
     }
 
-    // Claim the task: mark assigned + persist BEFORE the outer
-    // scheduler loop can pickEligible again. After this point the
-    // task is no longer "pending" to anyone.
-    task.status = "assigned";
+    // Fill in the real worker id now that we have it. Status was
+    // already flipped to "assigned" at the top of this function;
+    // assignedTo was held null until the childSessionId existed.
     task.assignedTo = childSessionId;
-    task.startedAt = nowIso();
-    task.attemptCount += 1;
     board.workers[childSessionId] = {
       currentTaskId: task.id,
       tasksCompleted: [],
