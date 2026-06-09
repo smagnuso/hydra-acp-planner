@@ -4513,8 +4513,27 @@ export class PlannerBridge {
     board: Board,
     orchestratorSessionId: string,
   ): Promise<void> {
-    const state = getOrchestratorState(orchestratorSessionId);
-    if (!state) return;
+    // Lazy-initialize: if an entry point forgot to seed sessionStates
+    // (e.g. an older MCP-tool path), don't silently no-op — that would
+    // strand the review pending and the scheduler would spin on it
+    // (continue → pickEligible returns same task → again).
+    let state = getOrchestratorState(orchestratorSessionId);
+    if (!state) {
+      log.warn(
+        `review ${reviewTask.id}: orchestrator state missing for …${orchestratorSessionId.slice(-8)}; initializing lazily`,
+      );
+      state = {
+        projectId: board.projectId,
+        decompositionAccumulator: "",
+        addAccumulator: "",
+        awaitingAdd: false,
+        awaitingDecomposition: false,
+        awaitingOrchestratorReview: false,
+        orchestratorReviewTaskId: null,
+        orchestratorReviewAccumulator: "",
+      };
+      setOrchestratorState(orchestratorSessionId, state);
+    }
 
     // Assign the task to the "orchestrator" sentinel so the plan view
     // shows what's happening. Orchestrator-lane reviews don't count
@@ -5208,6 +5227,22 @@ export class PlannerBridge {
     board.pendingExecute = false; // ready, awaiting planner_start
     boards.set(sessionId, board);
     saveBoard(board, sessionId);
+    // Initialize per-session orchestrator state. Mirrors the slash-command
+    // entry points (handleCreate/handleStart). Without this, downstream
+    // code that reads getOrchestratorState (notably runReviewOnOrchestrator)
+    // silently no-ops and the scheduler spins on the same review task.
+    if (!getOrchestratorState(sessionId)) {
+      setOrchestratorState(sessionId, {
+        projectId: board.projectId,
+        decompositionAccumulator: "",
+        addAccumulator: "",
+        awaitingAdd: false,
+        awaitingDecomposition: false,
+        awaitingOrchestratorReview: false,
+        orchestratorReviewTaskId: null,
+        orchestratorReviewAccumulator: "",
+      });
+    }
     // Make sure we're a transformer on the session so subsequent
     // emits (plan panel, hints) reach attached clients.
     try {
