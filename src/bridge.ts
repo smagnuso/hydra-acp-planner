@@ -4449,7 +4449,7 @@ export class PlannerBridge {
       log.info(
         `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=${reviewTask.canApplyFixes ?? "derived:false"}), treating as reject`,
       );
-      this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane`);
+      this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane (canApplyFixes=false)`);
       return;
     }
 

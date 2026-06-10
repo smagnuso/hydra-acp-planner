@@ -113,7 +113,7 @@ describe("applyReviewPolicy — table-driven", () => {
         assert.equal(rev!.status, "pending", `[${row.label}] review status mismatch`);
         assert.equal(rev!.kind, "review", `[${row.label}] review kind mismatch`);
         assert.equal(rev!.reviews, "T1", `[${row.label}] reviews field mismatch`);
-        assert.equal(rev!.runOn, "orchestrator", `[${row.label}] runOn mismatch`);
+        assert.equal(rev!.runOn, undefined, `[${row.label}] runOn should be unset (derived at dispatch by resolveReviewLane)`);
         assert.equal(rev!.attemptCount, 0, `[${row.label}] attemptCount mismatch`);
       }
     });
