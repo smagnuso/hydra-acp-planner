@@ -54,6 +54,13 @@ export interface WorkerState {
   // handleTaskComplete fires without a parseable block. Cap of 1
   // reprompt before we hand off to handleTaskFailure.
   repromptCount: number;
+  // Tool call ids the worker has emitted that we recognized as
+  // TodoWrite-shaped (input contained a `todos` array). The initial
+  // `tool_call` envelope is suppressed and routed to the orchestrator
+  // board's subtodo merge path; subsequent `tool_call_update` envelopes
+  // sharing one of these ids must also be suppressed so the user
+  // doesn't see a stray progress panel attributed to a hidden call.
+  todoToolCallIds?: Set<string>;
 }
 
 const workerStates = new Map<string, WorkerState>();

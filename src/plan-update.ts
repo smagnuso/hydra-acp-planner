@@ -16,7 +16,7 @@
 // identical content; the wire shape is the only difference, so we
 // can flip without retesting board logic.
 
-import type { Board, Task } from "./board.js";
+import type { Board, Task, WorkerSubtodo } from "./board.js";
 import {
   buildAgentMessageChunkEnvelope,
   type UpdateEnvelope,
@@ -24,6 +24,62 @@ import {
 import { shortProjectId } from "./board.js";
 import { formatTaskTag } from "./format.js";
 import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
+
+// Maximum number of a worker's incomplete subtodos to surface in the
+// orchestrator's merged plan panel. Caps growth: 3 workers × this many
+// is the worst-case extra row count beyond the task list. Tunable via
+// PLANNER_WORKER_SUBTODO_CAP env var; default 3 trades peek-ahead value
+// against panel real estate on a 30-row terminal.
+export function workerSubtodoCap(): number {
+  const raw = process.env.PLANNER_WORKER_SUBTODO_CAP;
+  if (raw === undefined || raw === "") return 3;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 3;
+  return n;
+}
+
+// Normalize a raw entries array (from an ACP plan envelope or a
+// TodoWrite tool input) into our internal WorkerSubtodo shape.
+// Tolerates missing/extra fields: unknown statuses collapse to
+// "pending", non-string content is dropped. Returns [] for non-array
+// input so callers can pass straight through without pre-checking.
+export function normalizeSubtodoEntries(raw: unknown): WorkerSubtodo[] {
+  if (!Array.isArray(raw)) return [];
+  const out: WorkerSubtodo[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const obj = item as { content?: unknown; status?: unknown };
+    if (typeof obj.content !== "string") continue;
+    const status =
+      obj.status === "in_progress" || obj.status === "completed"
+        ? obj.status
+        : "pending";
+    out.push({ content: obj.content, status });
+  }
+  return out;
+}
+
+// Pick the first N incomplete subtodos in worker-emit order. Completed
+// items drop off so the panel always shows what's NEXT, never what was
+// — the tool-call stream already covered completed work. Returns
+// {visible, hiddenCount} so the renderer can show a "… +N more" hint
+// when truncated.
+export function pickVisibleSubtodos(
+  subtodos: WorkerSubtodo[] | undefined,
+  cap: number,
+): { visible: WorkerSubtodo[]; hiddenCount: number } {
+  if (!subtodos || subtodos.length === 0 || cap === 0) {
+    return { visible: [], hiddenCount: 0 };
+  }
+  const incomplete = subtodos.filter((s) => s.status !== "completed");
+  if (incomplete.length <= cap) {
+    return { visible: incomplete, hiddenCount: 0 };
+  }
+  return {
+    visible: incomplete.slice(0, cap),
+    hiddenCount: incomplete.length - cap,
+  };
+}
 
 export type PlanRenderMode = "plan" | "ascii";
 
@@ -74,15 +130,41 @@ export function buildPlanUpdateEnvelope(opts: {
       blockedByCount.set(dep, (blockedByCount.get(dep) ?? 0) + 1);
     }
   }
-  const entries = board.tasks.map((t) => {
+  const cap = workerSubtodoCap();
+  // Pre-index: for each assigned task, the worker session id running it.
+  // Lets us look up subtodos by task without scanning board.workers each time.
+  const workerByTask = new Map<string, string>();
+  for (const [wid, w] of Object.entries(board.workers)) {
+    if (w.currentTaskId) workerByTask.set(w.currentTaskId, wid);
+  }
+  const entries: { content: string; priority: "high" | "medium" | "low"; status: "pending" | "in_progress" | "completed" }[] = [];
+  for (const t of board.tasks) {
     const failedPrefix = t.status === "failed" ? "[FAILED] " : "";
-    const content = `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}`;
-    return {
-      content,
+    entries.push({
+      content: `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}`,
       priority: taskPriority(t, blockedByCount),
       status: mapStatus(t),
-    };
-  });
+    });
+    if (t.status !== "assigned") continue;
+    const wid = workerByTask.get(t.id);
+    if (!wid) continue;
+    const subtodos = board.workers[wid]?.subtodos;
+    const { visible, hiddenCount } = pickVisibleSubtodos(subtodos, cap);
+    for (const s of visible) {
+      entries.push({
+        content: `    \u21B3 ${s.content}`,
+        priority: "low",
+        status: s.status,
+      });
+    }
+    if (hiddenCount > 0) {
+      entries.push({
+        content: `    \u2026 +${hiddenCount} more`,
+        priority: "low",
+        status: "pending",
+      });
+    }
+  }
   return {
     sessionId: opts.sessionId,
     update: {
@@ -124,6 +206,11 @@ export function buildAsciiPlanText(board: Board): string {
   const renderedReviews = new Set<string>();
 
   const tagFor = (t: Task) => formatTaskTag(t, board);
+  const cap = workerSubtodoCap();
+  const workerByTask = new Map<string, string>();
+  for (const [wid, w] of Object.entries(board.workers)) {
+    if (w.currentTaskId) workerByTask.set(w.currentTaskId, wid);
+  }
   for (const t of board.tasks) {
     if (t.kind === "review") {
       const line = renderReviewTask(t, renderedReviews, { indent: "    ", renderTaskTag: tagFor });
@@ -132,6 +219,18 @@ export function buildAsciiPlanText(board: Board): string {
     }
     const glyph = STATUS_GLYPH[t.status] ?? "?";
     lines.push(`  ${glyph} ${t.id}  ${t.title}${tagFor(t)}`);
+    if (t.status === "assigned") {
+      const wid = workerByTask.get(t.id);
+      const subtodos = wid ? board.workers[wid]?.subtodos : undefined;
+      const { visible, hiddenCount } = pickVisibleSubtodos(subtodos, cap);
+      for (const s of visible) {
+        const subGlyph = s.status === "in_progress" ? "\u22EF" : s.status === "completed" ? "\u2713" : "\u00B7";
+        lines.push(`      ${subGlyph} ${s.content}`);
+      }
+      if (hiddenCount > 0) {
+        lines.push(`      \u2026 +${hiddenCount} more`);
+      }
+    }
     const childReviews = reviewsByParent.get(t.id);
     if (childReviews) {
       for (const r of childReviews) {

@@ -59,6 +59,7 @@ import {
   buildAsciiPlanEnvelope,
   buildPlanUpdateEnvelope,
   getPlanRenderMode,
+  normalizeSubtodoEntries,
 } from "./plan-update.js";
 import {
   clearHeldTurn,
@@ -95,6 +96,7 @@ import {
   type Task,
   type TaskArtifacts,
   type TaskStatus,
+  type WorkerSubtodo,
 } from "./board.js";
 import { projectDir } from "./paths.js";
 import {
@@ -2993,12 +2995,106 @@ export class PlannerBridge {
       }
       return;
     }
+    if (kind === "plan") {
+      // ACP plan update from the worker. Don't forward as its own
+      // panel (the orchestrator session has only one plan slot, owned
+      // by the board panel) — instead merge into the board panel as
+      // indented sub-rows under the worker's parent task. See
+      // plan-update.ts for the rendering.
+      this.applyWorkerSubtodosFromPlanEnvelope(sessionId, envelope);
+      return;
+    }
     if (kind === "tool_call" || kind === "tool_call_update") {
+      // Some hosts (opencode) emit their internal todolist as a
+      // TodoWrite tool_call rather than an ACP plan envelope. Detect
+      // by input shape (a `todos` array of {content,status,...}),
+      // route the same way as plan updates, and suppress the tool
+      // panel so the user doesn't see a redundant raw TodoWrite UI
+      // alongside the merged board panel. Subsequent tool_call_update
+      // envelopes on the same toolCallId are tracked in
+      // workerState.todoToolCallIds so they're suppressed too.
+      if (this.maybeInterceptTodoWriteToolCall(sessionId, kind, envelope, workerState)) {
+        return;
+      }
       if (forwarder) {
         forwarder.ingestToolUpdate(kind, envelope);
       }
       return;
     }
+  }
+
+  // Translate an ACP plan envelope's entries into WorkerSubtodo[] and
+  // store on the worker's board entry. Triggers an orchestrator plan
+  // update so the merged view re-renders. Best-effort: malformed
+  // envelopes are silently ignored — a missed merge isn't worth
+  // failing for, and the next emit replaces.
+  private applyWorkerSubtodosFromPlanEnvelope(
+    workerSessionId: string,
+    envelope: unknown,
+  ): void {
+    const entries = (envelope as { update?: { entries?: unknown } } | undefined)
+      ?.update?.entries;
+    if (!Array.isArray(entries)) return;
+    this.applyWorkerSubtodos(workerSessionId, normalizeSubtodoEntries(entries));
+  }
+
+  // Detect a TodoWrite-shaped tool_call / tool_call_update; if it
+  // matches, route into the subtodo merge path and return true so the
+  // caller suppresses normal forwarding. tool_call_update may arrive
+  // without input — in that case we just remember the toolCallId was
+  // a TodoWrite (so we keep suppressing it) and skip the merge.
+  private maybeInterceptTodoWriteToolCall(
+    workerSessionId: string,
+    kind: string,
+    envelope: unknown,
+    workerState: { todoToolCallIds?: Set<string> },
+  ): boolean {
+    const update = (envelope as { update?: Record<string, unknown> } | undefined)?.update;
+    if (!update) return false;
+    const toolCallId = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
+    const title = typeof update.title === "string" ? update.title : undefined;
+    const input = update.input ?? update.rawInput;
+    const todosFromInput =
+      input && typeof input === "object" && Array.isArray((input as { todos?: unknown }).todos)
+        ? ((input as { todos: unknown[] }).todos as unknown[])
+        : undefined;
+
+    const ids = workerState.todoToolCallIds;
+    const alreadyKnown = !!(toolCallId && ids?.has(toolCallId));
+    const looksLikeTodoWrite =
+      todosFromInput !== undefined || (title?.toLowerCase().includes("todowrite") ?? false);
+
+    if (!alreadyKnown && !looksLikeTodoWrite) return false;
+
+    if (toolCallId) {
+      const set = workerState.todoToolCallIds ?? new Set<string>();
+      set.add(toolCallId);
+      workerState.todoToolCallIds = set;
+    }
+    if (todosFromInput) {
+      this.applyWorkerSubtodos(workerSessionId, normalizeSubtodoEntries(todosFromInput));
+    }
+    void kind;
+    return true;
+  }
+
+  // Write a normalized subtodo list onto the worker's board record
+  // and re-emit the orchestrator plan panel. No-ops if the worker
+  // has no board entry yet (race with spawn) or no orchestrator.
+  private applyWorkerSubtodos(workerSessionId: string, subtodos: WorkerSubtodo[]): void {
+    const orchestratorId = orchestratorOfWorker(workerSessionId);
+    if (!orchestratorId) return;
+    const board = boards.get(orchestratorId);
+    if (!board) return;
+    const w = board.workers[workerSessionId];
+    if (!w) return;
+    if (subtodos.length === 0) {
+      if (!w.subtodos || w.subtodos.length === 0) return;
+      w.subtodos = [];
+    } else {
+      w.subtodos = subtodos;
+    }
+    this.emitPlanUpdate(orchestratorId, board);
   }
 
   private handleUpdateResponse(reqId: number | string, sessionId: string, envelope: unknown): void {
@@ -3198,11 +3294,18 @@ export class PlannerBridge {
       void this.scheduleEligibleTasks(sessionId, board);
       return;
     }
-    this.emitPlanUpdate(sessionId, board);
-    void this.emitSyntheticMessage(
-      sessionId,
-      `Plan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or \`/hydra planner create <new description>\` to revise.`,
-    );
+    // Dump the full status (description + task list + assignments)
+    // as a one-shot agent_message_chunk, NOT an ACP plan update. The
+    // live plan panel belongs to `/hydra planner continue`'s held
+    // turn — emitting it here would render before any turn exists
+    // to anchor to, duplicate whatever the orchestrator agent emits
+    // later, and conflate "plan was just persisted" (a discrete
+    // event) with "plan is live and updating" (a turn-anchored
+    // panel). Status dump matches the mental model: here's what was
+    // planned; run /start (or /continue) to engage the live view.
+    const statusDump = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const followup = `\nPlan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or \`/hydra planner create <new description>\` to revise.`;
+    void this.emitSyntheticMessage(sessionId, `${statusDump}${followup}`);
   }
 
   // ── Worker scheduling ─────────────────────────────────────────────
@@ -4881,9 +4984,19 @@ export class PlannerBridge {
   private async injectContinueAtHead(sessionId: string): Promise<void> {
     await this.ensureClientAttached(sessionId);
     try {
+      // The trailing instruction tells the host agent (opencode,
+      // Claude Code, etc.) not to emit its own todolist or ACP plan
+      // update in response to this prompt. The planner owns the
+      // live plan panel for this session; a parallel todolist from
+      // the host produces two competing panels updating in lockstep
+      // (see plan-update.ts file header). Hosts that don't honor
+      // the instruction degrade gracefully — the user sees two
+      // panels, which is the pre-fix behavior.
+      const PLANNER_OWNS_PLAN_HINT =
+        "\n\n(Do not call TodoWrite or emit a plan update — the planner owns the live todolist for this session.)";
       await this.client.request("session/prompt", {
         sessionId,
-        prompt: [{ type: "text", text: "/hydra planner continue" }],
+        prompt: [{ type: "text", text: `/hydra planner continue${PLANNER_OWNS_PLAN_HINT}` }],
         _meta: { "hydra-acp": { queuePosition: "head" } },
       });
     } catch (err) {

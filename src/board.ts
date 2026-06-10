@@ -111,6 +111,15 @@ export interface Task {
   canApplyFixes?: boolean;
 }
 
+// A single entry in a worker's internal todolist as observed by the
+// orchestrator. Mirrors the ACP plan-entry shape (content + status)
+// minus the priority field, which we don't surface in the merged
+// board view. Status maps directly to ACP statuses.
+export interface WorkerSubtodo {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
 export interface WorkerUsage {
   used?: number;
   size?: number;
@@ -232,6 +241,13 @@ export interface Board {
     // Cost is cumulative within the worker's lifetime; we aggregate
     // across workers for the project total in formatStatus.
     usage?: WorkerUsage;
+    // Last-observed worker-internal todolist, captured from the
+    // worker's ACP `plan` updates and/or `TodoWrite` tool calls.
+    // Surfaced in the orchestrator board panel as indented sub-rows
+    // beneath the parent task (capped at the first N incomplete by
+    // worker order — see plan-update.ts). Ephemeral: not persisted
+    // across daemon restarts; the next worker emit rebuilds them.
+    subtodos?: WorkerSubtodo[];
   }>;
   concurrencyCap: number;
   // When true, decomposition won't recompute concurrencyCap from the
