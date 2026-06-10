@@ -93,6 +93,12 @@ export function applyReviewPolicy(board: Board, policy?: ReviewPolicy): Board {
     if (p.maxAttempts !== undefined) {
       synthesized.onReject = { maxAttempts: p.maxAttempts };
     }
+    // Per-work-task review-agent/model overrides take precedence over
+    // fleetDefaults.review.{agent,model} at resolve time. Copy them onto
+    // the synthesized review's own agent/model so resolveAgent/resolveModel
+    // (which check task.agent/task.model first) pick them up.
+    if (t.reviewAgent) synthesized.agent = t.reviewAgent;
+    if (t.reviewModel) synthesized.model = t.reviewModel;
     tasks.push(synthesized);
     reviewedBy.set(t.id, `review-${t.id}`);
     changed = true;

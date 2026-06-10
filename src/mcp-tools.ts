@@ -179,6 +179,30 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
                 type: "string",
                 description: "Optional per-task model override.",
               },
+              reviewAgent: {
+                type: "string",
+                description:
+                  "Optional agent override for the synthesized review of this task. Falls through to fleetDefaults.review.agent. Ignored on tasks with kind='review'.",
+              },
+              reviewModel: {
+                type: "string",
+                description:
+                  "Optional model override for the synthesized review of this task. Falls through to fleetDefaults.review.model.",
+              },
+              kind: {
+                type: "string",
+                enum: ["work", "review"],
+                description:
+                  "Task kind. Defaults to 'work'. Use 'review' to author a hand-rolled review task (e.g. a competition referee); pair with `reviews` to point at the work tasks being reviewed.",
+              },
+              reviews: {
+                description:
+                  "For kind='review' tasks: the work-task id (string) or ids (array) this review evaluates. Used by the competition pattern to nominate a single referee for sibling implementations.",
+                oneOf: [
+                  { type: "string" },
+                  { type: "array", items: { type: "string" } },
+                ],
+              },
             },
           },
         },

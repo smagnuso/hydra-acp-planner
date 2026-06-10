@@ -27,6 +27,12 @@ For each task specify:
                        from the list below. Omit (or set null) when the default agent fits.
   - model (optional): model id to apply on the worker session at bootstrap (e.g. a
                        stronger model for harder tasks). Omit when the default model fits.
+  - reviewAgent (optional): agent id to use for THIS task's review (when one is synthesized).
+                              Use when the reviewer needs different expertise than the worker —
+                              e.g. a security specialist reviewing crypto code written by a generalist.
+                              Omit when the fleet-wide review agent (or default) fits.
+  - reviewModel (optional): model id for THIS task's review. Use for stronger reasoning on
+                              high-risk reviews. Omit when the default fits.
   - riskLevel: one of "low", "medium", or "high" — how risky is this task?
   - reviewHint: one of "skip", "optional", "recommended", or "required" — how strongly
                   should a human review be applied after the work is done?
@@ -329,6 +335,8 @@ export function normalizeAddedTasks(
       ? t.deps.filter((d): d is string => typeof d === "string")
       : [];
     newIds.add(id);
+    const kind = validateKind(t.kind);
+    const reviews = validateReviews(t.reviews);
     tasks.push({
       id,
       title: title || `Task ${id}`,
@@ -338,6 +346,10 @@ export function normalizeAddedTasks(
       deps,
       agent: typeof t.agent === "string" ? t.agent : null,
       model: typeof t.model === "string" ? t.model : null,
+      reviewAgent: typeof t.reviewAgent === "string" ? t.reviewAgent : null,
+      reviewModel: typeof t.reviewModel === "string" ? t.reviewModel : null,
+      ...(kind ? { kind } : {}),
+      ...(reviews ? { reviews } : {}),
       riskLevel: validateRiskLevel(t.riskLevel),
       reviewHint: validateReviewHint(t.reviewHint),
       status: "pending",
@@ -376,6 +388,26 @@ function validateReviewHint(v: unknown): "skip" | "optional" | "recommended" | "
   return "optional";
 }
 
+// Coerce a `kind` field from raw input. Defaults to undefined (work)
+// when missing or invalid — preserves the existing default of "work"
+// semantics throughout the planner.
+function validateKind(v: unknown): "work" | "review" | undefined {
+  if (v === "work" || v === "review") return v;
+  return undefined;
+}
+
+// Coerce a `reviews` field from raw input. Accepts string or array of
+// strings (matching the Task.reviews shape). Returns undefined when
+// missing or malformed.
+function validateReviews(v: unknown): string | string[] | undefined {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) {
+    const out = v.filter((s): s is string => typeof s === "string");
+    if (out.length > 0) return out;
+  }
+  return undefined;
+}
+
 // Validate and normalize the parsed JSON into Task records. The agent
 // follows the schema mostly, but we defend against missing fields,
 // duplicate ids, dangling deps, and id ordering issues.
@@ -408,6 +440,8 @@ export function normalizeDecomposition(raw: unknown): DecompositionResult | unde
       ? t.deps.filter((d): d is string => typeof d === "string")
       : [];
     seenIds.add(id);
+    const kind = validateKind(t.kind);
+    const reviews = validateReviews(t.reviews);
     tasks.push({
       id,
       title: title || `Task ${id}`,
@@ -417,6 +451,10 @@ export function normalizeDecomposition(raw: unknown): DecompositionResult | unde
       deps,
       agent: typeof t.agent === "string" ? t.agent : null,
       model: typeof t.model === "string" ? t.model : null,
+      reviewAgent: typeof t.reviewAgent === "string" ? t.reviewAgent : null,
+      reviewModel: typeof t.reviewModel === "string" ? t.reviewModel : null,
+      ...(kind ? { kind } : {}),
+      ...(reviews ? { reviews } : {}),
       riskLevel: validateRiskLevel(t.riskLevel),
       reviewHint: validateReviewHint(t.reviewHint),
       status: "pending",

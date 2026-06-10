@@ -82,6 +82,13 @@ export interface Task {
   deps: string[];
   agent?: string | null;
   model?: string | null;
+  // Per-task override for the synthesized review task's agent/model.
+  // applyReviewPolicy copies these onto the review it generates for this
+  // work task. Independent of `agent`/`model` (which configure the work
+  // task itself). Falls through to fleetDefaults.review.{agent,model}
+  // when unset. Ignored on tasks with kind="review".
+  reviewAgent?: string | null;
+  reviewModel?: string | null;
   status: TaskStatus;
   assignedTo?: string | null;
   attemptCount: number;

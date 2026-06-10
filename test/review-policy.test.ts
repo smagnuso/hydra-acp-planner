@@ -333,6 +333,20 @@ describe("applyReviewPolicy — table-driven", () => {
     }
   });
 
+  it("reviewAgent/reviewModel on a work task propagate to the synthesized review", () => {
+    const b = makeBoard([
+      work("T1", { reviewAgent: "security-expert", reviewModel: "opus" }),
+      work("T2"),
+    ]);
+    const result = applyReviewPolicy(b, { mode: "all", overrideHint: false });
+    const r1 = result.tasks.find((t) => t.id === "review-T1")!;
+    assert.equal(r1.agent, "security-expert");
+    assert.equal(r1.model, "opus");
+    const r2 = result.tasks.find((t) => t.id === "review-T2")!;
+    assert.equal(r2.agent, undefined);
+    assert.equal(r2.model, undefined);
+  });
+
   it("synthesized reviews are appended in declaration order", () => {
     const b = makeBoard([work("T1"), work("T2"), work("T3")]);
     const result = applyReviewPolicy(b, { mode: "all", overrideHint: false });

@@ -204,6 +204,53 @@ describe("normalizeDecomposition", () => {
     assert.equal(got!.tasks[1]!.model, null);
   });
 
+  it("preserves reviewAgent/reviewModel per task", () => {
+    const got = normalizeDecomposition({
+      tasks: [
+        {
+          id: "T1",
+          title: "ok",
+          deps: [],
+          reviewAgent: "security-expert",
+          reviewModel: "opus",
+        },
+        { id: "T2", title: "default", deps: [] },
+      ],
+    });
+    assert.equal(got!.tasks[0]!.reviewAgent, "security-expert");
+    assert.equal(got!.tasks[0]!.reviewModel, "opus");
+    assert.equal(got!.tasks[1]!.reviewAgent, null);
+    assert.equal(got!.tasks[1]!.reviewModel, null);
+  });
+
+  it("preserves kind and reviews for hand-authored review tasks", () => {
+    const got = normalizeDecomposition({
+      tasks: [
+        { id: "T1", title: "impl A", deps: [] },
+        { id: "T2", title: "impl B", deps: [] },
+        {
+          id: "R",
+          title: "pick winner",
+          deps: ["T1", "T2"],
+          kind: "review",
+          reviews: ["T1", "T2"],
+          agent: "referee-agent",
+        },
+      ],
+    });
+    const r = got!.tasks.find((t) => t.id === "R")!;
+    assert.equal(r.kind, "review");
+    assert.deepEqual(r.reviews, ["T1", "T2"]);
+    assert.equal(r.agent, "referee-agent");
+  });
+
+  it("ignores invalid kind values (treats as work / undefined)", () => {
+    const got = normalizeDecomposition({
+      tasks: [{ id: "T1", title: "x", deps: [], kind: "bogus" }],
+    });
+    assert.equal(got!.tasks[0]!.kind, undefined);
+  });
+
   it("surfaces a top-level description (trimmed) when present", () => {
     const got = normalizeDecomposition({
       description: "  build a todo app  ",
