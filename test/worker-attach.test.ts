@@ -163,7 +163,7 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
         childSessionId,
       }));
 
-      dispatch(mkInvoke(10, "planner_start", {}));
+      dispatch(mkInvoke(10, "start", {}));
       await settle();
 
       // The board should have transitioned to running.

@@ -2655,7 +2655,7 @@ export class PlannerBridge {
         : "";
     resolveHeldTurn(orchestratorSessionId, {
       reason: "cancelled",
-      text: `Project ${shortProjectId(board.projectId)} stopped${tail}. Use /hydra planner start (or planner_start) to resume.`,
+      text: `Project ${shortProjectId(board.projectId)} stopped${tail}. Use /hydra planner start (or the start tool) to resume.`,
     });
    }
 
@@ -2683,7 +2683,7 @@ export class PlannerBridge {
     const failedIds = failed.map((t) => t.id).join(", ");
     const msg =
       `Project ${shortProjectId(board.projectId)} is stuck: ${pending} pending task${pending === 1 ? "" : "s"} blocked by failed dep${failed.length === 1 ? "" : "s"} ${failedIds}. ` +
-      `Use \`/hydra planner retry\` (or planner_retry with no taskId) to retry all failed tasks, ` +
+      `Use \`/hydra planner retry\` (or the retry tool with no taskId) to retry all failed tasks, ` +
       `or \`/hydra planner skip <id>\` to accept a failure and unblock dependents that are still reachable.`;
     log.info(
       `project ${shortProjectId(board.projectId)} blocked by failed deps [${failedIds}]; ${pending} pending task${pending === 1 ? "" : "s"} unreachable`,
@@ -3094,9 +3094,9 @@ export class PlannerBridge {
   // reply and delegates to the shared persistence layer.
   //
   // This is the non-MCP path: agents that don't speak the
-  // planner_set_plan MCP tool emit fenced JSON which we extract and
+  // set_plan MCP tool emit fenced JSON which we extract and
   // parse. MCP-speaking agents skip this code path — they call
-  // planner_set_plan directly with structured input, and the MCP
+  // set_plan directly with structured input, and the MCP
   // tool handler calls setPlan with the same shape we'd reconstruct
   // from the fenced block here.
   private finishDecomposition(
@@ -3135,7 +3135,7 @@ export class PlannerBridge {
 
   // Shared persistence layer for plan materialization. Used by:
   //   - finishDecomposition (fenced-JSON path, for non-MCP agents)
-  //   - planner_set_plan MCP tool (for MCP-capable agents)
+  //   - set_plan MCP tool (for MCP-capable agents)
   //
   // Takes an already-normalized DecompositionResult (tasks + optional
   // description + warnings) and:
@@ -3150,7 +3150,7 @@ export class PlannerBridge {
   // Idempotent on the board reference — caller owns the board and
   // any pre-call mutations are visible. pendingExecute is cleared
   // after the transition so subsequent setPlan calls (e.g. user
-  // revises via planner_set_plan) default to ready unless explicitly
+  // revises via set_plan) default to ready unless explicitly
   // re-flagged.
   private setPlan(
     sessionId: string,
@@ -5039,31 +5039,31 @@ export class PlannerBridge {
     log.info(`mcp tool ${tool} on session …${sessionId.slice(-8)}`);
     try {
       switch (tool) {
-        case "planner_list_agents":
+        case "list_agents":
           return await this.toolListAgents(req.id);
-        case "planner_set_plan":
+        case "set_plan":
           return await this.toolSetPlan(req.id, sessionId, args);
-        case "planner_start":
+        case "start":
           return await this.toolExecute(req.id, sessionId);
-        case "planner_get_plan":
+        case "get_plan":
           return this.toolGetPlan(req.id, sessionId);
-        case "planner_get_status":
+        case "get_status":
           return this.toolGetStatus(req.id, sessionId);
-        case "planner_add_task":
+        case "add_task":
           return await this.toolAddTask(req.id, sessionId, args);
-        case "planner_stop":
+        case "stop":
           return this.toolStop(req.id, sessionId);
-        case "planner_pause":
+        case "pause":
           return this.toolPause(req.id, sessionId);
-        case "planner_resume":
+        case "resume":
           return this.toolResume(req.id, sessionId);
-        case "planner_skip":
+        case "skip":
           return this.toolSkip(req.id, sessionId, args);
-        case "planner_retry":
+        case "retry":
           return this.toolRetry(req.id, sessionId, args);
-        case "planner_restart":
+        case "restart":
           return this.toolRestart(req.id, sessionId);
-        case "planner_remove":
+        case "remove":
           return this.toolRemove(req.id, sessionId);
         default:
           return this.replyMcpTextError(req.id, `unknown planner tool: ${tool}`);
@@ -5123,11 +5123,11 @@ export class PlannerBridge {
   ): Promise<void> {
     const description = typeof args.description === "string" ? args.description.trim() : "";
     if (!description) {
-      return this.replyMcpTextError(reqId, "planner_set_plan: missing required `description`");
+      return this.replyMcpTextError(reqId, "set_plan: missing required `description`");
     }
     const tasksRaw = args.tasks;
     if (!Array.isArray(tasksRaw) || tasksRaw.length === 0) {
-      return this.replyMcpTextError(reqId, "planner_set_plan: `tasks` must be a non-empty array");
+      return this.replyMcpTextError(reqId, "set_plan: `tasks` must be a non-empty array");
     }
     // Reuse the fenced-JSON normalizer — same task shape, same
     // validation. The agent's tool input is already structured but
@@ -5139,7 +5139,7 @@ export class PlannerBridge {
     if (!normalized || normalized.tasks.length === 0) {
       return this.replyMcpTextError(
         reqId,
-        "planner_set_plan: tasks failed validation (need at least one valid task with id, title, and deps)",
+        "set_plan: tasks failed validation (need at least one valid task with id, title, and deps)",
       );
     }
 
@@ -5156,7 +5156,7 @@ export class PlannerBridge {
     ) {
       return this.replyMcpTextError(
         reqId,
-        `planner_set_plan: project ${shortProjectId(existing.projectId)} is already ${existing.state}. Stop or remove it first.`,
+        `set_plan: project ${shortProjectId(existing.projectId)} is already ${existing.state}. Stop or remove it first.`,
       );
     }
     // Clean up a prior ready draft on disk before overwriting (same
@@ -5248,7 +5248,7 @@ export class PlannerBridge {
     if (boardReviewPolicy) {
       board.reviewPolicy = boardReviewPolicy;
     }
-    board.pendingExecute = false; // ready, awaiting planner_start
+    board.pendingExecute = false; // ready, awaiting start
     boards.set(sessionId, board);
     saveBoard(board, sessionId);
     // Initialize per-session orchestrator state. Mirrors the slash-command
@@ -5288,7 +5288,7 @@ export class PlannerBridge {
     const titles = normalized.tasks
       .map((t) => `${t.id} ${t.title}`)
       .join(" · ");
-    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}): ${titles}. Call planner_start when ready to start.`;
+    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.`;
     this.replyMcpResult(reqId, summary, {
       projectId: board.projectId,
       replacedReadyProjectId: replacedReadyId,
@@ -5303,19 +5303,19 @@ export class PlannerBridge {
     if (!board) {
       return this.replyMcpTextError(
         reqId,
-        "planner_start: no plan on this session. Call planner_set_plan first.",
+        "start: no plan on this session. Call set_plan first.",
       );
     }
     if (board.state === "running") {
       return this.replyMcpTextError(
         reqId,
-        `planner_start: project ${shortProjectId(board.projectId)} is already running.`,
+        `start: project ${shortProjectId(board.projectId)} is already running.`,
       );
     }
     if (board.state === "done" || board.state === "failed") {
       return this.replyMcpTextError(
         reqId,
-        `planner_start: project ${shortProjectId(board.projectId)} is ${board.state}. Call planner_set_plan to start a new project.`,
+        `start: project ${shortProjectId(board.projectId)} is ${board.state}. Call set_plan to start a new project.`,
       );
     }
     // ready and stopped are both eligible starting points. ready =
@@ -5325,7 +5325,7 @@ export class PlannerBridge {
     if (board.state !== "ready" && board.state !== "stopped" && board.state !== "paused") {
       return this.replyMcpTextError(
         reqId,
-        `planner_start: project ${shortProjectId(board.projectId)} is ${board.state}; not ready to start.`,
+        `start: project ${shortProjectId(board.projectId)} is ${board.state}; not ready to start.`,
       );
     }
     // Transition ready/paused/stopped → running and kick off the
@@ -5336,7 +5336,7 @@ export class PlannerBridge {
     // want.
     const result = await this.resumeBoardToRunning(sessionId, board);
     if (!result) {
-      return this.replyMcpTextError(reqId, `planner_start: project ${shortProjectId(board.projectId)} could not be resumed (unexpected state).`);
+      return this.replyMcpTextError(reqId, `start: project ${shortProjectId(board.projectId)} could not be resumed (unexpected state).`);
     }
     // Inject /hydra planner continue at the head of the session's
     // queue so the TUI opens a held live view automatically. Without
@@ -5363,7 +5363,7 @@ export class PlannerBridge {
     if (!board) {
       return this.replyMcpResult(
         reqId,
-        "No plan on this session. Use planner_set_plan to create one.",
+        "No plan on this session. Use set_plan to create one.",
         { hasPlan: false },
       );
     }
@@ -5460,7 +5460,7 @@ export class PlannerBridge {
   ): Promise<void> {
     const description = typeof args.description === "string" ? args.description.trim() : "";
     if (!description) {
-      return this.replyMcpTextError(reqId, "planner_add_task: missing required `description`");
+      return this.replyMcpTextError(reqId, "add_task: missing required `description`");
     }
     const ctx = this.requireBoardForTool(sessionId);
     if ("error" in ctx) {
@@ -5486,7 +5486,7 @@ export class PlannerBridge {
   private toolStop(reqId: number | string, sessionId: string): void {
     const board = boards.get(sessionId);
     if (!board) {
-      return this.replyMcpTextError(reqId, "planner_stop: no project on this session");
+      return this.replyMcpTextError(reqId, "stop: no project on this session");
     }
     if (
       board.state === "done" ||
@@ -5502,20 +5502,20 @@ export class PlannerBridge {
     void this.runProjectStop(sessionId, board, "slash");
     this.replyMcpResult(
       reqId,
-      `Stopped ${shortProjectId(board.projectId)}${inFlight > 0 ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} reverted to pending` : ""}. Call planner_start to resume.`,
+      `Stopped ${shortProjectId(board.projectId)}${inFlight > 0 ? `; ${inFlight} in-flight task${inFlight === 1 ? "" : "s"} reverted to pending` : ""}. Call start to resume.`,
     );
   }
 
   private toolPause(reqId: number | string, sessionId: string): void {
     const board = boards.get(sessionId);
-    if (!board) return this.replyMcpTextError(reqId, "planner_pause: no project on this session");
+    if (!board) return this.replyMcpTextError(reqId, "pause: no project on this session");
     if (board.state === "paused") {
       return this.replyMcpResult(reqId, `${shortProjectId(board.projectId)} is already paused.`);
     }
     if (board.state !== "running") {
       return this.replyMcpTextError(
         reqId,
-        `planner_pause: project is ${board.state}; can only pause a running project.`,
+        `pause: project is ${board.state}; can only pause a running project.`,
       );
     }
     setBoardState(board, "paused");
@@ -5529,11 +5529,11 @@ export class PlannerBridge {
 
   private toolResume(reqId: number | string, sessionId: string): void {
     const board = boards.get(sessionId);
-    if (!board) return this.replyMcpTextError(reqId, "planner_resume: no project on this session");
+    if (!board) return this.replyMcpTextError(reqId, "resume: no project on this session");
     if (board.state !== "paused") {
       return this.replyMcpTextError(
         reqId,
-        `planner_resume: project is ${board.state}, not paused.`,
+        `resume: project is ${board.state}, not paused.`,
       );
     }
     setBoardState(board, "running");
@@ -5551,12 +5551,12 @@ export class PlannerBridge {
     args: Record<string, unknown>,
   ): void {
     const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
-    if (!taskId) return this.replyMcpTextError(reqId, "planner_skip: missing required `taskId`");
+    if (!taskId) return this.replyMcpTextError(reqId, "skip: missing required `taskId`");
     const ctx = this.requireBoardForTool(sessionId);
     if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
     const { board } = ctx;
     const task = board.tasks.find((t) => t.id === taskId);
-    if (!task) return this.replyMcpTextError(reqId, `planner_skip: no task '${taskId}' in this project`);
+    if (!task) return this.replyMcpTextError(reqId, `skip: no task '${taskId}' in this project`);
     if (task.status === "done") {
       return this.replyMcpResult(reqId, `${taskId} is already done.`);
     }
@@ -5602,7 +5602,7 @@ export class PlannerBridge {
       if (failed.length === 0) {
         return this.replyMcpTextError(
           reqId,
-          "planner_retry: no failed tasks; pass `taskId` to retry a specific task",
+          "retry: no failed tasks; pass `taskId` to retry a specific task",
         );
       }
       for (const task of failed) {
@@ -5611,7 +5611,7 @@ export class PlannerBridge {
       resetIds = failed.map((t) => t.id);
     } else {
       const task = board.tasks.find((t) => t.id === taskId);
-      if (!task) return this.replyMcpTextError(reqId, `planner_retry: no task '${taskId}' in this project`);
+      if (!task) return this.replyMcpTextError(reqId, `retry: no task '${taskId}' in this project`);
       this.retryOne(board, sessionId, task);
       resetIds = [taskId];
     }
@@ -5644,7 +5644,7 @@ export class PlannerBridge {
     if (board.state === "decomposing") {
       return this.replyMcpTextError(
         reqId,
-        `planner_restart: project ${shortProjectId(board.projectId)} is decomposing — wait for it to finish`,
+        `restart: project ${shortProjectId(board.projectId)} is decomposing — wait for it to finish`,
       );
     }
 
@@ -5704,7 +5704,7 @@ export class PlannerBridge {
   private toolRemove(reqId: number | string, sessionId: string): void {
     const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
     if (!board) {
-      return this.replyMcpTextError(reqId, "planner_remove: no project on this session");
+      return this.replyMcpTextError(reqId, "remove: no project on this session");
     }
     const canonical = board.projectId;
     const workerIds = Object.keys(board.workers);
@@ -5745,12 +5745,12 @@ export class PlannerBridge {
     if (!board) {
       return {
         error:
-          "no plan in this session yet. Use planner_set_plan to create one, or /hydra planner create.",
+          "no plan in this session yet. Use set_plan to create one, or /hydra planner create.",
       };
     }
     if (board.state === "done" || board.state === "failed") {
       return {
-        error: `project ${shortProjectId(board.projectId)} is ${board.state}; use planner_set_plan to start a new one.`,
+        error: `project ${shortProjectId(board.projectId)} is ${board.state}; use set_plan to start a new one.`,
       };
     }
     return { board };

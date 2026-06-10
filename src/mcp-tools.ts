@@ -15,7 +15,7 @@ planner extension.
 When the user asks you to build, fix, refactor, or otherwise execute \
 work that decomposes into multiple parallelizable tasks, use these \
 tools to form and run plans. Iterate the plan in dialog: the user \
-proposes changes, you regenerate the DAG and call planner_set_plan \
+proposes changes, you regenerate the DAG and call set_plan \
 again. Don't dump task JSON into chat — pass it as the tool's input.
 
 Workflow:
@@ -25,8 +25,8 @@ Workflow:
      optional per-task agent / model). Identify what can run in \
      parallel via task dependencies.
 
-  2. Call planner_set_plan with the DAG to materialize it as a \
-     ready plan. Use planner_list_agents first if you want to know \
+  2. Call set_plan with the DAG to materialize it as a \
+     ready plan. Use list_agents first if you want to know \
      what agents are available for per-task overrides.
 
   3. Narrate the plan to the user in plain language. Don't repeat \
@@ -35,24 +35,24 @@ Workflow:
 
   4. If the user wants to revise (more parallelism, add/remove \
      tasks, change constraints, switch agents/models), regenerate \
-     the DAG and call planner_set_plan again. The new plan replaces \
+     the DAG and call set_plan again. The new plan replaces \
      the old draft.
 
-  5. When the user agrees, call planner_start to kick off workers.
+  5. When the user agrees, call start to kick off workers.
 
-  6. While running, call planner_get_status when the user asks \
-     about progress, planner_add_task to slot in mid-flight \
-     additions, or planner_stop / planner_pause / planner_resume \
+  6. While running, call get_status when the user asks \
+     about progress, add_task to slot in mid-flight \
+     additions, or stop / pause / resume \
      to control execution.
 
 User-stated preferences (worker count, preferred agent/model, \
 specific overrides for particular tasks) MUST be embedded in your \
-planner_set_plan call exactly as specified — concurrencyCap for \
+set_plan call exactly as specified — concurrencyCap for \
 worker count, fleetDefaults for session-wide preferences, per-task \
 agent/model for specific overrides. Never silently override what \
 the user requested.
 
-Never call planner_start without the user's explicit go-ahead.\
+Never call start without the user's explicit go-ahead.\
 `;
 
 export interface PlannerMcpTool {
@@ -63,7 +63,7 @@ export interface PlannerMcpTool {
 
 export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
-    name: "planner_list_agents",
+    name: "list_agents",
     description:
       "List the agents available for spawning workers on this session's tasks. Returns an array of {id, description} pairs. Call this when you're deciding per-task agent overrides and want to know what's installed. The default agent (used when no per-task or fleet override is set) is whatever this session was created with — usually the same agent that's currently talking.",
     inputSchema: {
@@ -72,9 +72,9 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_set_plan",
+    name: "set_plan",
     description:
-      "Persist a task DAG as a ready plan for this session. Replaces any existing ready plan. Use this when the user has settled on what they want built, or wants to revise a draft. Returns a summary the user-facing turn can narrate. Does NOT start execution — call planner_start separately when the user agrees.",
+      "Persist a task DAG as a ready plan for this session. Replaces any existing ready plan. Use this when the user has settled on what they want built, or wants to revise a draft. Returns a summary the user-facing turn can narrate. Does NOT start execution — call start separately when the user agrees.",
     inputSchema: {
       type: "object",
       required: ["description", "tasks"],
@@ -115,7 +115,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
             agent: {
               type: "string",
               description:
-                "Default agent id. Use planner_list_agents to discover valid ids.",
+                "Default agent id. Use list_agents to discover valid ids.",
             },
             model: {
               type: "string",
@@ -163,7 +163,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
               agent: {
                 type: "string",
                 description:
-                  "Optional per-task agent override. Use a value from planner_list_agents. Falls through to fleetDefaults.agent then daemon default.",
+                  "Optional per-task agent override. Use a value from list_agents. Falls through to fleetDefaults.agent then daemon default.",
               },
               model: {
                 type: "string",
@@ -176,25 +176,25 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_start",
+    name: "start",
     description:
-      "Kick off the ready plan on this session. If no ready plan exists, fails with a hint to call planner_set_plan first. Returns when the worker scheduler is started — progress is observable via subsequent planner_get_status calls or via the live plan rendering in the orchestrator's turn.",
+      "Kick off the ready plan on this session. If no ready plan exists, fails with a hint to call set_plan first. Returns when the worker scheduler is started — progress is observable via subsequent get_status calls or via the live plan rendering in the orchestrator's turn.",
     inputSchema: {
       type: "object",
       properties: {},
     },
   },
   {
-    name: "planner_get_plan",
+    name: "get_plan",
     description:
-      "Return the current plan for this session as structured data. Useful for inspecting what's there before revising, or for answering user questions about the plan structure. Returns the same shape that planner_set_plan accepts plus runtime fields like task status and assigned worker.",
+      "Return the current plan for this session as structured data. Useful for inspecting what's there before revising, or for answering user questions about the plan structure. Returns the same shape that set_plan accepts plus runtime fields like task status and assigned worker.",
     inputSchema: {
       type: "object",
       properties: {},
     },
   },
   {
-    name: "planner_get_status",
+    name: "get_status",
     description:
       "Return the current execution status: task counts (pending / in-flight / done / failed), in-flight workers and what task each is on, recent completions with their result summaries. Use when the user asks 'where are we' or 'what's happening now.'",
     inputSchema: {
@@ -203,7 +203,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_add_task",
+    name: "add_task",
     description:
       "Slot a new task into a running or ready plan. The agent will be asked to figure out where it fits in the DAG. Use when the user adds a requirement mid-flight ('also make sure to retry HTTP failures').",
     inputSchema: {
@@ -218,7 +218,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_restart",
+    name: "restart",
     description:
       "Reset every task on the board to pending and run the whole plan from scratch. Closes any in-flight workers, clears artifacts and reviewFeedback, and re-engages the scheduler. The plan structure (titles, deps, agents, reviews) stays intact — only per-task runtime state is wiped. Use when the user wants to redo a project end-to-end after the source tree has changed underneath the plan (e.g. stashed/applied a patch).",
     inputSchema: {
@@ -227,25 +227,25 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_stop",
+    name: "stop",
     description:
-      "Stop the running project. Force-cancels in-flight workers and reverts those tasks to pending; the project moves to state 'stopped' and is resumable via planner_start. Use when the user wants to halt work but might come back to it. Distinct from planner_remove (which deletes the project) and planner_pause (which lets in-flight workers finish).",
+      "Stop the running project. Force-cancels in-flight workers and reverts those tasks to pending; the project moves to state 'stopped' and is resumable via start. Use when the user wants to halt work but might come back to it. Distinct from remove (which deletes the project) and pause (which lets in-flight workers finish).",
     inputSchema: {
       type: "object",
       properties: {},
     },
   },
   {
-    name: "planner_pause",
+    name: "pause",
     description:
-      "Stop scheduling new tasks. In-flight workers run to completion; their results land normally; no new tasks dispatch until planner_resume. Use when the user wants to take a break or inspect intermediate state.",
+      "Stop scheduling new tasks. In-flight workers run to completion; their results land normally; no new tasks dispatch until resume. Use when the user wants to take a break or inspect intermediate state.",
     inputSchema: {
       type: "object",
       properties: {},
     },
   },
   {
-    name: "planner_resume",
+    name: "resume",
     description: "Resume scheduling on a paused project.",
     inputSchema: {
       type: "object",
@@ -253,7 +253,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_skip",
+    name: "skip",
     description:
       "Mark a task done without running it (artifacts: 'skipped by user'). Frees its worker if assigned. Use when the user has decided a task isn't needed after all.",
     inputSchema: {
@@ -268,7 +268,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_retry",
+    name: "retry",
     description:
       "Reset a task to pending and resume work. If it's currently assigned, closes its worker (work is discarded), bumps attemptCount, schedules a fresh attempt. If the project was in `stopped` state, also flips it back to running. Use when a task got into a bad state and the user wants to try again from scratch. Omit `taskId` to retry every task currently in `failed` status — the common recovery flow after a stuck-board notice.",
     inputSchema: {
@@ -282,9 +282,9 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
   {
-    name: "planner_remove",
+    name: "remove",
     description:
-      "Delete this session's project. Closes worker sessions; orchestrator session is left intact. Use only when the user is done with the project entirely — for stopping work without deleting, use planner_stop.",
+      "Delete this session's project. Closes worker sessions; orchestrator session is left intact. Use only when the user is done with the project entirely — for stopping work without deleting, use stop.",
     inputSchema: {
       type: "object",
       properties: {},

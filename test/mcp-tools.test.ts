@@ -171,7 +171,7 @@ describe("handleMcpToolInvoke dispatcher", () => {
       jsonrpc: "2.0",
       id: 1,
       method: "hydra-acp/mcp_tools/invoke",
-      params: { tool: "planner_list_agents", args: {} },
+      params: { tool: "list_agents", args: {} },
     });
     await settle();
     const r = client.lastReply();
@@ -202,12 +202,12 @@ describe("handleMcpToolInvoke dispatcher", () => {
   });
 });
 
-// ── planner_list_agents ────────────────────────────────────────────
+// ── list_agents ────────────────────────────────────────────
 
-describe("planner_list_agents", () => {
+describe("list_agents", () => {
   it("returns no-agents text when daemon reports none installed", async () => {
     client.responders.set("hydra-acp/agents/list", () => ({ agents: [] }));
-    dispatch(mkInvoke(10, "planner_list_agents", {}));
+    dispatch(mkInvoke(10, "list_agents", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { content: Array<{ text: string }>; structuredContent: { agents: unknown[] } };
@@ -224,7 +224,7 @@ describe("planner_list_agents", () => {
         { id: 42, description: "bogus", installed: "yes" }, // non-string id
       ],
     }));
-    dispatch(mkInvoke(11, "planner_list_agents", {}));
+    dispatch(mkInvoke(11, "list_agents", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { content: Array<{ text: string }>; structuredContent: { agents: Array<{ id: string }> } };
@@ -238,11 +238,11 @@ describe("planner_list_agents", () => {
   });
 });
 
-// ── planner_set_plan ───────────────────────────────────────────────
+// ── set_plan ───────────────────────────────────────────────
 
-describe("planner_set_plan", () => {
+describe("set_plan", () => {
   it("errors when description is missing", async () => {
-    dispatch(mkInvoke(20, "planner_set_plan", { tasks: [{ id: "T1", title: "x" }] }));
+    dispatch(mkInvoke(20, "set_plan", { tasks: [{ id: "T1", title: "x" }] }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -251,7 +251,7 @@ describe("planner_set_plan", () => {
   });
 
   it("errors when tasks is not a non-empty array", async () => {
-    dispatch(mkInvoke(21, "planner_set_plan", { description: "x", tasks: [] }));
+    dispatch(mkInvoke(21, "set_plan", { description: "x", tasks: [] }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -262,7 +262,7 @@ describe("planner_set_plan", () => {
   it("errors when no task survives validation", async () => {
     // No id, no title — normalizeDecomposition drops it; result is empty.
     dispatch(
-      mkInvoke(22, "planner_set_plan", {
+      mkInvoke(22, "set_plan", {
         description: "x",
         tasks: [{ deps: ["nowhere"] }],
       }),
@@ -276,7 +276,7 @@ describe("planner_set_plan", () => {
 
   it("saves a ready plan, persists pendingExecute=false, and attaches as transformer", async () => {
     dispatch(
-      mkInvoke(23, "planner_set_plan", {
+      mkInvoke(23, "set_plan", {
         description: "build a thing",
         tasks: [
           { id: "T1", title: "first", deps: [] },
@@ -309,7 +309,7 @@ describe("planner_set_plan", () => {
       content: Array<{ text: string }>;
       structuredContent: { taskCount: number; concurrencyCap: number; projectId: string };
     };
-    assert.match(result.content[0]!.text, /Saved 2 tasks .* Call planner_start when ready/);
+    assert.match(result.content[0]!.text, /Saved 2 tasks .* Call start when ready/);
     assert.equal(result.structuredContent.taskCount, 2);
     assert.equal(result.structuredContent.concurrencyCap, 3);
     assert.equal(result.structuredContent.projectId, board!.projectId);
@@ -317,7 +317,7 @@ describe("planner_set_plan", () => {
 
   it("ignores non-string fleetDefaults fields and non-positive concurrencyCap", async () => {
     dispatch(
-      mkInvoke(24, "planner_set_plan", {
+      mkInvoke(24, "set_plan", {
         description: "x",
         tasks: [{ id: "T1", title: "t" }],
         fleetDefaults: { agent: 42, model: null },
@@ -335,7 +335,7 @@ describe("planner_set_plan", () => {
   it("refuses to overwrite when board is running", async () => {
     seedBoard("hydra_session_test", { state: "running" });
     dispatch(
-      mkInvoke(25, "planner_set_plan", {
+      mkInvoke(25, "set_plan", {
         description: "x",
         tasks: [{ id: "T1", title: "t" }],
       }),
@@ -350,7 +350,7 @@ describe("planner_set_plan", () => {
   it("refuses to overwrite when board is paused", async () => {
     seedBoard("hydra_session_test", { state: "paused" });
     dispatch(
-      mkInvoke(26, "planner_set_plan", {
+      mkInvoke(26, "set_plan", {
         description: "x",
         tasks: [{ id: "T1", title: "t" }],
       }),
@@ -365,7 +365,7 @@ describe("planner_set_plan", () => {
   it("refuses to overwrite when board is decomposing", async () => {
     seedBoard("hydra_session_test", { state: "decomposing" });
     dispatch(
-      mkInvoke(27, "planner_set_plan", {
+      mkInvoke(27, "set_plan", {
         description: "x",
         tasks: [{ id: "T1", title: "t" }],
       }),
@@ -383,7 +383,7 @@ describe("planner_set_plan", () => {
     assert.equal(existsSync(oldDir), true);
 
     dispatch(
-      mkInvoke(28, "planner_set_plan", {
+      mkInvoke(28, "set_plan", {
         description: "replacement",
         tasks: [{ id: "T1", title: "t" }],
       }),
@@ -399,11 +399,11 @@ describe("planner_set_plan", () => {
   });
 });
 
-// ── planner_start ────────────────────────────────────────────────
+// ── start ────────────────────────────────────────────────
 
-describe("planner_start", () => {
+describe("start", () => {
   it("errors when no plan exists on the session", async () => {
-    dispatch(mkInvoke(30, "planner_start", {}));
+    dispatch(mkInvoke(30, "start", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -414,14 +414,14 @@ describe("planner_start", () => {
   it("errors when board is running, done, or failed (distinct messages)", async () => {
     const cases: Array<{ state: Board["state"]; pattern: RegExp }> = [
       { state: "running", pattern: /already running/ },
-      { state: "done", pattern: /done.*planner_set_plan to start a new project/ },
-      { state: "failed", pattern: /failed.*planner_set_plan to start a new project/ },
+      { state: "done", pattern: /done.*set_plan to start a new project/ },
+      { state: "failed", pattern: /failed.*set_plan to start a new project/ },
     ];
     let id = 31;
     for (const c of cases) {
       boards.clear();
       seedBoard("hydra_session_test", { state: c.state });
-      dispatch(mkInvoke(id++, "planner_start", {}));
+      dispatch(mkInvoke(id++, "start", {}));
       await settle();
       const r = client.lastReply();
       const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -439,7 +439,7 @@ describe("planner_start", () => {
         { id: "T3", title: "blocked", status: "blocked" },
       ],
     });
-    dispatch(mkInvoke(38, "planner_start", {}));
+    dispatch(mkInvoke(38, "start", {}));
     await settle();
     const board = boards.get("hydra_session_test")!;
     assert.equal(board.state, "running");
@@ -457,7 +457,7 @@ describe("planner_start", () => {
       state: "ready",
       tasks: [{ id: "T1", title: "blocked", status: "blocked" }],
     });
-    dispatch(mkInvoke(35, "planner_start", {}));
+    dispatch(mkInvoke(35, "start", {}));
     await settle();
     const board = boards.get("hydra_session_test")!;
     assert.equal(board.state, "running");
@@ -468,7 +468,7 @@ describe("planner_start", () => {
   });
 
   it("accepts a stopped board and reports 'Resumed' rather than 'Kicked off'", async () => {
-    // After planner_stop, the board state is `stopped` and previously
+    // After stop, the board state is `stopped` and previously
     // assigned tasks are pending. Execute should treat this as a
     // resume — same transition + scheduler kick, distinct message.
     seedBoard("hydra_session_test", {
@@ -483,7 +483,7 @@ describe("planner_start", () => {
         { id: "T3", title: "blocked", status: "blocked" },
       ],
     });
-    dispatch(mkInvoke(37, "planner_start", {}));
+    dispatch(mkInvoke(37, "start", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "running");
     const r = client.lastReply();
@@ -502,7 +502,7 @@ describe("planner_start", () => {
       state: "ready",
       tasks: [{ id: "T1", title: "blocked", status: "blocked" }],
     });
-    dispatch(mkInvoke(36, "planner_start", {}));
+    dispatch(mkInvoke(36, "start", {}));
     await settle();
     // session/attach is required before session/prompt — verify the
     // lazy attach happened.
@@ -525,11 +525,11 @@ describe("planner_start", () => {
   });
 });
 
-// ── planner_get_plan ───────────────────────────────────────────────
+// ── get_plan ───────────────────────────────────────────────
 
-describe("planner_get_plan", () => {
+describe("get_plan", () => {
   it("returns hasPlan:false when nothing is on the session or disk", async () => {
-    dispatch(mkInvoke(40, "planner_get_plan", {}));
+    dispatch(mkInvoke(40, "get_plan", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { structuredContent: { hasPlan: boolean } };
@@ -544,7 +544,7 @@ describe("planner_get_plan", () => {
         { id: "T2", title: "second", deps: ["T1"], status: "pending" },
       ],
     });
-    dispatch(mkInvoke(41, "planner_get_plan", {}));
+    dispatch(mkInvoke(41, "get_plan", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as {
@@ -560,11 +560,11 @@ describe("planner_get_plan", () => {
   });
 });
 
-// ── planner_get_status ─────────────────────────────────────────────
+// ── get_status ─────────────────────────────────────────────
 
-describe("planner_get_status", () => {
+describe("get_status", () => {
   it("returns hasProject:false when no board", async () => {
-    dispatch(mkInvoke(50, "planner_get_status", {}));
+    dispatch(mkInvoke(50, "get_status", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { structuredContent: { hasProject: boolean } };
@@ -582,7 +582,7 @@ describe("planner_get_status", () => {
         { id: "T5", title: "fail", status: "failed" },
       ],
     });
-    dispatch(mkInvoke(51, "planner_get_status", {}));
+    dispatch(mkInvoke(51, "get_status", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as {
@@ -606,12 +606,12 @@ describe("planner_get_status", () => {
   });
 });
 
-// ── planner_add_task ───────────────────────────────────────────────
+// ── add_task ───────────────────────────────────────────────
 
-describe("planner_add_task", () => {
+describe("add_task", () => {
   it("errors when description is missing", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(60, "planner_add_task", {}));
+    dispatch(mkInvoke(60, "add_task", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -620,7 +620,7 @@ describe("planner_add_task", () => {
   });
 
   it("errors when no board exists on the session", async () => {
-    dispatch(mkInvoke(61, "planner_add_task", { description: "x" }));
+    dispatch(mkInvoke(61, "add_task", { description: "x" }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -630,7 +630,7 @@ describe("planner_add_task", () => {
 
   it("errors when board is terminal (done/failed)", async () => {
     seedBoard("hydra_session_test", { state: "done" });
-    dispatch(mkInvoke(62, "planner_add_task", { description: "x" }));
+    dispatch(mkInvoke(62, "add_task", { description: "x" }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -640,7 +640,7 @@ describe("planner_add_task", () => {
 
   it("acks immediately with a 'Asking the agent' message on an active board", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(63, "planner_add_task", { description: "add tests" }));
+    dispatch(mkInvoke(63, "add_task", { description: "add tests" }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { content: Array<{ text: string }>; structuredContent: { dispatched: boolean } };
@@ -649,11 +649,11 @@ describe("planner_add_task", () => {
   });
 });
 
-// ── planner_stop / pause / resume ──────────────────────────────────
+// ── stop / pause / resume ──────────────────────────────────
 
-describe("planner_stop", () => {
+describe("stop", () => {
   it("errors when no board exists", async () => {
-    dispatch(mkInvoke(70, "planner_stop", {}));
+    dispatch(mkInvoke(70, "stop", {}));
     await settle();
     const r = client.lastReply();
     assert.equal((r.result as { isError: boolean }).isError, true);
@@ -663,7 +663,7 @@ describe("planner_stop", () => {
     for (const [state, idx] of [["done", 71], ["failed", 72], ["stopped", 73]] as const) {
       boards.clear();
       seedBoard("hydra_session_test", { state });
-      dispatch(mkInvoke(idx, "planner_stop", {}));
+      dispatch(mkInvoke(idx, "stop", {}));
       await settle();
       const r = client.lastReply();
       const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
@@ -681,7 +681,7 @@ describe("planner_stop", () => {
         { id: "T3", title: "pend", status: "pending" },
       ],
     });
-    dispatch(mkInvoke(74, "planner_stop", {}));
+    dispatch(mkInvoke(74, "stop", {}));
     await settle();
     const board = boards.get("hydra_session_test")!;
     assert.equal(board.state, "stopped");
@@ -697,10 +697,10 @@ describe("planner_stop", () => {
   });
 });
 
-describe("planner_pause", () => {
+describe("pause", () => {
   it("errors when board is not running", async () => {
     seedBoard("hydra_session_test", { state: "ready" });
-    dispatch(mkInvoke(80, "planner_pause", {}));
+    dispatch(mkInvoke(80, "pause", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -710,7 +710,7 @@ describe("planner_pause", () => {
 
   it("is a no-op success when already paused", async () => {
     seedBoard("hydra_session_test", { state: "paused" });
-    dispatch(mkInvoke(81, "planner_pause", {}));
+    dispatch(mkInvoke(81, "pause", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
@@ -720,16 +720,16 @@ describe("planner_pause", () => {
 
   it("flips running to paused and persists", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(82, "planner_pause", {}));
+    dispatch(mkInvoke(82, "pause", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "paused");
   });
 });
 
-describe("planner_resume", () => {
+describe("resume", () => {
   it("errors when board is not paused", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(90, "planner_resume", {}));
+    dispatch(mkInvoke(90, "resume", {}));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -742,7 +742,7 @@ describe("planner_resume", () => {
       state: "paused",
       tasks: [{ id: "T1", title: "blocked", status: "blocked" }], // nothing eligible
     });
-    dispatch(mkInvoke(91, "planner_resume", {}));
+    dispatch(mkInvoke(91, "resume", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "running");
     // Same live-view inject as start — resume also kicks workers,
@@ -755,19 +755,19 @@ describe("planner_resume", () => {
   });
 });
 
-// ── planner_skip / retry ───────────────────────────────────────────
+// ── skip / retry ───────────────────────────────────────────
 
-describe("planner_skip", () => {
+describe("skip", () => {
   it("errors when taskId is missing", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(100, "planner_skip", {}));
+    dispatch(mkInvoke(100, "skip", {}));
     await settle();
     assert.equal((client.lastReply().result as { isError: boolean }).isError, true);
   });
 
   it("errors when taskId doesn't exist on the board", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(101, "planner_skip", { taskId: "Tnope" }));
+    dispatch(mkInvoke(101, "skip", { taskId: "Tnope" }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
@@ -780,7 +780,7 @@ describe("planner_skip", () => {
       state: "running",
       tasks: [{ id: "T1", title: "x", status: "done" }],
     });
-    dispatch(mkInvoke(102, "planner_skip", { taskId: "T1" }));
+    dispatch(mkInvoke(102, "skip", { taskId: "T1" }));
     await settle();
     const r = client.lastReply();
     const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
@@ -796,7 +796,7 @@ describe("planner_skip", () => {
         { id: "T2", title: "blocked", status: "blocked" }, // keeps scheduler quiet
       ],
     });
-    dispatch(mkInvoke(103, "planner_skip", { taskId: "T1" }));
+    dispatch(mkInvoke(103, "skip", { taskId: "T1" }));
     await settle();
     const board = boards.get("hydra_session_test")!;
     const t1 = board.tasks.find((t) => t.id === "T1")!;
@@ -805,14 +805,14 @@ describe("planner_skip", () => {
   });
 });
 
-describe("planner_retry", () => {
+describe("retry", () => {
   it("errors when taskId is missing or unknown", async () => {
     seedBoard("hydra_session_test", { state: "running" });
-    dispatch(mkInvoke(110, "planner_retry", {}));
+    dispatch(mkInvoke(110, "retry", {}));
     await settle();
     assert.equal((client.lastReply().result as { isError: boolean }).isError, true);
 
-    dispatch(mkInvoke(111, "planner_retry", { taskId: "Tnope" }));
+    dispatch(mkInvoke(111, "retry", { taskId: "Tnope" }));
     await settle();
     assert.equal((client.lastReply().result as { isError: boolean }).isError, true);
   });
@@ -833,7 +833,7 @@ describe("planner_retry", () => {
         { id: "T2", title: "blocked", status: "blocked" },
       ],
     });
-    dispatch(mkInvoke(112, "planner_retry", { taskId: "T1" }));
+    dispatch(mkInvoke(112, "retry", { taskId: "T1" }));
     await settle();
     const t1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
     assert.equal(t1.status, "pending");
@@ -843,11 +843,11 @@ describe("planner_retry", () => {
   });
 });
 
-// ── planner_remove ─────────────────────────────────────────────────
+// ── remove ─────────────────────────────────────────────────
 
-describe("planner_remove", () => {
+describe("remove", () => {
   it("errors when no board exists on memory or disk", async () => {
-    dispatch(mkInvoke(120, "planner_remove", {}));
+    dispatch(mkInvoke(120, "remove", {}));
     await settle();
     const r = client.lastReply();
     assert.equal((r.result as { isError: boolean }).isError, true);
@@ -863,7 +863,7 @@ describe("planner_remove", () => {
     const dir = projectDir(b.projectId);
     assert.equal(existsSync(dir), true);
 
-    dispatch(mkInvoke(121, "planner_remove", {}));
+    dispatch(mkInvoke(121, "remove", {}));
     await settle();
 
     // Worker session/delete request fired with the worker id.
