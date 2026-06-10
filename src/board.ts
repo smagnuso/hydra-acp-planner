@@ -238,6 +238,14 @@ export interface Board {
   projectId: string;
   description: string;
   attachments?: Attachment[];
+  // User-authored block of contracts that apply to every task in the
+  // project. Rendered into both work and review prompts above any
+  // per-task context, so every worker (and every reviewer) is checking
+  // against the same set of invariants. Use for cross-cutting facts
+  // that are not visible from the diff alone: daemon protocol
+  // contracts, wire-shape constraints, "this method requires `this`
+  // binding", etc. Free-form markdown.
+  contractBrief?: string;
   state: BoardState;
   createdAt: string;
   updatedAt: string;
@@ -245,6 +253,7 @@ export interface Board {
   reviewPolicy?: {
     mode?: "off" | "hints" | "all" | "high-only";
     overrideHint?: boolean;
+    maxAttempts?: number;
   };
   tasks: Task[];
   workers: Record<string, {
@@ -382,13 +391,16 @@ export function newBoard(opts: {
   fleetDefaults?: FleetDefaults;
   concurrencyCap?: number;
   attachments?: Attachment[];
+  contractBrief?: string;
 }): Board {
   const now = nowIso();
+  const brief = opts.contractBrief?.trim();
   return {
     version: BOARD_SCHEMA_VERSION,
     projectId: newProjectId(),
     description: opts.description,
     attachments: opts.attachments && opts.attachments.length > 0 ? opts.attachments : undefined,
+    contractBrief: brief && brief.length > 0 ? brief : undefined,
     state: "decomposing",
     createdAt: now,
     updatedAt: now,

@@ -382,6 +382,57 @@ describe("buildReviewPrompt", () => {
     const p = buildReviewPrompt(t, board([t]));
     assert.match(p, /```hydra-result/);
   });
+
+  it("includes adversarial verification clause", () => {
+    const t = task("R1");
+    const p = buildReviewPrompt(t, board([t]));
+    assert.match(p, /Search adversarially/);
+    assert.match(p, /Then judge honestly/);
+    assert.match(p, /Verify every external reference is real/);
+    assert.match(p, /Run the tests this code adds/);
+    assert.match(p, /Do NOT invent a finding/);
+  });
+
+  it("requests contracts_verified and tests_executed in the schema", () => {
+    const t = task("R1");
+    const p = buildReviewPrompt(t, board([t]));
+    assert.match(p, /contracts_verified/);
+    assert.match(p, /tests_executed/);
+  });
+
+  it("renders contractBrief above attachments when set on the board", () => {
+    const t = task("R1");
+    const b = board([t]);
+    b.contractBrief = "session/update kinds are documented in core/render-update.ts.";
+    const p = buildReviewPrompt(t, b);
+    assert.match(p, /Project contracts \(apply to every task\)/);
+    assert.match(p, /core\/render-update\.ts/);
+  });
+
+  it("omits contractBrief section when unset", () => {
+    const t = task("R1");
+    const p = buildReviewPrompt(t, board([t]));
+    assert.ok(!/Project contracts \(apply to every task\)/.test(p));
+  });
+});
+
+// ─── contractBrief in work prompts ──────────────────────────────────────
+
+describe("contractBrief in buildTaskPrompt", () => {
+  it("renders the brief on work prompts when set", () => {
+    const t = task("T1");
+    const b = board([t]);
+    b.contractBrief = "Always invoke term.brightYellow directly on this.term.";
+    const p = buildTaskPrompt(t, b);
+    assert.match(p, /Project contracts \(apply to every task\)/);
+    assert.match(p, /term\.brightYellow/);
+  });
+
+  it("omits the section when no brief is set", () => {
+    const t = task("T1");
+    const p = buildTaskPrompt(t, board([t]));
+    assert.ok(!/Project contracts \(apply to every task\)/.test(p));
+  });
 });
 
 // ─── extractReviewBlock ─────────────────────────────────────────────────
@@ -409,7 +460,11 @@ describe("extractReviewBlock", () => {
 
 describe("normalizeReview", () => {
   it("normalizes approve decision", () => {
-    const r = normalizeReview({ decision: "approve", notes: "LGTM" }) as {
+    const r = normalizeReview({
+      decision: "approve",
+      notes: "LGTM",
+      contracts_verified: [{ claim: "API shape matches", evidence: "src/foo.ts:42" }],
+    }) as {
       artifacts: { summary: string; review_decision?: string };
       warnings: string[];
     };
@@ -481,8 +536,33 @@ describe("normalizeReview", () => {
 
   it("warns when notes is missing", () => {
     const r = normalizeReview({ decision: "approve" }) as { warnings: string[] };
+    // expect two warnings: one for missing notes, one for the new
+    // approve-without-evidence gate (no contracts_verified / tests_executed).
+    assert.equal(r.warnings.length, 2);
+    assert.ok(r.warnings.some((w) => /missing notes/.test(w)));
+    assert.ok(r.warnings.some((w) => /approve decision with empty contracts_verified/.test(w)));
+  });
+
+  it("warns when approve has no contracts_verified or tests_executed", () => {
+    const r = normalizeReview({ decision: "approve", notes: "ok" }) as { warnings: string[] };
     assert.equal(r.warnings.length, 1);
-    assert.match(r.warnings[0]!, /missing notes/);
+    assert.match(r.warnings[0]!, /approve decision with empty contracts_verified/);
+  });
+
+  it("stores contracts_verified and tests_executed when present", () => {
+    const r = normalizeReview({
+      decision: "approve",
+      notes: "verified",
+      contracts_verified: [{ claim: "X exists", evidence: "f.ts:1" }],
+      tests_executed: [{ command: "npm test", exit_code: 0, output_excerpt: "ok" }],
+    }) as { artifacts: Record<string, unknown>; warnings: string[] };
+    assert.deepEqual(r.artifacts.contracts_verified, [
+      { claim: "X exists", evidence: "f.ts:1" },
+    ]);
+    assert.deepEqual(r.artifacts.tests_executed, [
+      { command: "npm test", exit_code: 0, output_excerpt: "ok" },
+    ]);
+    assert.equal(r.warnings.length, 0);
   });
 
   it("returns undefined for invalid decision", () => {

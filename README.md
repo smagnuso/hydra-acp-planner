@@ -316,7 +316,86 @@ strategies (configurable per-task via `onReject.strategy`):
 | `escalate` | Spawn a new task targeting a different agent/model (requires `onReject.escalateTo`). |
 
 All strategies respect `onReject.maxAttempts` (default 3), after which
-the work task fails with all accumulated review feedback attached.
+the work task fails with all accumulated review feedback attached. The
+default can be raised or lowered board-wide via
+`reviewPolicy.maxAttempts` in `set_plan`; per-task `onReject.maxAttempts`
+overrides it.
+
+### Adversarial review prompts
+
+Synthesized review tasks ship with a default system clause that separates
+two modes the reviewer must NOT conflate:
+
+- **Search adversarially.** Assume the implementation contains an
+  integration bug and look for the specific way it might be wrong about
+  contracts with code outside the diff.
+- **Judge honestly.** If the adversarial search turns up nothing of
+  substance, approve. Inventing nits to seem rigorous is just a different
+  way of being unreliable.
+
+The search prescribes:
+
+1. Grep the surrounding codebase to confirm every external reference
+   (method names, RPC names, wire-shape literals) actually exists.
+2. Read the implementation of every API call to verify the call site
+   matches the real contract.
+3. Run the tests the work task adds and paste the actual output.
+4. Walk the user-visible scenario end-to-end if the change affects UI.
+
+Findings are classified by severity:
+
+- `blocker` — wrong at runtime / violates a contract / visibly misbehaves.
+  Emit `reject` (or `amend` if the fix is obvious).
+- `concern` — non-obvious risk or unverifiable contract. Surface in
+  `notes`; emit `approve` unless multiple concerns compound into a blocker.
+- `nit` — stylistic / preference. Capture in `follow_ups` and `approve`.
+- none — the search turned up nothing. `approve` with evidence of what
+  was searched. This is a valid and honest outcome.
+
+The `hydra-result` block schema for reviews accordingly includes two
+evidence fields:
+
+```json
+{
+  "decision": "approve",
+  "notes": "...",
+  "contracts_verified": [
+    { "claim": "session/update sessionUpdate kinds include 'turn_complete'", "evidence": "core/render-update.ts:178" }
+  ],
+  "tests_executed": [
+    { "command": "npm test -- --grep btw", "exit_code": 0, "output_excerpt": "12 passing" }
+  ]
+}
+```
+
+For an `approve` decision, both arrays SHOULD be non-empty. Empty arrays
+are parsed and stored as a soft signal (the planner records a warning)
+but do not block approval today. The reviewer's evidence is visible to
+the user via `get_status` / `get_plan` for post-hoc inspection.
+
+### `contractBrief`
+
+`set_plan` accepts an optional `contractBrief` field: a free-form
+markdown block describing cross-cutting contracts and invariants that
+every task (work AND review) must respect. It's rendered above any
+per-task context in both worker and reviewer prompts, so every
+implementer is checking against the same spec and every reviewer has
+the same brief to verify the implementation against.
+
+Use it for non-obvious facts that aren't visible in the diff:
+
+- "Daemon broadcasts `session/update` notifications with
+  `sessionUpdate: '<kind>'` shape; valid kinds are documented in
+  `core/render-update.ts:170-200`."
+- "Originators of `session/prompt` are excluded from `turn_complete`
+  broadcasts — they receive completion via the response's `stopReason`,
+  not via the notification stream."
+- "Terminal-kit style methods rely on `this` binding; invoke them
+  directly on `this.term`, never extract a reference."
+
+A well-written brief at plan time prevents the same bug from being
+re-introduced by every task that touches the affected area, and gives
+reviewers concrete contracts to grep for.
 
 ### Competition pattern
 

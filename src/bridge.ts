@@ -5333,6 +5333,9 @@ export class PlannerBridge {
       }
       const overrideHint = typeof rp.overrideHint === "boolean" ? rp.overrideHint : false;
       boardReviewPolicy = { mode, overrideHint };
+      if (typeof rp.maxAttempts === "number" && Number.isFinite(rp.maxAttempts) && rp.maxAttempts > 0) {
+        boardReviewPolicy.maxAttempts = Math.floor(rp.maxAttempts);
+      }
     } else {
       boardReviewPolicy = undefined;
     }
@@ -5353,10 +5356,17 @@ export class PlannerBridge {
       if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
     }
 
+    const contractBriefRaw = args.contractBrief;
+    const contractBrief =
+      typeof contractBriefRaw === "string" && contractBriefRaw.trim().length > 0
+        ? contractBriefRaw
+        : undefined;
+
     const board = newBoard({
       description,
       concurrencyCap,
       fleetDefaults: boardFleetDefaults,
+      contractBrief,
     });
     if (boardReviewPolicy) {
       board.reviewPolicy = boardReviewPolicy;

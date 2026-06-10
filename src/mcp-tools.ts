@@ -92,7 +92,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         reviewPolicy: {
           type: "object",
           description:
-            "Optional. Controls whether review tasks are synthesized after decomposition. Defaults to { mode: 'hints', overrideHint: false }.",
+            "Optional. Controls whether review tasks are synthesized after decomposition. Defaults to { mode: 'hints', overrideHint: false, maxAttempts: 3 }.",
           properties: {
             mode: {
               type: "string",
@@ -105,7 +105,17 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
               description:
                 "When true, overrides the agent's 'skip' hint to still synthesize a review task.",
             },
+            maxAttempts: {
+              type: "integer",
+              description:
+                "Default number of attempts a work task is allowed before its review marking it failed. Defaults to 3. Applies to every synthesized review unless the task carries its own onReject.maxAttempts.",
+            },
           },
+        },
+        contractBrief: {
+          type: "string",
+          description:
+            "Optional. A user-authored markdown block describing cross-cutting contracts and invariants that every task (work AND review) must respect. Use for non-obvious facts about the surrounding system — protocol/wire-shape constraints, framework gotchas, binding rules, etc. Rendered above any per-task context, so every worker checks against the same spec and every reviewer has the same brief to verify against.",
         },
         fleetDefaults: {
           type: "object",

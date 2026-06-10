@@ -43,7 +43,27 @@ The block MUST appear at the very end of your reply, after any other prose,
 code blocks, or tool-call output. If you cannot complete the task, still
 emit the block and explain what blocked you in \`summary\`.`;
 
-const REVIEW_SYSTEM = `You are a reviewer agent on a multi-agent coding project. You have been given one completed work task to review. Examine the work, decide whether it meets the spec, then end your message with a structured \`hydra-result\` block recording your decision. The planner CANNOT proceed without that block.`;
+const REVIEW_SYSTEM = `You are a reviewer agent on a multi-agent coding project. Your job has two parts that must NOT be conflated.
+
+**Search adversarially.** Assume the implementation contains an integration bug — a real one that would break the system in practice. Reviews that rubber-stamp surface-plausible code are worse than no review at all; that is the failure mode we're guarding against. Don't read the diff looking for it to be correct; read it looking for the specific way it might be wrong about contracts with code OUTSIDE the diff.
+
+**Then judge honestly.** If your adversarial search turns up nothing of substance, approve. Do NOT invent a finding to justify the time you spent searching. A thorough review that ends in approval — with evidence of what you actually checked — is the correct outcome when the code is correct. Inventing nits to seem rigorous is just a different way of being unreliable.
+
+To search adversarially:
+
+  1. **Verify every external reference is real.** For every method name, notification name, event name, RPC name, status string, or wire-shape literal this code references that's defined OUTSIDE the diff, grep the codebase to confirm it actually exists the way this code assumes. Quote the file:line where it's defined. If you cannot find a definition, the reference is likely fabricated — that is a blocker.
+  2. **Verify every API call matches the actual contract.** For every call into a shared utility, daemon endpoint, or existing module, read the implementation of that API and verify the call site matches its real parameter shapes, return shapes, error behavior, and side effects. Quote line numbers as evidence.
+  3. **Run the tests this code adds.** Execute them and paste the actual runner output, including any failures. Approval based on assumed test correctness is not acceptable. If you cannot execute, say so explicitly.
+  4. **Walk the user-visible scenario end-to-end.** If the change affects UI, terminal output, or any observable behavior, trace what the user will actually see end-to-end.
+
+Then classify each finding by severity:
+
+  - \`blocker\` — the change is wrong in a way that will fail at runtime, violate a contract, or visibly misbehave for the user. Block on these; emit a \`reject\` (or \`amend\` if a fix is obvious).
+  - \`concern\` — non-obvious risk, code-smell, or contract you weren't able to verify. Surface in \`notes\`; emit \`approve\` unless the concern compounds with others into a blocker.
+  - \`nit\` — minor stylistic / preference. Capture in \`follow_ups\` and \`approve\`.
+  - none — the adversarial search turned up nothing. \`approve\` and list what you searched for as evidence in \`contracts_verified\` / \`tests_executed\`. This is a valid and honest outcome.
+
+End your message with a structured \`hydra-result\` block recording your decision. The planner CANNOT proceed without that block.`;
 
 // Trailing instructions for the single-reviewee review prompt. This is
 // the last thing the reviewer sees before its turn — placed at the
@@ -61,15 +81,25 @@ Write whatever prose / evidence-citing you need first, then end with:
 
 \`\`\`hydra-result
 {
-  "decision":   "approve|reject|amend|fix",
-  "notes":      "your reasoning, citing specific evidence from verified_diff",
-  "follow_ups": ["optional: any deferred work to capture (amend only)"],
-  "applied":    true
+  "decision":           "approve|reject|amend|fix",
+  "notes":              "your reasoning, citing specific evidence from verified_diff",
+  "contracts_verified": [
+    { "claim": "session/update sessionUpdate kinds include 'turn_complete'", "evidence": "core/render-update.ts:178" }
+  ],
+  "tests_executed":     [
+    { "command": "npm test -- --grep btw", "exit_code": 0, "output_excerpt": "12 passing" }
+  ],
+  "follow_ups":         ["optional: any deferred work to capture (amend only)"],
+  "applied":            true
 }
 \`\`\`
 
-(\`follow_ups\` and \`applied\` are optional. \`applied: true\` is for the
-\`fix\` decision when you've made the corrections yourself this turn.)
+\`contracts_verified\` and \`tests_executed\` are how you prove you actually
+did the work the REVIEW_SYSTEM clause demands. For an \`approve\` decision
+both SHOULD be non-empty — empty arrays mean either "I didn't check" or
+"there was nothing to check" (be honest about which). \`follow_ups\` and
+\`applied\` are optional. \`applied: true\` is for the \`fix\` decision when
+you've made the corrections yourself this turn.
 
 This block MUST be the literal last thing in your reply — after any prose,
 tool-call output, or code samples. The fence must be exactly \`\`\`hydra-result
@@ -121,6 +151,59 @@ function formatAttachments(board: Board): string {
   return parts.join("\n");
 }
 
+// Render the board's project-wide contract brief as a context block.
+// Applied to every task (work AND review) above attachments, so every
+// worker checks against the same set of invariants and every reviewer
+// has the same brief to verify the implementation against. Returns ""
+// when no brief is set so callers can conditionally include the
+// section.
+function formatContractBrief(board: Board): string {
+  const brief = board.contractBrief?.trim();
+  if (!brief) return "";
+  return [
+    "## Project contracts (apply to every task)",
+    "These contracts describe non-obvious invariants that the surrounding system depends on. Treat them as authoritative — code that violates them is wrong, even when it looks plausible. If you are reviewing, verify the implementation against these specifically.",
+    "",
+    brief,
+  ].join("\n");
+}
+
+// Parse an array of evidence objects from a reviewer's hydra-result block.
+// Each entry must be an object with at least the named keys, all strings
+// (exit_code is allowed as a number). Returns a normalized array of the
+// objects with only string/number-valued recognized keys; pushes warnings
+// for malformed entries.
+function parseEvidenceArray(
+  value: unknown,
+  field: string,
+  keys: string[],
+  warnings: string[],
+): Array<Record<string, string | number>> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) {
+    warnings.push(`${field} should be an array; ignoring`);
+    return undefined;
+  }
+  const out: Array<Record<string, string | number>> = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      warnings.push(`${field}: skipping non-object entry`);
+      continue;
+    }
+    const rec = entry as Record<string, unknown>;
+    const normalized: Record<string, string | number> = {};
+    for (const key of keys) {
+      const v = rec[key];
+      if (typeof v === "string" || typeof v === "number") {
+        normalized[key] = v;
+      }
+    }
+    if (Object.keys(normalized).length === 0) continue;
+    out.push(normalized);
+  }
+  return out;
+}
+
 // Render a task's dependency artifacts as context the worker can read.
 // Each completed dependency's artifacts are inlined verbatim so the
 // worker has the same view of "what other workers decided" that the
@@ -160,6 +243,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       if (task.constraints) {
         parts.push("");
         parts.push(`**Constraints:** ${task.constraints}`);
+      }
+      const workBrief = formatContractBrief(board);
+      if (workBrief) {
+        parts.push("");
+        parts.push(workBrief);
       }
       const attachments = formatAttachments(board);
       if (attachments) {
@@ -301,6 +389,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         parts.push("");
         parts.push(`**Constraints:** ${task.constraints}`);
       }
+      const reviewBrief = formatContractBrief(board);
+      if (reviewBrief) {
+        parts.push("");
+        parts.push(reviewBrief);
+      }
       const attachments = formatAttachments(board);
       if (attachments) {
         parts.push("");
@@ -426,6 +519,24 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         (artifacts as Record<string, unknown>).applied = applied;
       }
 
+      const contractsVerified = parseEvidenceArray(obj.contracts_verified, "contracts_verified", ["claim", "evidence"], warnings);
+      if (contractsVerified && contractsVerified.length > 0) {
+        (artifacts as Record<string, unknown>).contracts_verified = contractsVerified;
+      }
+      const testsExecuted = parseEvidenceArray(obj.tests_executed, "tests_executed", ["command", "exit_code", "output_excerpt"], warnings);
+      if (testsExecuted && testsExecuted.length > 0) {
+        (artifacts as Record<string, unknown>).tests_executed = testsExecuted;
+      }
+      if (decision === "approve") {
+        const cvCount = contractsVerified?.length ?? 0;
+        const teCount = testsExecuted?.length ?? 0;
+        if (cvCount === 0 && teCount === 0) {
+          warnings.push(
+            "approve decision with empty contracts_verified AND tests_executed: reviewer provided no evidence",
+          );
+        }
+      }
+
       const winner = typeof obj.winner === "string" ? obj.winner : undefined;
       if (winner) {
         if (reviewsList && !reviewsList.includes(winner)) {
@@ -460,10 +571,10 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         `Please emit it now — do NOT redo the review, just emit a structured summary of your decision:`,
         ``,
         "```hydra-result",
-        `{ \"decision\": \"<approve|reject|amend|fix>\", \"notes\": \"<reasoning>\" }`,
+        `{ \"decision\": \"<approve|reject|amend|fix>\", \"notes\": \"<reasoning>\", \"contracts_verified\": [{ \"claim\": \"...\", \"evidence\": \"file:line\" }], \"tests_executed\": [{ \"command\": \"...\", \"exit_code\": 0, \"output_excerpt\": \"...\" }] }`,
         "```",
         ``,
-        `If the task itself failed or you couldn't complete it, still emit the block — set "summary" to describe what blocked you.`,
+        `For an \`approve\` decision, \`contracts_verified\` and \`tests_executed\` SHOULD be non-empty — they're how the planner records that you actually checked, not just looked. Empty arrays are fine for cases where nothing was actually checkable. If the task itself failed or you couldn't complete it, still emit the block — set "notes" to describe what blocked you.`,
       ].join("\n");
     },
   },

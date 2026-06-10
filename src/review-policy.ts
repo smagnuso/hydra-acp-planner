@@ -3,11 +3,18 @@ import type { Board } from "./board.js";
 export interface ReviewPolicy {
   mode: "off" | "hints" | "all" | "high-only";
   overrideHint: boolean;
+  // Board-level default for the number of work-task attempts allowed
+  // before a rejecting review marks the task `failed`. Applies to every
+  // synthesized review unless the task carries its own
+  // onReject.maxAttempts. Falls through to the hard-coded default in
+  // handleReviewReject (currently 3) when unset.
+  maxAttempts?: number;
 }
 
 interface RawReviewPolicy {
   mode?: "off" | "hints" | "all" | "high-only";
   overrideHint?: boolean;
+  maxAttempts?: number;
 }
 
 const DEFAULT_POLICY: ReviewPolicy = {
@@ -21,7 +28,14 @@ const DEFAULT_POLICY: ReviewPolicy = {
 // default).
 export function resolveReviewPolicy(raw: RawReviewPolicy | undefined): ReviewPolicy | undefined {
   if (!raw) return undefined;
-  return { mode: raw.mode ?? "hints", overrideHint: raw.overrideHint ?? false };
+  const out: ReviewPolicy = {
+    mode: raw.mode ?? "hints",
+    overrideHint: raw.overrideHint ?? false,
+  };
+  if (typeof raw.maxAttempts === "number" && Number.isFinite(raw.maxAttempts) && raw.maxAttempts > 0) {
+    out.maxAttempts = Math.floor(raw.maxAttempts);
+  }
+  return out;
 }
 
 // Walk a board's tasks and synthesize review tasks according to the given
@@ -65,7 +79,7 @@ export function applyReviewPolicy(board: Board, policy?: ReviewPolicy): Board {
 
     // Synthesize a review task.
     // canApplyFixes defaults to true when runOn='orchestrator', false otherwise.
-    tasks.push({
+    const synthesized: import("./board.js").Task = {
       id: `review-${t.id}`,
       title: `Review ${t.title}`,
       deps: [t.id],
@@ -75,7 +89,11 @@ export function applyReviewPolicy(board: Board, policy?: ReviewPolicy): Board {
       runOn: "orchestrator",
       canApplyFixes: true,
       attemptCount: 0,
-    });
+    };
+    if (p.maxAttempts !== undefined) {
+      synthesized.onReject = { maxAttempts: p.maxAttempts };
+    }
+    tasks.push(synthesized);
     reviewedBy.set(t.id, `review-${t.id}`);
     changed = true;
   }

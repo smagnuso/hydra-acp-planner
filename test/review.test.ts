@@ -66,8 +66,10 @@ describe("normalizeReview — decision parsing", () => {
   it("treats empty notes as missing (warning), omits notes key from artifacts", () => {
     const r = normalizeReview({ decision: "approve", notes: "" })!;
     assert.equal((r.artifacts as Record<string, unknown>).notes, undefined);
-    assert.equal(r.warnings.length, 1);
-    assert.match(r.warnings[0]!, /missing notes/);
+    // expect two warnings: missing notes + new approve-without-evidence gate.
+    assert.equal(r.warnings.length, 2);
+    assert.ok(r.warnings.some((w) => /missing notes/.test(w)));
+    assert.ok(r.warnings.some((w) => /approve decision with empty contracts_verified/.test(w)));
   });
 
   it("omits notes key when absent from input", () => {
