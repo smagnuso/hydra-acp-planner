@@ -111,6 +111,7 @@ beforeEach(() => {
     daemonWsUrl: "ws://unused",
     token: "unused",
     client,
+    fetchSessionInfo: async () => undefined,
   });
 });
 
@@ -313,6 +314,30 @@ describe("set_plan", () => {
     assert.equal(result.structuredContent.taskCount, 2);
     assert.equal(result.structuredContent.concurrencyCap, 3);
     assert.equal(result.structuredContent.projectId, board!.projectId);
+  });
+
+  it("seeds orchestratorAgent/Model from fetchSessionInfo at board-create time", async () => {
+    const localClient = new FakeClient();
+    const localBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: localClient,
+      fetchSessionInfo: async (sid) => ({
+        sessionId: sid,
+        agentId: "seeded-agent",
+        currentModel: "seeded-model",
+      }),
+    });
+    (localBridge as unknown as { handleRequest: (r: unknown) => void }).handleRequest(
+      mkInvoke(99, "set_plan", {
+        description: "seeded",
+        tasks: [{ id: "T1", title: "t" }],
+      }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.equal(board.orchestratorAgent, "seeded-agent");
+    assert.equal(board.orchestratorModel, "seeded-model");
   });
 
   it("ignores non-string fleetDefaults fields and non-positive concurrencyCap", async () => {

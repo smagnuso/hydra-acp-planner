@@ -105,6 +105,7 @@ import {
   summarizeDiff,
   type DiffFile,
 } from "./util/session-diff.js";
+import { fetchSessionInfo } from "./util/session-info.js";
 import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
@@ -263,6 +264,12 @@ export interface BridgeOptions {
   fetchSessionDiff?: (
     sessionId: string,
   ) => Promise<import("./util/session-diff.js").DiffFile[] | undefined>;
+  // Test seam: when provided, the orchestrator-identity seed at
+  // board-create time calls this instead of hitting the daemon's
+  // GET /v1/sessions/:id endpoint.
+  fetchSessionInfo?: (
+    sessionId: string,
+  ) => Promise<import("./util/session-info.js").SessionInfo | undefined>;
 }
 
 // Track active boards in memory so we don't reload from disk on every
@@ -411,6 +418,9 @@ export class PlannerBridge {
   private fetchDiffOverride:
     | ((sessionId: string) => Promise<import("./util/session-diff.js").DiffFile[] | undefined>)
     | undefined;
+  private fetchSessionInfoOverride:
+    | ((sessionId: string) => Promise<import("./util/session-info.js").SessionInfo | undefined>)
+    | undefined;
   // Cached list of installed specialist agents, populated lazily on
   // first prompt-building call. Refreshed at startup. Decomposition and
   // add-task prompts splice this in so the planner agent only suggests
@@ -448,10 +458,44 @@ export class PlannerBridge {
     }
   }
 
+  // Seed `board.orchestratorAgent` / `orchestratorModel` from the
+  // daemon's authoritative session info at board-create time. The
+  // reactive update path (session_info_update / current_model_update
+  // intercepts in handleSessionUpdate) only fires when the orchestrator
+  // emits a fresh notification — which typically happened during
+  // session startup, long before any board existed for that session.
+  // Without this seed, freshly-created boards have null agent/model
+  // until the user changes models or otherwise re-triggers emission,
+  // and the status / plan-panel / preamble all render "-".
+  private async seedOrchestratorIdentity(
+    board: Board,
+    sessionId: string,
+  ): Promise<void> {
+    const fetcher = this.fetchSessionInfoOverride
+      ?? ((sid: string) =>
+        fetchSessionInfo(sid, {
+          daemonHttpBase: this.daemonHttpBase,
+          token: this.daemonToken,
+        }));
+    try {
+      const info = await fetcher(sessionId);
+      if (!info) return;
+      if (info.agentId && !board.orchestratorAgent) {
+        board.orchestratorAgent = info.agentId;
+      }
+      if (info.currentModel && !board.orchestratorModel) {
+        board.orchestratorModel = info.currentModel;
+      }
+    } catch (err) {
+      log.debug(`seedOrchestratorIdentity ${sessionId}: ${(err as Error).message}`);
+    }
+  }
+
   constructor(opts: BridgeOptions) {
     this.daemonHttpBase = httpBaseFromWsUrl(opts.daemonWsUrl);
     this.daemonToken = opts.token;
     this.fetchDiffOverride = opts.fetchSessionDiff;
+    this.fetchSessionInfoOverride = opts.fetchSessionInfo;
     this.client =
       opts.client ??
       new TransformerClient({
@@ -2071,6 +2115,7 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       attachments: attachResult.attachments,
     });
+    await this.seedOrchestratorIdentity(board, sessionId);
     if (reviewPolicyMode || overrideHint !== undefined) {
       board.reviewPolicy = {
         mode: reviewPolicyMode ?? "hints",
@@ -2447,6 +2492,7 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       attachments: attachResult.attachments,
     });
+    await this.seedOrchestratorIdentity(board, sessionId);
     if (reviewPolicyMode || overrideHint !== undefined) {
       board.reviewPolicy = {
         mode: reviewPolicyMode ?? "hints",
@@ -5376,6 +5422,7 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       contractBrief,
     });
+    await this.seedOrchestratorIdentity(board, sessionId);
     if (boardReviewPolicy) {
       board.reviewPolicy = boardReviewPolicy;
     }
