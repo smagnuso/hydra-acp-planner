@@ -3303,9 +3303,16 @@ export class PlannerBridge {
     // event) with "plan is live and updating" (a turn-anchored
     // panel). Status dump matches the mental model: here's what was
     // planned; run /start (or /continue) to engage the live view.
+    // Wrap the status dump in a fenced code block so markdown
+    // renderers (browser clients, etc.) preserve the aligned-column
+    // formatting that formatStatus produces. Without the fence,
+    // markdown collapses single newlines and runs of whitespace,
+    // flattening the task list and sessions table into one wrapped
+    // blob. Terminals render the fenced form the same as raw text,
+    // so this is a strict improvement across clients.
     const statusDump = formatStatus(board, attachedSessions.has(sessionId), sessionId);
-    const followup = `\nPlan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or \`/hydra planner create <new description>\` to revise.`;
-    void this.emitSyntheticMessage(sessionId, `${statusDump}${followup}`);
+    const followup = `Plan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or \`/hydra planner create <new description>\` to revise.`;
+    void this.emitSyntheticMessage(sessionId, `\`\`\`\n${statusDump}\n\`\`\`\n\n${followup}`);
   }
 
   // ── Worker scheduling ─────────────────────────────────────────────
@@ -4984,19 +4991,20 @@ export class PlannerBridge {
   private async injectContinueAtHead(sessionId: string): Promise<void> {
     await this.ensureClientAttached(sessionId);
     try {
-      // The trailing instruction tells the host agent (opencode,
-      // Claude Code, etc.) not to emit its own todolist or ACP plan
-      // update in response to this prompt. The planner owns the
-      // live plan panel for this session; a parallel todolist from
-      // the host produces two competing panels updating in lockstep
-      // (see plan-update.ts file header). Hosts that don't honor
-      // the instruction degrade gracefully — the user sees two
-      // panels, which is the pre-fix behavior.
-      const PLANNER_OWNS_PLAN_HINT =
-        "\n\n(Do not call TodoWrite or emit a plan update — the planner owns the live todolist for this session.)";
+      // Slash commands are dispatched by hydra at the message layer;
+      // the host agent never runs an LLM turn around the text, so
+      // there's no opportunity to append instructions ("don't call
+      // TodoWrite", etc.) that the host would read. Anything beyond
+      // the bare verb is either echoed as dead text in the transcript
+      // or stripped. The host's own TodoWrite during the held turn —
+      // if any — is the host being proactive when the turn opens, not
+      // a response to this prompt. Suppressing it requires host-level
+      // cooperation we don't have today; until then, mixed-host runs
+      // may show a host-emitted plan panel alongside the planner's
+      // board panel.
       await this.client.request("session/prompt", {
         sessionId,
-        prompt: [{ type: "text", text: `/hydra planner continue${PLANNER_OWNS_PLAN_HINT}` }],
+        prompt: [{ type: "text", text: "/hydra planner continue" }],
         _meta: { "hydra-acp": { queuePosition: "head" } },
       });
     } catch (err) {
