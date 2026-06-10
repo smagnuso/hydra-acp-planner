@@ -78,7 +78,16 @@ export function applyReviewPolicy(board: Board, policy?: ReviewPolicy): Board {
     if (!shouldReview) continue;
 
     // Synthesize a review task.
-    // canApplyFixes defaults to true when runOn='orchestrator', false otherwise.
+    //
+    // Intentionally leave runOn and canApplyFixes UNSET so resolveReviewLane
+    // can derive the lane at dispatch time from fleetDefaults.review.runOn /
+    // .agent / .model and per-task reviewAgent / reviewModel. Hard-coding
+    // runOn: "orchestrator" here would short-circuit resolveReviewLane's
+    // "configured-agent" / "configured-model" rules and silently strand the
+    // user's configured review agent/model on a lane that doesn't honor
+    // them. canApplyFixes is derived at the fix-gate from the resolved
+    // lane (orchestrator → allowed, worker → not allowed) unless the task
+    // carries an explicit override.
     const synthesized: import("./board.js").Task = {
       id: `review-${t.id}`,
       title: `Review ${t.title}`,
@@ -86,8 +95,6 @@ export function applyReviewPolicy(board: Board, policy?: ReviewPolicy): Board {
       status: "pending",
       kind: "review",
       reviews: t.id,
-      runOn: "orchestrator",
-      canApplyFixes: true,
       attemptCount: 0,
     };
     if (p.maxAttempts !== undefined) {

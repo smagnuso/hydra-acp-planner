@@ -4435,12 +4435,21 @@ export class PlannerBridge {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
-    // Gate: canApplyFixes defaults to true when runOn='orchestrator', false otherwise.
-    if (reviewTask.canApplyFixes === false) {
+    // Gate: explicit task.canApplyFixes wins. Otherwise derive from the
+    // resolved review lane — orchestrator-lane reviewers can apply fixes
+    // directly to the host workspace; worker-lane reviewers cannot (the
+    // fix would only land in the worker's ephemeral session). Synthesized
+    // reviews leave canApplyFixes unset on purpose so this derivation
+    // runs against whatever lane resolveReviewLane picks at dispatch time.
+    const fixAllowed =
+      reviewTask.canApplyFixes !== undefined
+        ? reviewTask.canApplyFixes
+        : resolveReviewLane(reviewTask, board).lane === "orchestrator";
+    if (!fixAllowed) {
       log.info(
-        `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=false), treating as reject`,
+        `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=${reviewTask.canApplyFixes ?? "derived:false"}), treating as reject`,
       );
-      this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane (canApplyFixes=false)`);
+      this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane`);
       return;
     }
 
