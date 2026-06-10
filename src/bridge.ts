@@ -5218,6 +5218,8 @@ export class PlannerBridge {
           return this.toolGetStatus(req.id, sessionId);
         case "add_task":
           return await this.toolAddTask(req.id, sessionId, args);
+        case "update_task":
+          return this.toolUpdateTask(req.id, sessionId, args);
         case "stop":
           return this.toolStop(req.id, sessionId);
         case "pause":
@@ -5721,6 +5723,75 @@ export class PlannerBridge {
     // TUI shows busy while resumed work runs.
     void this.injectContinueAtHead(sessionId);
     this.replyMcpResult(reqId, `Resumed ${shortProjectId(board.projectId)}.`);
+  }
+
+  private toolUpdateTask(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): void {
+    const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
+    if (!taskId)
+      return this.replyMcpTextError(reqId, "update_task: missing required `taskId`");
+    const ctx = this.requireBoardForTool(sessionId);
+    if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
+    const { board } = ctx;
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task)
+      return this.replyMcpTextError(
+        reqId,
+        `update_task: no task '${taskId}' in this project`,
+      );
+    if (task.status !== "pending") {
+      return this.replyMcpTextError(
+        reqId,
+        `update_task: ${taskId} is ${task.status}; only pending tasks can be edited. Use retry to re-run an in-flight or finished task.`,
+      );
+    }
+    // Fields that resolve at spawn time — safe to rebind on a
+    // pending task because resolveAgent/resolveModel re-read them
+    // every time spawnTaskOnNewWorker runs.
+    const MUTABLE: readonly string[] = [
+      "agent",
+      "model",
+      "reviewAgent",
+      "reviewModel",
+      "what",
+      "why",
+      "constraints",
+    ];
+    const changes: Record<string, string> = {};
+    let touched = false;
+    for (const key of MUTABLE) {
+      const raw = args[key];
+      if (typeof raw !== "string") continue;
+      const trimmed = raw.trim();
+      const next = trimmed === "" ? null : trimmed;
+      const taskRec = task as unknown as Record<string, unknown>;
+      const current = taskRec[key];
+      const currentNorm = current == null ? null : current;
+      if (currentNorm === next) continue;
+      taskRec[key] = next;
+      changes[key] = next ?? "(cleared)";
+      touched = true;
+    }
+    if (!touched) {
+      return this.replyMcpResult(reqId, `update_task: no changes for ${taskId}.`);
+    }
+    saveBoard(board, sessionId);
+    this.emitPlanUpdate(sessionId, board);
+    const summary = Object.entries(changes)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(", ");
+    void this.emitSyntheticMessage(
+      sessionId,
+      `updated ${taskId}: ${summary}`,
+      { event: "task-updated", taskId },
+    );
+    this.replyMcpResult(
+      reqId,
+      `Updated ${taskId} (${Object.keys(changes).join(", ")}).`,
+    );
   }
 
   private toolSkip(

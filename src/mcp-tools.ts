@@ -33,17 +33,23 @@ Workflow:
      the raw task data — summarize structure (how many tasks, what \
      can parallelize, key per-task choices).
 
-  4. If the user wants to revise (more parallelism, add/remove \
-     tasks, change constraints, switch agents/models), regenerate \
-     the DAG and call set_plan again. The new plan replaces \
-     the old draft.
+  4. If the user wants to revise BEFORE work has started (board \
+     state is ready), regenerate the DAG and call set_plan again \
+     — the new plan replaces the old draft. AFTER work has started, \
+     prefer update_task for single-task edits (switching a pending \
+     task's agent or model, tweaking its brief); set_plan is \
+     refused on a running/paused board. Only fall back to \
+     stop → set_plan → start when structural changes are too \
+     sweeping for update_task / add_task / skip / retry to express.
 
   5. When the user agrees, call start to kick off workers.
 
-  6. While running, call get_status when the user asks \
-     about progress, add_task to slot in mid-flight \
-     additions, or stop / pause / resume \
-     to control execution.
+  6. While running, call get_status when the user asks about \
+     progress, add_task to slot in mid-flight additions, \
+     update_task to rebind a pending task's agent / model / brief \
+     without disturbing the rest of the board, skip / retry for \
+     per-task corrections, or stop / pause / resume to control \
+     execution overall.
 
 User-stated preferences (worker count, preferred agent/model, \
 specific overrides for particular tasks) MUST be embedded in your \
@@ -247,6 +253,50 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         description: {
           type: "string",
           description: "Description of the task to add.",
+        },
+      },
+    },
+  },
+  {
+    name: "update_task",
+    description:
+      "Rebind fields on a pending task without disturbing the rest of the board. Use when the user wants to change which agent or model handles an upcoming task, or to tweak its brief, mid-run ('switch T5 to opus', 'have T7 use the rust-expert agent'). Only pending tasks may be updated — for in-flight or finished tasks, use retry or restart. The new values take effect when the task is next scheduled. Pass an empty string to clear an override and fall through to fleetDefaults.",
+    inputSchema: {
+      type: "object",
+      required: ["taskId"],
+      properties: {
+        taskId: {
+          type: "string",
+          description: "Id of the task to update (e.g. 'T5').",
+        },
+        agent: {
+          type: "string",
+          description:
+            "New worker agent id. Empty string clears the override and falls through to fleetDefaults.",
+        },
+        model: {
+          type: "string",
+          description: "New worker model id. Empty string clears.",
+        },
+        reviewAgent: {
+          type: "string",
+          description: "Agent override for the synthesized review of this task.",
+        },
+        reviewModel: {
+          type: "string",
+          description: "Model override for the synthesized review of this task.",
+        },
+        what: {
+          type: "string",
+          description: "Revised 'what to produce' brief.",
+        },
+        why: {
+          type: "string",
+          description: "Revised rationale.",
+        },
+        constraints: {
+          type: "string",
+          description: "Revised hard constraints.",
         },
       },
     },
