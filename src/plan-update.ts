@@ -180,7 +180,7 @@ const STATUS_GLYPH: Record<string, string> = {
   failed: "[!]",
   blocked: "[-]",
   pending: "[ ]",
-  awaiting_review: "\u{1F50D}",
+  awaiting_review: "[*]",
   superseded: "(~)",
 };
 
