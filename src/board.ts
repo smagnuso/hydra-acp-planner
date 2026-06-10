@@ -134,21 +134,41 @@ export interface FleetDefaults {
   review?: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" };
 }
 
-export function resolveAgent(task: Task, fleetDefaults: FleetDefaults): string | null {
+// Resolution chain:
+//   task.agent  >  fleet.{work|review}.agent  >  fleet.agent (--agent)
+//                                            >  board.orchestratorAgent
+//                                            >  null (→ daemon default)
+//
+// The orchestratorAgent fallback exists because the daemon's own
+// `defaultAgent` (set in its config) may not match what the user
+// launched `hydra tui --agent X` with. The daemon is long-lived and
+// can't track per-client launch flags, so we mirror the orchestrator
+// session's agent onto workers when nothing more specific applies.
+export function resolveAgent(
+  task: Task,
+  board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null },
+): string | null {
   if (task.agent) return task.agent;
   const kind = task.kind ?? "work";
-  const kindAgent = kind === "review" ? fleetDefaults.review?.agent : fleetDefaults.work?.agent;
+  const fleet = board.fleetDefaults;
+  const kindAgent = kind === "review" ? fleet.review?.agent : fleet.work?.agent;
   if (kindAgent) return kindAgent;
-  if (fleetDefaults.agent) return fleetDefaults.agent;
+  if (fleet.agent) return fleet.agent;
+  if (board.orchestratorAgent) return board.orchestratorAgent;
   return null;
 }
 
-export function resolveModel(task: Task, fleetDefaults: FleetDefaults): string | null {
+export function resolveModel(
+  task: Task,
+  board: { fleetDefaults: FleetDefaults; orchestratorModel?: string | null },
+): string | null {
   if (task.model) return task.model;
   const kind = task.kind ?? "work";
-  const kindModel = kind === "review" ? fleetDefaults.review?.model : fleetDefaults.work?.model;
+  const fleet = board.fleetDefaults;
+  const kindModel = kind === "review" ? fleet.review?.model : fleet.work?.model;
   if (kindModel) return kindModel;
-  if (fleetDefaults.model) return fleetDefaults.model;
+  if (fleet.model) return fleet.model;
+  if (board.orchestratorModel) return board.orchestratorModel;
   return null;
 }
 

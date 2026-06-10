@@ -3461,8 +3461,8 @@ export class PlannerBridge {
     // override → kind-specific fleet default → fleet default → null.
     // Declared at function scope so it remains in scope after the spawn
     // try-block, where it's recorded on board.workers below.
-    const effectiveAgent = resolveAgent(task, board.fleetDefaults);
-    const effectiveModel = resolveModel(task, board.fleetDefaults);
+    const effectiveAgent = resolveAgent(task, board);
+    const effectiveModel = resolveModel(task, board);
 
     // Claim the task SYNCHRONOUSLY before any await. Without this,
     // two concurrent invocations of scheduleEligibleTasks both

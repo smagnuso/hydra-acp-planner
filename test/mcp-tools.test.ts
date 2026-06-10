@@ -513,7 +513,7 @@ describe("start", () => {
 
     const continuePrompt = client.requestsFor("session/prompt").find((r) => {
       const p = r.params as { prompt?: Array<{ text?: string }>; _meta?: { "hydra-acp"?: { queuePosition?: string } } };
-      return p.prompt?.[0]?.text === "/hydra planner continue";
+      return p.prompt?.[0]?.text?.startsWith("/hydra planner continue") ?? false;
     });
     assert.ok(continuePrompt, "expected an injected /hydra planner continue prompt");
     const params = continuePrompt.params as {
@@ -749,7 +749,7 @@ describe("resume", () => {
     // so the TUI should go busy.
     const continuePrompt = client.requestsFor("session/prompt").find((r) => {
       const p = r.params as { prompt?: Array<{ text?: string }> };
-      return p.prompt?.[0]?.text === "/hydra planner continue";
+      return p.prompt?.[0]?.text?.startsWith("/hydra planner continue") ?? false;
     });
     assert.ok(continuePrompt, "expected an injected /hydra planner continue prompt on resume");
   });

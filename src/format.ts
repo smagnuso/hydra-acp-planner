@@ -123,9 +123,8 @@ export function wallClockMs(board: Board, now: number = Date.now()): number {
 // per-task override. Same shape across the board-context preamble,
 // the /status view, and the plan panel.
 export function formatTaskTag(task: Task, board?: Board): string {
-  const fleet = board?.fleetDefaults;
-  const a = fleet ? resolveAgent(task, fleet) : (task.agent ?? null);
-  const m = fleet ? resolveModel(task, fleet) : (task.model ?? null);
+  const a = board ? resolveAgent(task, board) : (task.agent ?? null);
+  const m = board ? resolveModel(task, board) : (task.model ?? null);
   if (!a && !m) return "";
   const inner = a && m ? `${a}·${m}` : (a ?? m);
   return ` {${inner}}`;
