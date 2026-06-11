@@ -5784,6 +5784,38 @@ export class PlannerBridge {
       changes[key] = next ?? "(cleared)";
       touched = true;
     }
+    // reviewAgent/reviewModel on a work task are consumed once, at
+    // review-synthesis time (review-policy.ts) — once the review task
+    // exists they're dead-letter. Propagate the user's intent to the
+    // live review task whenever reviewAgent/reviewModel appears in
+    // args, even if the parent field's value didn't change (idempotent
+    // calls still need to take effect on the review task).
+    const propagated: string[] = [];
+    const reviewAgentArg = typeof args.reviewAgent === "string" ? args.reviewAgent.trim() : undefined;
+    const reviewModelArg = typeof args.reviewModel === "string" ? args.reviewModel.trim() : undefined;
+    if (reviewAgentArg !== undefined || reviewModelArg !== undefined) {
+      const review = board.tasks.find(
+        (t) => t.kind === "review" && t.id === `review-${task.id}`,
+      );
+      if (review && review.status === "pending") {
+        if (reviewAgentArg !== undefined) {
+          const next = reviewAgentArg === "" ? null : reviewAgentArg;
+          if ((review.agent ?? null) !== next) {
+            review.agent = next;
+            propagated.push(`${review.id}.agent`);
+            touched = true;
+          }
+        }
+        if (reviewModelArg !== undefined) {
+          const next = reviewModelArg === "" ? null : reviewModelArg;
+          if ((review.model ?? null) !== next) {
+            review.model = next;
+            propagated.push(`${review.id}.model`);
+            touched = true;
+          }
+        }
+      }
+    }
     if (!touched) {
       return this.replyMcpResult(reqId, `update_task: no changes for ${taskId}.`);
     }
@@ -5792,14 +5824,17 @@ export class PlannerBridge {
     const summary = Object.entries(changes)
       .map(([k, v]) => `${k}=${v}`)
       .join(", ");
+    const propSummary = propagated.length > 0
+      ? ` (also updated ${propagated.join(", ")})`
+      : "";
     void this.emitSyntheticMessage(
       sessionId,
-      `updated ${taskId}: ${summary}`,
+      `updated ${taskId}: ${summary}${propSummary}`,
       { event: "task-updated", taskId },
     );
     this.replyMcpResult(
       reqId,
-      `Updated ${taskId} (${Object.keys(changes).join(", ")}).`,
+      `Updated ${taskId} (${Object.keys(changes).join(", ")})${propSummary}.`,
     );
   }
 

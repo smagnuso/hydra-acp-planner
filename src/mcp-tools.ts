@@ -260,7 +260,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "update_task",
     description:
-      "Rebind fields on a pending task without disturbing the rest of the board. Use when the user wants to change which agent or model handles an upcoming task, or to tweak its brief, mid-run ('switch T5 to opus', 'have T7 use the rust-expert agent'). Only pending tasks may be updated — for in-flight or finished tasks, use retry or restart. The new values take effect when the task is next scheduled. Pass an empty string to clear an override and fall through to fleetDefaults.",
+      "Rebind fields on a pending task without disturbing the rest of the board. Use when the user wants to change which agent or model handles an upcoming task, or to tweak its brief, mid-run ('switch T5 to opus', 'have T7 use the rust-expert agent'). Only pending tasks may be updated — for in-flight or finished tasks, use retry or restart. To change a review task's agent/model, either set reviewAgent/reviewModel on the work task (the change propagates to the live review-Tx task automatically) or target the review task directly by its id (e.g., taskId='review-T1', agent='pi-local'). The new values take effect when the task is next scheduled. Pass an empty string to clear an override and fall through to fleetDefaults.",
     inputSchema: {
       type: "object",
       required: ["taskId"],
