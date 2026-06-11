@@ -14,6 +14,13 @@ export interface SessionInfo {
   sessionId: string;
   agentId?: string;
   currentModel?: string;
+  // Set iff this session was locally forked (via /btw or
+  // POST /v1/sessions/:id/fork). Lets the planner answer get_plan
+  // / get_status on a forked session by walking up to the owning
+  // session's board. See SessionListEntry in cli/PROTOCOL.md.
+  forkedFromSessionId?: string;
+  // Set iff this session was spawned as a transformer child.
+  parentSessionId?: string;
 }
 
 export interface FetchSessionInfoOpts {
@@ -49,6 +56,12 @@ export async function fetchSessionInfo(
     if (typeof body.agentId === "string") out.agentId = body.agentId;
     if (typeof body.currentModel === "string") {
       out.currentModel = body.currentModel;
+    }
+    if (typeof body.forkedFromSessionId === "string") {
+      out.forkedFromSessionId = body.forkedFromSessionId;
+    }
+    if (typeof body.parentSessionId === "string") {
+      out.parentSessionId = body.parentSessionId;
     }
     return out;
   } catch (err) {

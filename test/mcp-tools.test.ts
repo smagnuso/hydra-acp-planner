@@ -631,6 +631,127 @@ describe("get_status", () => {
   });
 });
 
+// ── fork resolution (read tools) ───────────────────────────
+
+describe("read tools resolve via forkedFromSessionId", () => {
+  // Inject a fake fetchSessionInfo so the bridge thinks the
+  // calling session is a fork of the owning session.
+  function setFetcher(
+    map: Record<string, { forkedFromSessionId?: string } | undefined>,
+  ): void {
+    (bridge as unknown as {
+      fetchSessionInfoOverride: (sid: string) => Promise<unknown>;
+    }).fetchSessionInfoOverride = async (sid: string) =>
+      map[sid] ? { sessionId: sid, ...map[sid] } : undefined;
+  }
+
+  it("get_plan returns the owner's board with readOnly+viewedFromFork", async () => {
+    seedBoard("hydra_session_owner", {
+      state: "running",
+      tasks: [{ id: "T1", title: "task one", deps: [], status: "pending" }],
+    });
+    setFetcher({
+      hydra_session_fork: { forkedFromSessionId: "hydra_session_owner" },
+    });
+    dispatch(mkInvoke(700, "get_plan", {}, "hydra_session_fork"));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: {
+        hasPlan: boolean;
+        readOnly: boolean;
+        viewedFromFork: boolean;
+        ownerSessionId: string;
+        tasks: Array<{ id: string }>;
+      };
+    };
+    assert.equal(result.structuredContent.hasPlan, true);
+    assert.equal(result.structuredContent.readOnly, true);
+    assert.equal(result.structuredContent.viewedFromFork, true);
+    assert.equal(result.structuredContent.ownerSessionId, "hydra_session_owner");
+    assert.equal(result.structuredContent.tasks.length, 1);
+    assert.match(result.content[0]!.text, /read-only: viewing parent session/);
+  });
+
+  it("get_status returns the owner's board with readOnly+viewedFromFork", async () => {
+    seedBoard("hydra_session_owner", { state: "running" });
+    setFetcher({
+      hydra_session_fork: { forkedFromSessionId: "hydra_session_owner" },
+    });
+    dispatch(mkInvoke(701, "get_status", {}, "hydra_session_fork"));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: {
+        hasProject: boolean;
+        readOnly: boolean;
+        viewedFromFork: boolean;
+        ownerSessionId: string;
+      };
+    };
+    assert.equal(result.structuredContent.hasProject, true);
+    assert.equal(result.structuredContent.readOnly, true);
+    assert.equal(result.structuredContent.viewedFromFork, true);
+    assert.equal(result.structuredContent.ownerSessionId, "hydra_session_owner");
+    assert.match(result.content[0]!.text, /read-only: viewing parent session/);
+  });
+
+  it("walks multi-hop fork chains until it finds an owner", async () => {
+    seedBoard("hydra_session_grandparent", { state: "running" });
+    setFetcher({
+      hydra_session_child: {
+        forkedFromSessionId: "hydra_session_parent",
+      },
+      hydra_session_parent: {
+        forkedFromSessionId: "hydra_session_grandparent",
+      },
+    });
+    dispatch(mkInvoke(702, "get_plan", {}, "hydra_session_child"));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      structuredContent: { hasPlan: boolean; ownerSessionId: string };
+    };
+    assert.equal(result.structuredContent.hasPlan, true);
+    assert.equal(
+      result.structuredContent.ownerSessionId,
+      "hydra_session_grandparent",
+    );
+  });
+
+  it("returns hasPlan:false when no ancestor owns a board", async () => {
+    setFetcher({
+      hydra_session_fork: { forkedFromSessionId: "hydra_session_nowhere" },
+    });
+    dispatch(mkInvoke(703, "get_plan", {}, "hydra_session_fork"));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { structuredContent: { hasPlan: boolean } };
+    assert.equal(result.structuredContent.hasPlan, false);
+  });
+
+  it("a direct (non-fork) hit reports viewedFromFork:false", async () => {
+    seedBoard("hydra_session_test", { state: "ready" });
+    dispatch(mkInvoke(704, "get_plan", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      structuredContent: {
+        hasPlan: boolean;
+        viewedFromFork: boolean;
+        readOnly: boolean;
+        ownerSessionId: string;
+      };
+    };
+    assert.equal(result.structuredContent.hasPlan, true);
+    assert.equal(result.structuredContent.viewedFromFork, false);
+    assert.equal(result.structuredContent.readOnly, false);
+    assert.equal(result.structuredContent.ownerSessionId, "hydra_session_test");
+  });
+});
+
 // ── add_task ───────────────────────────────────────────────
 
 describe("add_task", () => {

@@ -435,6 +435,85 @@ export class PlannerBridge {
   // eligible again, e.g. via retry of the failed root).
   private blockedNotifiedFor = new Set<string>();
 
+  // Cache mapping a forked session id to the ancestor session id that
+  // actually owns a board (or null if no board lives anywhere up the
+  // chain). Populated lazily by resolveBoardForRead via a daemon
+  // GET /v1/sessions/:id walk. Lets get_plan / get_status answer
+  // honestly when called from a session forked off the orchestrator
+  // session that ran set_plan — e.g. a hydra `/btw` sub-session.
+  // Purged when a project is removed (see toolRemove).
+  private forkOwnerCache = new Map<string, string | null>();
+
+  // Walk up the fork ancestry of `sessionId` until we find an
+  // ancestor that owns a board (boards map or on-disk). Returns the
+  // owning session id, or undefined if none up the chain has a
+  // board. Capped at 8 hops as a defensive guard against cycles
+  // (the daemon shouldn't produce them, but cheap to bound).
+  private async resolveForkOwner(
+    sessionId: string,
+    depth = 0,
+  ): Promise<string | undefined> {
+    if (depth > 8) return undefined;
+    const cached = this.forkOwnerCache.get(sessionId);
+    if (cached !== undefined) return cached ?? undefined;
+    const fetcher = this.fetchSessionInfoOverride
+      ?? ((sid: string) =>
+        fetchSessionInfo(sid, {
+          daemonHttpBase: this.daemonHttpBase,
+          token: this.daemonToken,
+        }));
+    let info: import("./util/session-info.js").SessionInfo | undefined;
+    try {
+      info = await fetcher(sessionId);
+    } catch {
+      info = undefined;
+    }
+    const parent = info?.forkedFromSessionId;
+    if (!parent) {
+      this.forkOwnerCache.set(sessionId, null);
+      return undefined;
+    }
+    if (boards.has(parent) || findBoardOnDisk(parent)) {
+      this.forkOwnerCache.set(sessionId, parent);
+      return parent;
+    }
+    const upstream = await this.resolveForkOwner(parent, depth + 1);
+    this.forkOwnerCache.set(sessionId, upstream ?? null);
+    return upstream;
+  }
+
+  // Locate the board to render for a *read* tool (get_plan,
+  // get_status). Prefers the session's own board, else walks the
+  // fork chain looking for an ancestor that owns one. When
+  // viaFork=true the caller should mark the response read-only and
+  // surface ownerSessionId so the agent understands it's looking at
+  // a parent session's project.
+  private async resolveBoardForRead(
+    sessionId: string,
+  ): Promise<
+    { board: Board; ownerSessionId: string; viaFork: boolean } | undefined
+  > {
+    const direct = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    if (direct) {
+      return { board: direct, ownerSessionId: sessionId, viaFork: false };
+    }
+    const owner = await this.resolveForkOwner(sessionId);
+    if (!owner) return undefined;
+    const board = boards.get(owner) ?? findBoardOnDisk(owner);
+    if (!board) return undefined;
+    return { board, ownerSessionId: owner, viaFork: true };
+  }
+
+  // Drop any forkOwnerCache entries pointing at `sessionId`. Called
+  // after a project is removed so future read-tool calls from
+  // descendant fork sessions don't keep returning the stale owner.
+  private purgeForkOwnerCacheFor(sessionId: string): void {
+    this.forkOwnerCache.delete(sessionId);
+    for (const [k, v] of this.forkOwnerCache) {
+      if (v === sessionId) this.forkOwnerCache.delete(k);
+    }
+  }
+
   private async ensureAgentChoices(): Promise<AgentChoice[] | undefined> {
     if (this.agentChoices !== undefined) return this.agentChoices;
     try {
@@ -5271,9 +5350,9 @@ export class PlannerBridge {
         case "start":
           return await this.toolExecute(req.id, sessionId);
         case "get_plan":
-          return this.toolGetPlan(req.id, sessionId);
+          return await this.toolGetPlan(req.id, sessionId);
         case "get_status":
-          return this.toolGetStatus(req.id, sessionId);
+          return await this.toolGetStatus(req.id, sessionId);
         case "add_task":
           return await this.toolAddTask(req.id, sessionId, args);
         case "update_task":
@@ -5598,16 +5677,23 @@ export class PlannerBridge {
     );
   }
 
-  private toolGetPlan(reqId: number | string, sessionId: string): void {
-    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
-    if (!board) {
+  private async toolGetPlan(
+    reqId: number | string,
+    sessionId: string,
+  ): Promise<void> {
+    const resolved = await this.resolveBoardForRead(sessionId);
+    if (!resolved) {
       return this.replyMcpResult(
         reqId,
         "No plan on this session. Use set_plan to create one.",
         { hasPlan: false },
       );
     }
-    const text = `Plan for ${shortProjectId(board.projectId)} (${board.state}): ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"}, concurrency cap ${board.concurrencyCap}.\n${board.tasks.map((t) => `  - ${t.id} [${t.status}] ${t.title}${t.deps.length ? ` (deps: ${t.deps.join(", ")})` : ""}`).join("\n")}`;
+    const { board, ownerSessionId, viaFork } = resolved;
+    const forkNote = viaFork
+      ? ` (read-only: viewing parent session ${shortSessionId(ownerSessionId)})`
+      : "";
+    const text = `Plan for ${shortProjectId(board.projectId)} (${board.state})${forkNote}: ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"}, concurrency cap ${board.concurrencyCap}.\n${board.tasks.map((t) => `  - ${t.id} [${t.status}] ${t.title}${t.deps.length ? ` (deps: ${t.deps.join(", ")})` : ""}`).join("\n")}`;
     this.replyMcpResult(reqId, text, {
       hasPlan: true,
       projectId: board.projectId,
@@ -5615,6 +5701,9 @@ export class PlannerBridge {
       description: board.description,
       concurrencyCap: board.concurrencyCap,
       fleetDefaults: board.fleetDefaults,
+      ownerSessionId,
+      viewedFromFork: viaFork,
+      readOnly: viaFork,
       tasks: board.tasks.map((t) => ({
         id: t.id,
         title: t.title,
@@ -5631,14 +5720,25 @@ export class PlannerBridge {
     });
   }
 
-  private toolGetStatus(reqId: number | string, sessionId: string): void {
-    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
-    if (!board) {
+  private async toolGetStatus(
+    reqId: number | string,
+    sessionId: string,
+  ): Promise<void> {
+    const resolved = await this.resolveBoardForRead(sessionId);
+    if (!resolved) {
       return this.replyMcpResult(reqId, "No project on this session.", {
         hasProject: false,
       });
     }
-    const text = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const { board, ownerSessionId, viaFork } = resolved;
+    const baseText = formatStatus(
+      board,
+      attachedSessions.has(ownerSessionId),
+      ownerSessionId,
+    );
+    const text = viaFork
+      ? `${baseText}\n\n(read-only: viewing parent session ${shortSessionId(ownerSessionId)}; use that session to control the project)`
+      : baseText;
     const totals = totalUsage(board);
     const done = board.tasks.filter((t) => t.status === "done").length;
     const failed = board.tasks.filter((t) => t.status === "failed").length;
@@ -5654,6 +5754,9 @@ export class PlannerBridge {
       hasProject: true,
       projectId: board.projectId,
       state: board.state,
+      ownerSessionId,
+      viewedFromFork: viaFork,
+      readOnly: viaFork,
       counts: {
         total: board.tasks.length,
         done,
@@ -6069,6 +6172,7 @@ export class PlannerBridge {
         text: `Removed project ${shortProjectId(canonical)}.`,
       });
     }
+    this.purgeForkOwnerCacheFor(sessionId);
     for (const workerId of workerIds) {
       clearWorkerState(workerId);
       unregisterWorker(workerId);
