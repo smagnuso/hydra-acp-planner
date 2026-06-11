@@ -215,4 +215,69 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       assert.equal(emitParams.route, "chain");
     },
   );
+
+  it(
+    "spawnTaskOnNewWorker: board entering 'done' mid-spawn reverts task to pending and clears assignedTo",
+    async () => {
+      const childSessionId = "hydra_session_worker_done_xyz789";
+
+      seedBoard("hydra_session_test", {
+        state: "ready",
+        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+      });
+
+      // Deferred spawn responder so we can flip board.state to "done"
+      // before the spawn resolves and the post-spawn guard runs.
+      let resolveSpawn!: (v: { childSessionId: string }) => void;
+      const spawnPromise = new Promise<{ childSessionId: string }>((res) => {
+        resolveSpawn = res;
+      });
+      client.responders.set("hydra-acp/child_session/spawn", () => spawnPromise);
+
+      dispatch(mkInvoke(11, "start", {}));
+      await settle();
+
+      const board = boards.get("hydra_session_test")!;
+      // Synchronous claim should have happened by now.
+      const task1 = board.tasks.find((t) => t.id === "T1")!;
+      assert.equal(task1.status, "assigned");
+
+      // Board enters a terminal state while spawn is still pending.
+      board.state = "done";
+
+      resolveSpawn({ childSessionId });
+      await settle();
+
+      // Task claim must have been reverted.
+      assert.equal(task1.status, "pending", "task must revert to pending");
+      assert.equal(task1.assignedTo, null, "assignedTo must be cleared");
+      assert.equal(task1.startedAt, null, "startedAt must be cleared");
+      // No worker entry should have been recorded for the abandoned spawn.
+      assert.equal(
+        board.workers[childSessionId],
+        undefined,
+        "no worker entry for abandoned spawn",
+      );
+      // The aborted worker session should have been closed.
+      const closes = client.requestsFor("hydra-acp/child_session/close");
+      assert.ok(
+        closes.find(
+          (r) =>
+            (r.params as { childSessionId?: string }).childSessionId ===
+            childSessionId,
+        ),
+        "expected hydra-acp/child_session/close for aborted worker",
+      );
+      // No task prompt should have been emitted to the worker.
+      const emits = client.requestsFor("hydra-acp/message/emit");
+      const workerEmit = emits.find(
+        (r) => (r.params as { sessionId?: string }).sessionId === childSessionId,
+      );
+      assert.equal(
+        workerEmit,
+        undefined,
+        "must not emit task prompt to abandoned worker",
+      );
+    },
+  );
 });

@@ -229,6 +229,37 @@ describe("orchestrator-lane review — runReviewOnOrchestrator", () => {
     assert.ok(wt.artifacts?.decisions?.some((d) => d === "[review fix] patched directly"));
   });
 
+  it("cancel mid-reprompt: bails loop without issuing further emits", async () => {
+    const work = workTask("T1");
+    const rev = reviewTask("R1", "T1");
+    const board = makeBoard([work, rev]);
+    let promptEmitCount = 0;
+    client.responders.set("hydra-acp/message/emit", (params) => {
+      const p = params as { sessionId?: string; method?: string };
+      if (p.method === "session/prompt") {
+        promptEmitCount += 1;
+      }
+      const sessionId = p.sessionId;
+      const st = getOrchestratorState(ORCH);
+      if (sessionId === ORCH && p.method === "session/prompt" && st?.awaitingOrchestratorReview) {
+        // Simulate cancel landing during the first emit: board flips to
+        // stopped and awaitingOrchestratorReview gets cleared (as the
+        // cancel pathway does in production). Leave the accumulator
+        // empty so the loop would otherwise reprompt.
+        board.state = "stopped";
+        st.awaitingOrchestratorReview = false;
+        st.orchestratorReviewTaskId = null;
+        st.orchestratorReviewAccumulator = "";
+      }
+      return {};
+    });
+
+    await runOrchestratorReview(board, rev);
+    await settle();
+
+    assert.equal(promptEmitCount, 1, "no further reprompts after cancel");
+  });
+
   it("malformed reply: parse failure treated as reject (review reset to pending, work retasked)", async () => {
     const work = workTask("T1");
     const rev = reviewTask("R1", "T1");

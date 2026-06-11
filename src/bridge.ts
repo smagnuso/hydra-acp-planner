@@ -304,7 +304,7 @@ export const clientAttachedSessions = new Set<string>();
 // — when the user reopens the TUI or fires a slash command, the
 // session goes live, attach succeeds, and we activate (waking workers
 // and resuming tasks).
-const pendingActivation = new Set<string>(); // orchestratorSessionId
+export const pendingActivation = new Set<string>(); // orchestratorSessionId
 
 // Per-worker forwarders that buffer streaming agent_message_chunk /
 // agent_thought_chunk text from the worker and flush it as a single
@@ -534,6 +534,7 @@ export class PlannerBridge {
   }
 
   private activationTimer: NodeJS.Timeout | null = null;
+  private activationTickInFlight: Promise<void> | null = null;
 
   // True between PlannerBridge.stop() and process exit. Used to
   // distinguish "ws closed because we're shutting down" from "ws
@@ -722,8 +723,25 @@ export class PlannerBridge {
   private ensureActivationTimer(): void {
     if (this.activationTimer || pendingActivation.size === 0) return;
     this.activationTimer = setInterval(() => {
-      void this.tickActivation();
+      this.runActivationTick();
     }, ACTIVATION_POLL_INTERVAL_MS);
+  }
+
+  // Guarded entry point for the activation interval. Skips re-entry
+  // while a prior tick is still awaiting tryActivateBoard so a slow
+  // network / large pending list can't cause overlapping transformer/attach
+  // + session/load + resume-prompt storms on the same orchestrator.
+  private runActivationTick(): void {
+    if (this.activationTickInFlight) {
+      return;
+    }
+    const p = this.tickActivation().finally(() => {
+      if (this.activationTickInFlight === p) {
+        this.activationTickInFlight = null;
+      }
+    });
+    this.activationTickInFlight = p;
+    void p;
   }
 
   private async tickActivation(): Promise<void> {
@@ -3605,16 +3623,16 @@ export class PlannerBridge {
       log.info(
         `task ${task.id}: abandoning spawn — board entered "${board.state}" during spawn`,
       );
-      // Revert the synchronous claim so resume can re-dispatch.
-      // stopBoardBookkeeping only runs on tasks with assignedTo set, so
-      // an assigned-but-unattached task wouldn't get reverted by it;
-      // do it explicitly here.
-      if (board.state === "stopped") {
-        task.status = "pending";
-        task.assignedTo = null;
-        task.startedAt = null;
-        saveBoard(board, orchestratorSessionId);
-      }
+      // Revert the synchronous claim unconditionally on every terminal
+      // path (stopped/failed/done). stopBoardBookkeeping only revisits
+      // tasks with assignedTo set, and our pre-attach claim left
+      // assignedTo null — so without this, failed/done leave a ghost
+      // `assigned` row that confuses the scheduler and UI.
+      task.status = "pending";
+      task.assignedTo = null;
+      task.startedAt = null;
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
       void this.closeWorker(childSessionId);
       return;
     }
@@ -4759,6 +4777,22 @@ export class PlannerBridge {
     let accumulated = "";
 
     while (true) {
+      // Re-check board/state before each emit. A cancel landing during the
+      // in-flight emit will flip board.state to stopped (and clear
+      // awaitingOrchestratorReview); without this guard the loop would
+      // keep firing reprompts on a dead board.
+      if (
+        board.state === "stopped" ||
+        board.state === "failed" ||
+        board.state === "done" ||
+        !state.awaitingOrchestratorReview ||
+        state.orchestratorReviewTaskId !== reviewTask.id
+      ) {
+        log.info(
+          `orchestrator review ${reviewTask.id}: bailing reprompt loop (board=${board.state}, awaiting=${state.awaitingOrchestratorReview})`,
+        );
+        return;
+      }
       try {
         const text =
           attempt === 0
