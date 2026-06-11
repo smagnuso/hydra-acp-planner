@@ -311,6 +311,12 @@ export interface Board {
   // itself. Captured the same way as worker usage; rendered on the
   // orchestrator row of the sessions table.
   orchestratorUsage?: WorkerUsage;
+  // Snapshot of the orchestrator session's cumulative usage at the
+  // moment this board was created. Subtracted from orchestratorUsage at
+  // render time so a project's reported cost/tokens start at 0 and only
+  // reflect spend accrued after plan creation — excluding whatever the
+  // orchestrator session had already spent on prior turns.
+  orchestratorUsageBaseline?: WorkerUsage;
   // Last-observed agent/model on the orchestrator session, captured
   // from session_info_update (agentId under _meta["hydra-acp"]) and
   // current_model_update (currentModel).

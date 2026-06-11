@@ -49,9 +49,31 @@ export function formatTokens(n: number | undefined): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
+// Orchestrator usage with the plan-creation baseline subtracted, so
+// the reported value is just the cost/tokens accrued on the
+// orchestrator session since plan start — not whatever it had already
+// spent on prior turns. Returns undefined if there's no orchestrator
+// usage to report.
+export function orchestratorUsageSincePlan(board: Board): WorkerUsage | undefined {
+  const u = board.orchestratorUsage;
+  if (!u) return undefined;
+  const b = board.orchestratorUsageBaseline;
+  if (!b) return u;
+  const out: WorkerUsage = { ...u };
+  if (typeof u.costAmount === "number" && typeof b.costAmount === "number") {
+    out.costAmount = Math.max(0, u.costAmount - b.costAmount);
+  }
+  if (typeof u.used === "number" && typeof b.used === "number") {
+    out.used = Math.max(0, u.used - b.used);
+  }
+  return out;
+}
+
 // Sum cumulative cost across all workers for the project total. Each
 // worker reports a session-cumulative amount, so summing across
-// distinct worker sessions gives the project-wide total.
+// distinct worker sessions gives the project-wide total. The
+// orchestrator contribution is baseline-adjusted so it counts only
+// plan-relevant spend (see orchestratorUsageSincePlan).
 export function totalUsage(board: Board): {
   cost: number;
   currency: string | undefined;
@@ -63,7 +85,7 @@ export function totalUsage(board: Board): {
   let tokensUsed = 0;
   let hasTokens = false;
   const sources: Array<WorkerUsage | undefined> = [
-    board.orchestratorUsage,
+    orchestratorUsageSincePlan(board),
     ...Object.values(board.workers).map((w) => w.usage),
   ];
   for (const u of sources) {
@@ -179,7 +201,7 @@ export function formatSessionsTable(
 
   const rows: Row[] = [];
   if (orchestratorSessionId) {
-    const ou = board.orchestratorUsage;
+    const ou = orchestratorUsageSincePlan(board);
     const oa = board.orchestratorAgent;
     const om = board.orchestratorModel;
     const orchAgentCell = oa || om

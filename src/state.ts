@@ -1,4 +1,4 @@
-import type { Board } from "./board.js";
+import type { Board, WorkerUsage } from "./board.js";
 
 // In-memory per-session state. The orchestrator role is implied by
 // presence in `boards`. Decomposition state machines (idle → decomposing
@@ -32,6 +32,24 @@ export interface OrchestratorState {
 }
 
 const sessionStates = new Map<string, OrchestratorState>();
+
+// Latest observed cumulative usage_update for any orchestrator session,
+// tracked independently of board lifecycle. Captured even before a
+// board exists on the session so that newBoard can snapshot the current
+// orchestrator cost as a baseline — the report-time view subtracts the
+// baseline so a project's "usage" starts at 0 and only reflects costs
+// accrued from plan-creation onward, not whatever the orchestrator
+// session had already spent on prior turns.
+const latestOrchestratorUsageBySession = new Map<string, WorkerUsage>();
+
+export function getLatestOrchestratorUsage(sessionId: string): WorkerUsage | undefined {
+  return latestOrchestratorUsageBySession.get(sessionId);
+}
+
+export function recordOrchestratorUsage(sessionId: string, usage: WorkerUsage): void {
+  const prev = latestOrchestratorUsageBySession.get(sessionId);
+  latestOrchestratorUsageBySession.set(sessionId, { ...(prev ?? {}), ...usage });
+}
 
 // Mirror map for workers → their orchestrator. Populated when workers
 // are spawned by the planner; consulted by the response intercept to

@@ -124,10 +124,12 @@ import { promptsFor } from "./task.js";
 import {
   clearOrchestratorState,
   clearWorkerState,
+  getLatestOrchestratorUsage,
   getOrchestratorState,
   getWorkerState,
   isOrchestrator,
   orchestratorOfWorker,
+  recordOrchestratorUsage,
   registerWorker,
   setOrchestratorState,
   setWorkerState,
@@ -2133,6 +2135,8 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       attachments: attachResult.attachments,
     });
+    const baseline0 = getLatestOrchestratorUsage(sessionId);
+    if (baseline0) board.orchestratorUsageBaseline = { ...baseline0 };
     await this.seedOrchestratorIdentity(board, sessionId);
     if (reviewPolicyMode || overrideHint !== undefined) {
       board.reviewPolicy = {
@@ -2510,6 +2514,8 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       attachments: attachResult.attachments,
     });
+    const baselineStart = getLatestOrchestratorUsage(sessionId);
+    if (baselineStart) board.orchestratorUsageBaseline = { ...baselineStart };
     await this.seedOrchestratorIdentity(board, sessionId);
     if (reviewPolicyMode || overrideHint !== undefined) {
       board.reviewPolicy = {
@@ -3222,14 +3228,23 @@ export class PlannerBridge {
     {
       const kind = updateKind(envelope);
       const board = boards.get(sessionId);
-      if (board) {
-        if (kind === "usage_update") {
-          const usage = extractUsageUpdate(envelope);
-          if (usage) {
+      // Track usage_update even when no board exists yet: newBoard
+      // snapshots this value as orchestratorUsageBaseline so the
+      // project's reported usage starts at 0 (and excludes any cost
+      // already accrued on the orchestrator session before plan
+      // creation).
+      if (kind === "usage_update") {
+        const usage = extractUsageUpdate(envelope);
+        if (usage) {
+          recordOrchestratorUsage(sessionId, usage);
+          if (board) {
             board.orchestratorUsage = { ...(board.orchestratorUsage ?? {}), ...usage };
             saveBoard(board, sessionId);
           }
-        } else if (kind === "session_info_update") {
+        }
+      }
+      if (board) {
+        if (kind === "session_info_update") {
           const agentId = extractAgentIdUpdate(envelope);
           if (agentId && agentId !== board.orchestratorAgent) {
             board.orchestratorAgent = agentId;
@@ -5467,6 +5482,8 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       contractBrief,
     });
+    const baselineSetPlan = getLatestOrchestratorUsage(sessionId);
+    if (baselineSetPlan) board.orchestratorUsageBaseline = { ...baselineSetPlan };
     await this.seedOrchestratorIdentity(board, sessionId);
     if (boardReviewPolicy) {
       board.reviewPolicy = boardReviewPolicy;
