@@ -934,8 +934,10 @@ export class PlannerBridge {
       );
       return false;
     }
-    // Also attach as a client for permission forwarding (best-effort).
-    await this.attachAsClient(workerId);
+    // session/load implicitly attached us as a client (see header
+    // comment above) — record it in attachedSessions so the
+    // idempotency guard in attachAsClient stays consistent.
+    attachedSessions.add(workerId);
     return true;
   }
 
@@ -3239,6 +3241,14 @@ export class PlannerBridge {
   // Best-effort: a failure here is logged but doesn't block worker
   // dispatch — only permission forwarding is degraded.
   private async attachAsClient(sessionId: string): Promise<void> {
+    // Idempotent: every attach allocates a fresh clientId daemon-side
+    // and bumps attachedCount, so without this guard repeat callers
+    // (fresh spawn + later wakeAndAttach, or any double-dispatch) cause
+    // the daemon to broadcast each session/update once per attach.
+    // That doubled stream lands in handleWorkerSessionUpdate twice,
+    // and the worker's text appears doubled in both the result
+    // accumulator and the orchestrator transcript.
+    if (attachedSessions.has(sessionId)) return;
     try {
       await this.client.request("session/attach", {
         sessionId,
