@@ -399,6 +399,83 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+// Make a fresh ready-to-run copy of an existing board.
+//
+// Use case: `/hydra planner fork <projectId>` — the user lost the
+// session that owned the original plan (or just wants to re-run the
+// same DAG from scratch) and wants a new project that mirrors the
+// source's structure but is owned by the current session.
+//
+// Copy semantics, not move: the source board is left untouched on
+// disk. The fork mints a new projectId, deep-copies the task
+// structure (id/title/deps/what/why/constraints/agent/model/kind/
+// reviews/onReject/risk/hint/runOn/canApplyFixes), resets every
+// task to `pending` with empty artifacts/feedback, and clears all
+// workers + execution timing. Board state lands at `ready` so the
+// user reviews and explicitly issues `/hydra planner start`.
+//
+// `concurrencyCap` and `concurrencyCapLocked` carry over. Review
+// policy, fleet defaults, contract brief, and attachments are
+// preserved. orchestratorAgent/Model are dropped — they'll be re-
+// seeded from the new owning session.
+export function forkBoard(opts: {
+  source: Board;
+  description?: string;
+}): Board {
+  const now = nowIso();
+  const src = opts.source;
+  return {
+    version: BOARD_SCHEMA_VERSION,
+    projectId: newProjectId(),
+    description: opts.description?.trim() || src.description,
+    attachments: src.attachments ? src.attachments.map((a) => ({ ...a })) : undefined,
+    contractBrief: src.contractBrief,
+    state: "ready",
+    createdAt: now,
+    updatedAt: now,
+    fleetDefaults: {
+      agent: src.fleetDefaults.agent,
+      model: src.fleetDefaults.model,
+      work: src.fleetDefaults.work ? { ...src.fleetDefaults.work } : undefined,
+      review: src.fleetDefaults.review ? { ...src.fleetDefaults.review } : undefined,
+    },
+    reviewPolicy: src.reviewPolicy ? { ...src.reviewPolicy } : undefined,
+    tasks: src.tasks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      why: t.why,
+      what: t.what,
+      constraints: t.constraints,
+      deps: [...t.deps],
+      agent: t.agent ?? null,
+      model: t.model ?? null,
+      reviewAgent: t.reviewAgent ?? null,
+      reviewModel: t.reviewModel ?? null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: t.kind ?? "work",
+      reviews: Array.isArray(t.reviews) ? [...t.reviews] : t.reviews,
+      runOn: t.runOn,
+      reviewFeedback: undefined,
+      riskLevel: t.riskLevel,
+      reviewHint: t.reviewHint,
+      onReject: t.onReject ? { ...t.onReject } : undefined,
+      canApplyFixes: t.canApplyFixes,
+    })),
+    workers: {},
+    concurrencyCap: src.concurrencyCap,
+    concurrencyCapLocked: src.concurrencyCapLocked,
+    pendingExecute: false,
+    compete: src.compete,
+    executionMs: undefined,
+    executionStartedAt: null,
+  };
+}
+
 export function newBoard(opts: {
   description: string;
   fleetDefaults?: FleetDefaults;

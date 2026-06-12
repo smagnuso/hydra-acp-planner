@@ -7,6 +7,7 @@ import {
   allTerminal,
   BOARD_SCHEMA_VERSION,
   canonicalProjectId,
+  forkBoard,
   inFlightCount,
   listProjects,
   loadBoard,
@@ -999,5 +1000,151 @@ describe("stopBoardBookkeeping", () => {
     assert.equal(b.tasks[0]!.assignedTo, null);
     assert.equal(b.workers[primary].currentTaskId, null);
     assert.equal(b.workers[shadow].currentTaskId, null);
+  });
+});
+
+describe("forkBoard", () => {
+  function srcBoard(overrides: Partial<Board> = {}): Board {
+    const base: Board = {
+      version: BOARD_SCHEMA_VERSION,
+      projectId: "hydra_plan_src",
+      description: "build a thing",
+      state: "running",
+      createdAt: "2025-01-01T00:00:00Z",
+      updatedAt: "2025-01-02T00:00:00Z",
+      fleetDefaults: { agent: "claude", model: null },
+      reviewPolicy: { mode: "hints", overrideHint: false, maxAttempts: 3 },
+      tasks: [
+        {
+          id: "T1",
+          title: "first",
+          why: "because",
+          what: "do it",
+          deps: [],
+          status: "done",
+          attemptCount: 2,
+          assignedTo: "hydra_session_w1",
+          artifacts: { summary: "did it", files_changed: ["a.ts"] },
+          startedAt: "2025-01-01T01:00:00Z",
+          finishedAt: "2025-01-01T01:05:00Z",
+          kind: "work",
+          reviewFeedback: ["nit"],
+          agent: "claude",
+        },
+        {
+          id: "T2",
+          title: "second",
+          deps: ["T1"],
+          status: "assigned",
+          attemptCount: 1,
+          assignedTo: "hydra_session_w2",
+          kind: "work",
+        },
+        {
+          id: "review-T1",
+          title: "review T1",
+          deps: ["T1"],
+          status: "done",
+          attemptCount: 1,
+          kind: "review",
+          reviews: "T1",
+        },
+      ],
+      workers: {
+        hydra_session_w1: { currentTaskId: null, tasksCompleted: ["T1"] },
+        hydra_session_w2: { currentTaskId: "T2", tasksCompleted: [] },
+      },
+      concurrencyCap: 4,
+      concurrencyCapLocked: true,
+      contractBrief: "be careful",
+      orchestratorAgent: "claude",
+      orchestratorModel: "opus",
+      executionMs: 60000,
+      executionStartedAt: "2025-01-02T00:00:00Z",
+    };
+    return { ...base, ...overrides };
+  }
+
+  it("mints a fresh projectId distinct from the source", () => {
+    const src = srcBoard();
+    const forked = forkBoard({ source: src });
+    assert.notEqual(forked.projectId, src.projectId);
+    assert.match(forked.projectId, /^hydra_plan_[0-9a-f]+$/);
+  });
+
+  it("resets every task to pending with no artifacts or assignment", () => {
+    const forked = forkBoard({ source: srcBoard() });
+    for (const t of forked.tasks) {
+      assert.equal(t.status, "pending");
+      assert.equal(t.assignedTo, null);
+      assert.equal(t.attemptCount, 0);
+      assert.equal(t.artifacts, null);
+      assert.equal(t.startedAt, null);
+      assert.equal(t.finishedAt, null);
+      assert.equal(t.reviewFeedback, undefined);
+    }
+  });
+
+  it("preserves task structure (id/title/deps/kind/reviews/agent)", () => {
+    const forked = forkBoard({ source: srcBoard() });
+    assert.deepEqual(forked.tasks.map((t) => t.id), ["T1", "T2", "review-T1"]);
+    assert.deepEqual(forked.tasks[1]!.deps, ["T1"]);
+    assert.equal(forked.tasks[2]!.kind, "review");
+    assert.equal(forked.tasks[2]!.reviews, "T1");
+    assert.equal(forked.tasks[0]!.agent, "claude");
+    assert.equal(forked.tasks[0]!.why, "because");
+  });
+
+  it("starts in ready state with no workers and no execution timer", () => {
+    const forked = forkBoard({ source: srcBoard() });
+    assert.equal(forked.state, "ready");
+    assert.deepEqual(forked.workers, {});
+    assert.equal(forked.executionMs, undefined);
+    assert.equal(forked.executionStartedAt, null);
+    assert.equal(forked.pendingExecute, false);
+  });
+
+  it("carries over fleet defaults, review policy, contract brief, cap", () => {
+    const forked = forkBoard({ source: srcBoard() });
+    assert.deepEqual(forked.fleetDefaults, { agent: "claude", model: null, work: undefined, review: undefined });
+    assert.deepEqual(forked.reviewPolicy, { mode: "hints", overrideHint: false, maxAttempts: 3 });
+    assert.equal(forked.contractBrief, "be careful");
+    assert.equal(forked.concurrencyCap, 4);
+    assert.equal(forked.concurrencyCapLocked, true);
+  });
+
+  it("drops orchestratorAgent/Model so the new session reseeds them", () => {
+    const forked = forkBoard({ source: srcBoard() });
+    assert.equal(forked.orchestratorAgent, undefined);
+    assert.equal(forked.orchestratorModel, undefined);
+  });
+
+  it("inherits the source description by default", () => {
+    const forked = forkBoard({ source: srcBoard() });
+    assert.equal(forked.description, "build a thing");
+  });
+
+  it("uses the override description when provided", () => {
+    const forked = forkBoard({ source: srcBoard(), description: "  do it differently  " });
+    assert.equal(forked.description, "do it differently");
+  });
+
+  it("falls back to the source description when override is whitespace-only", () => {
+    const forked = forkBoard({ source: srcBoard(), description: "   " });
+    assert.equal(forked.description, "build a thing");
+  });
+
+  it("does not mutate the source board", () => {
+    const src = srcBoard();
+    const snapshot = JSON.parse(JSON.stringify(src));
+    forkBoard({ source: src });
+    assert.deepEqual(JSON.parse(JSON.stringify(src)), snapshot);
+  });
+
+  it("forks from any source state — done, failed, decomposing all valid", () => {
+    for (const state of ["done", "failed", "decomposing", "ready", "stopped", "running"] as const) {
+      const forked = forkBoard({ source: srcBoard({ state }) });
+      assert.equal(forked.state, "ready");
+    }
   });
 });

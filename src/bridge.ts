@@ -77,6 +77,7 @@ import { resolve as resolvePath } from "node:path";
 import {
   allTerminal,
   canonicalProjectId,
+  forkBoard,
   inFlightCount,
   listProjects,
   loadBoard,
@@ -250,6 +251,15 @@ const COMMANDS = [
     verb: "remove",
     argsHint: "[<projectId>]",
     description: "Delete this session's project (or another by id). Closes worker sessions; orchestrator session is left intact.",
+  },
+  {
+    verb: "list",
+    description: "List planner projects across all sessions. Shows projectId, state, task counts, age, and description — useful for finding a project to fork or attach to.",
+  },
+  {
+    verb: "fork",
+    argsHint: "<projectId> [<new description>]",
+    description: "Copy an existing project's DAG into a new project owned by this session. All tasks reset to pending; no progress/artifacts carry over. Plan lands in `ready` — review then `/hydra planner start`. Useful when the original session was lost.",
   },
 ];
 
@@ -1092,6 +1102,19 @@ export class PlannerBridge {
     }
     if (verb === "resume") {
       this.handleResume(req.id, sessionId);
+      return;
+    }
+    if (verb === "list") {
+      this.handleList(req.id);
+      return;
+    }
+    if (verb === "fork") {
+      void this.handleFork(req.id, sessionId, args).catch((err) => {
+        log.error(`handleFork threw: ${(err as Error).message}`);
+        this.client.reply(req.id, {
+          text: `Internal error: ${(err as Error).message}`,
+        });
+      });
       return;
     }
     this.client.reply(req.id, { text: `unknown planner verb: ${verb}` });
@@ -1977,6 +2000,160 @@ export class PlannerBridge {
     this.client.reply(reqId, {
       text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
     });
+  }
+
+  // `/hydra planner list` — scan the projects dir and emit a compact
+  // table. Mirrors the CLI `hydra-acp planner list` output but lives
+  // inside an ACP session so the user can browse without dropping to
+  // a shell. Includes the orchestrator session id (short form) so the
+  // user can spot which projects are "owned by some other session"
+  // candidates for forking.
+  private handleList(reqId: number | string): void {
+    const projects = listProjects();
+    if (projects.length === 0) {
+      this.client.reply(reqId, {
+        text: "No planner projects yet. Start one with `/hydra planner create <description>`.",
+      });
+      return;
+    }
+    const idW = Math.max(10, ...projects.map((p) => shortProjectId(p.projectId).length));
+    const stateW = Math.max(8, ...projects.map((p) => p.state.length));
+    const sessW = Math.max(8, ...projects.map((p) => p.orchestratorSessionId ? shortSessionId(p.orchestratorSessionId).length : 1));
+    const header = `${"PROJECTID".padEnd(idW)}  ${"STATE".padEnd(stateW)}  TASKS  ${"SESSION".padEnd(sessW)}  DESCRIPTION`;
+    const lines = [header];
+    for (const p of projects) {
+      const tasks = `${p.tasksDone}/${p.tasksTotal}`.padEnd(5);
+      const sess = (p.orchestratorSessionId ? shortSessionId(p.orchestratorSessionId) : "-").padEnd(sessW);
+      const desc = p.description.length > 60
+        ? p.description.slice(0, 57) + "..."
+        : p.description;
+      lines.push(
+        `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${sess}  ${desc}`,
+      );
+    }
+    lines.push("");
+    lines.push("Fork one into this session with `/hydra planner fork <projectId>`.");
+    this.client.reply(reqId, { text: "```\n" + lines.join("\n") + "\n```" });
+  }
+
+  // `/hydra planner fork <projectId> [<new description>]`
+  //
+  // Copy semantics: load the source board, mint a new project that
+  // mirrors the source's DAG (tasks/deps/agents/fleet/contract brief/
+  // attachments/review policy) but with every task reset to pending
+  // and no workers/artifacts. The new project lands in `ready` —
+  // user reviews and explicitly issues `/hydra planner start`.
+  //
+  // The source board is left completely untouched on disk. The
+  // current session becomes the orchestrator for the new project.
+  private async handleFork(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): Promise<void> {
+    if (!sessionId) {
+      this.client.reply(reqId, { text: "planner fork: missing sessionId" });
+      return;
+    }
+    if (!args) {
+      this.client.reply(reqId, {
+        text: "planner fork: usage `/hydra planner fork <projectId> [<new description>]`",
+      });
+      return;
+    }
+    const m = args.match(/^(\S+)\s*(.*)$/);
+    if (!m) {
+      this.client.reply(reqId, {
+        text: "planner fork: usage `/hydra planner fork <projectId> [<new description>]`",
+      });
+      return;
+    }
+    const sourceArg = m[1]!;
+    const newDescription = m[2]!.trim();
+    const sourceId = canonicalProjectId(sourceArg);
+    const source = loadBoard(sourceId);
+    if (!source) {
+      this.client.reply(reqId, {
+        text: `planner fork: no project '${sourceArg}'. Try \`/hydra planner list\`.`,
+      });
+      return;
+    }
+    if (source.tasks.length === 0) {
+      this.client.reply(reqId, {
+        text: `planner fork: source project ${shortProjectId(sourceId)} has no tasks to fork (likely still decomposing). Wait for the source to reach \`ready\` or later, then try again.`,
+      });
+      return;
+    }
+
+    // Same guard as create: refuse if the current session already
+    // owns a live project. `ready` / `stopped` are overwritable
+    // (treat fork like a create-replacement of a draft).
+    const existing = boards.get(sessionId);
+    if (
+      existing &&
+      existing.state !== "done" &&
+      existing.state !== "failed" &&
+      existing.state !== "ready" &&
+      existing.state !== "stopped"
+    ) {
+      this.client.reply(reqId, {
+        text: `planner fork: project ${shortProjectId(existing.projectId)} is already ${existing.state} in this session. \`/hydra planner stop\` or \`/hydra planner remove\` it first, or run fork from a different session.`,
+      });
+      return;
+    }
+    if (existing && existing.state === "ready") {
+      try {
+        rmSync(projectDir(existing.projectId), { recursive: true, force: true });
+        log.info(
+          `fork: replacing prior ready plan ${shortProjectId(existing.projectId)} on session …${sessionId.slice(-8)}`,
+        );
+      } catch (err) {
+        log.warn(
+          `fork: failed to remove prior ready plan ${shortProjectId(existing.projectId)}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    const board = forkBoard({
+      source,
+      description: newDescription.length > 0 ? newDescription : undefined,
+    });
+    const baseline0 = getLatestOrchestratorUsage(sessionId);
+    if (baseline0) board.orchestratorUsageBaseline = { ...baseline0 };
+    await this.seedOrchestratorIdentity(board, sessionId);
+
+    boards.set(sessionId, board);
+    saveBoard(board, sessionId);
+    setOrchestratorState(sessionId, {
+      projectId: board.projectId,
+      decompositionAccumulator: "",
+      addAccumulator: "",
+      awaitingAdd: false,
+      awaitingDecomposition: false,
+      awaitingOrchestratorReview: false,
+      orchestratorReviewTaskId: null,
+      orchestratorReviewAccumulator: "",
+    });
+
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(`fork: transformer/attach failed: ${(err as Error).message}`);
+    }
+
+    log.info(
+      `forked ${shortProjectId(sourceId)} → ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)} (${board.tasks.length} tasks)`,
+    );
+
+    const descNote = newDescription.length > 0
+      ? ` with new description "${newDescription.slice(0, 60)}${newDescription.length > 60 ? "..." : ""}"`
+      : "";
+    const text =
+      `Forked ${shortProjectId(sourceId)} → ${shortProjectId(board.projectId)} (${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"})${descNote}.\n` +
+      `All tasks reset to pending; plan is in \`ready\`. Review and run \`/hydra planner start\` when you're ready, or \`/hydra planner add <description>\` to revise.\n\n` +
+      formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    this.client.reply(reqId, { text });
   }
 
   // `/hydra planner continue` — open the live view on a running
