@@ -577,18 +577,54 @@ export class PlannerBridge {
           daemonHttpBase: this.daemonHttpBase,
           token: this.daemonToken,
         }));
-    try {
-      const info = await fetcher(sessionId);
-      if (!info) return;
+    // Returns true to terminate the retry loop (both fields populated,
+    // hard error, or session unknown). Returns false to retry (fetch
+    // succeeded but agentId / currentModel were empty — common right
+    // after a daemon restart, before the orchestrator session has
+    // surfaced its identity).
+    const attempt = async (): Promise<boolean> => {
+      let info: import("./util/session-info.js").SessionInfo | undefined;
+      try {
+        info = await fetcher(sessionId);
+      } catch (err) {
+        log.debug(
+          `seedOrchestratorIdentity ${sessionId}: ${(err as Error).message}`,
+        );
+        return true;
+      }
+      if (!info) return true;
+      let changed = false;
       if (info.agentId && !board.orchestratorAgent) {
         board.orchestratorAgent = info.agentId;
+        changed = true;
       }
       if (info.currentModel && !board.orchestratorModel) {
         board.orchestratorModel = info.currentModel;
+        changed = true;
       }
-    } catch (err) {
-      log.debug(`seedOrchestratorIdentity ${sessionId}: ${(err as Error).message}`);
-    }
+      if (changed) {
+        saveBoard(board, sessionId);
+        this.emitPlanUpdate(sessionId, board);
+      }
+      // Use `!=` so both `null` (saved boards) and `undefined` (freshly
+      // created via newBoard/forkBoard, which leave these fields unset)
+      // are treated as "still needs a value" — otherwise the cold-start
+      // retry never runs for new boards.
+      return board.orchestratorAgent != null
+        && board.orchestratorModel != null;
+    };
+    // Await the first attempt to preserve today's call-site semantics
+    // (callers at 2292 / 2582 / 2978 / 6413 expect a populated board
+    // when this resolves on the happy path). Subsequent retries run in
+    // the background so we don't block create/start when the daemon is
+    // slow to surface session info.
+    if (await attempt()) return;
+    void (async () => {
+      for (let i = 0; i < 4; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        if (await attempt()) return;
+      }
+    })();
   }
 
   // Post-spawn refinement of Worker.agent/Worker.model from the
@@ -3731,6 +3767,37 @@ export class PlannerBridge {
           if (model && model !== board.orchestratorModel) {
             board.orchestratorModel = model;
             saveBoard(board, sessionId);
+          }
+        }
+      } else if (
+        kind === "session_info_update" ||
+        kind === "current_model_update"
+      ) {
+        // Post-spawn one-shot fetch is the fast path; this reactive
+        // handler catches slow-starting agents (e.g. local LLMs) whose
+        // currentModel doesn't materialize at the daemon until minutes
+        // after session_open. See refineWorkerFromDaemon.
+        const orchestratorId = orchestratorOfWorker(sessionId);
+        const workerBoard = orchestratorId ? boards.get(orchestratorId) : undefined;
+        const worker = workerBoard ? workerBoard.workers[sessionId] : undefined;
+        if (orchestratorId && workerBoard && worker) {
+          let changed = false;
+          if (kind === "session_info_update") {
+            const agentId = extractAgentIdUpdate(envelope);
+            if (agentId && agentId !== worker.agent) {
+              worker.agent = agentId;
+              changed = true;
+            }
+          } else {
+            const model = extractCurrentModelUpdate(envelope);
+            if (model && model !== worker.model) {
+              worker.model = model;
+              changed = true;
+            }
+          }
+          if (changed) {
+            saveBoard(workerBoard, orchestratorId);
+            this.emitPlanUpdate(orchestratorId, workerBoard);
           }
         }
       }

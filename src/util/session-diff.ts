@@ -14,13 +14,14 @@ export interface DiffFile {
 }
 
 export function httpBaseFromWsUrl(wsUrl: string): string {
-  if (wsUrl.startsWith("wss://")) {
-    return "https://" + wsUrl.slice("wss://".length);
+  try {
+    const u = new URL(wsUrl);
+    const proto =
+      u.protocol === "wss:" ? "https:" : u.protocol === "ws:" ? "http:" : u.protocol;
+    return `${proto}//${u.host}`;
+  } catch {
+    return wsUrl;
   }
-  if (wsUrl.startsWith("ws://")) {
-    return "http://" + wsUrl.slice("ws://".length);
-  }
-  return wsUrl;
 }
 
 export async function fetchSessionDiff(
