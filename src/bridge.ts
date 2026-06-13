@@ -3742,7 +3742,7 @@ export class PlannerBridge {
     // blob. Terminals render the fenced form the same as raw text,
     // so this is a strict improvement across clients.
     const statusDump = formatStatus(board, attachedSessions.has(sessionId), sessionId);
-    const followup = `Plan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or \`/hydra planner create <new description>\` to revise.`;
+    const followup = `Plan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or tell me what to change to revise the plan.`;
     void this.emitSyntheticMessage(sessionId, `\`\`\`\n${statusDump}\n\`\`\`\n\n${followup}`);
   }
 
