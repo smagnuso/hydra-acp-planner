@@ -7,10 +7,12 @@ import {
   buildResumeReviewPrompt,
   buildTaskPrompt,
   buildReviewPrompt,
+  buildDistillPrompt,
   extractResultBlock,
   extractReviewBlock,
   normalizeResult,
   normalizeReview,
+  normalizeDistill,
   promptsFor,
   PROMPTS,
 } from "../src/task.ts";
@@ -794,5 +796,266 @@ describe("normalizeReview — competition", () => {
       normalizeReview({ decision: "maybe" as unknown as "approve", notes: "x" }, ["T1"]),
       undefined,
     );
+  });
+});
+
+// ─── buildDistillPrompt — golden test (T3) ───────────────────────────────
+
+describe("buildDistillPrompt", () => {
+  function makeDistillFixture() {
+    const t1 = task("T1", {
+      kind: "work",
+      status: "done",
+      artifacts: {
+        summary: "auth via cookie",
+        files_changed: ["src/auth.ts"],
+        verified_diff: { files: ["src/auth.ts"], hunkCount: 3, sample: "+ cookie set" },
+      },
+    });
+    const t2 = task("T2", {
+      kind: "work",
+      status: "done",
+      artifacts: {
+        summary: "auth via JWT",
+        files_changed: ["src/auth.ts"],
+        verified_diff: { files: ["src/auth.ts"], hunkCount: 5, sample: "+ jwt.sign" },
+      },
+    });
+    const review = task("R1", {
+      kind: "review",
+      status: "done",
+      reviews: ["T1", "T2"],
+      artifacts: {
+        summary: "synthesize",
+        notes: "T1 is simpler but T2 handles multi-device; neither is clearly best",
+      },
+    });
+    const distill = task("R1d", {
+      kind: "distill",
+      title: "Distill R1",
+      reviews: ["T1", "T2"],
+      distillOf: "R1",
+      deps: ["T1", "T2"],
+    });
+    return { board: board([t1, t2, review, distill]), distill };
+  }
+
+  it("includes a Candidate section for each reviewee with their artifacts", () => {
+    const { board: b, distill } = makeDistillFixture();
+    const p = buildDistillPrompt(distill, b);
+    assert.match(p, /### Candidate T1/);
+    assert.match(p, /### Candidate T2/);
+    assert.match(p, /auth via cookie/);
+    assert.match(p, /auth via JWT/);
+    assert.match(p, /verified_diff/);
+    assert.match(p, /jwt\.sign/);
+  });
+
+  it("includes the originating reviewer's notes under 'Why no winner was picked'", () => {
+    const { board: b, distill } = makeDistillFixture();
+    const p = buildDistillPrompt(distill, b);
+    assert.match(p, /Why no winner was picked/);
+    assert.match(p, /T1 is simpler but T2 handles multi-device/);
+  });
+
+  it("ends with the DISTILL result-instructions block", () => {
+    const { board: b, distill } = makeDistillFixture();
+    const p = buildDistillPrompt(distill, b);
+    assert.match(p, /hydra-result/);
+    assert.match(p, /recommended_action/);
+    assert.match(p, /Citation rules/);
+    assert.match(p, /non-empty.*sources/i);
+  });
+
+  it("renders even when originating review has no notes", () => {
+    const t1 = task("T1", { kind: "work", status: "done", artifacts: { summary: "x" } });
+    const review = task("R1", { kind: "review", status: "done", reviews: ["T1"] });
+    const distill = task("R1d", {
+      kind: "distill",
+      reviews: ["T1"],
+      distillOf: "R1",
+    });
+    const p = buildDistillPrompt(distill, board([t1, review, distill]));
+    assert.match(p, /Reviewer left no notes|No originating review notes/);
+  });
+});
+
+// ─── normalizeDistill — citation validation (T3) ────────────────────────
+
+describe("normalizeDistill", () => {
+  const goodFinding = {
+    claim: "both use bcrypt",
+    sources: ["T1"],
+    verdict: "keep",
+    evidence: "T1:src/auth.ts hunk 2",
+  };
+
+  it("accepts a well-formed distill result (happy path)", () => {
+    const r = normalizeDistill(
+      {
+        summary: "T1 and T2 differ on token strategy",
+        findings: [goodFinding],
+        recommended_action: "apply T1",
+      },
+      ["T1", "T2"],
+    );
+    assert.ok(r);
+    assert.equal(r!.warnings.length, 0);
+    assert.equal(r!.artifacts.summary, "T1 and T2 differ on token strategy");
+    const rec = r!.artifacts as Record<string, unknown>;
+    assert.equal(rec.recommended_action, "apply T1");
+    assert.equal(rec.applied_winner, "T1");
+    assert.ok(Array.isArray(rec.findings));
+  });
+
+  it("rejects when a finding's sources contains an id not in task.reviews", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [{ ...goodFinding, sources: ["T9"] }],
+        recommended_action: "apply T1",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects when any finding has empty sources", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [{ ...goodFinding, sources: [] }],
+        recommended_action: "apply T1",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects when recommended_action 'apply Tx' references a non-reviewee", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [goodFinding],
+        recommended_action: "apply T9",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects when recommended_action is 'rework' but rework_brief is missing", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [goodFinding],
+        recommended_action: "rework",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects when recommended_action is 'new-work' but rework_brief is missing", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [goodFinding],
+        recommended_action: "new-work",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("accepts 'rework' with a non-empty rework_brief", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [goodFinding],
+        recommended_action: "rework",
+        rework_brief: "redo T1 using bcrypt-12",
+      },
+      ["T1", "T2"],
+    );
+    assert.ok(r);
+    const rec = r!.artifacts as Record<string, unknown>;
+    assert.equal(rec.recommended_action, "rework");
+    assert.equal(rec.rework_brief, "redo T1 using bcrypt-12");
+    assert.equal(rec.applied_winner, undefined);
+  });
+
+  it("rejects unknown recommended_action values", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [goodFinding],
+        recommended_action: "ship-it",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects when summary is missing", () => {
+    const r = normalizeDistill(
+      {
+        findings: [goodFinding],
+        recommended_action: "apply T1",
+      },
+      ["T1"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects when findings is empty", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [],
+        recommended_action: "apply T1",
+      },
+      ["T1"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects a finding missing evidence", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [{ claim: "c", sources: ["T1"], verdict: "keep" }],
+        recommended_action: "apply T1",
+      },
+      ["T1"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("rejects a finding with bad verdict", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [{ ...goodFinding, verdict: "maybe" }],
+        recommended_action: "apply T1",
+      },
+      ["T1"],
+    );
+    assert.equal(r, undefined);
+  });
+
+  it("preserves unresolved when provided", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [goodFinding],
+        recommended_action: "apply T1",
+        unresolved: ["does T1 handle expiry?"],
+      },
+      ["T1"],
+    );
+    assert.ok(r);
+    const rec = r!.artifacts as Record<string, unknown>;
+    assert.deepEqual(rec.unresolved, ["does T1 handle expiry?"]);
   });
 });

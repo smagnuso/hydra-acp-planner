@@ -664,6 +664,66 @@ describe("get_findings", () => {
     assert.match(result.content[0]!.text, /3 findings/);
   });
 
+  it("returns a distill finding with structured distillReport payload", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "distill-review-T1",
+          title: "Distill of T1 reviews",
+          status: "done",
+          kind: "distill",
+          reviews: ["review-T1a", "review-T1b"],
+          artifacts: {
+            summary: "merged 2 reviews",
+            ...({
+              findings: [
+                {
+                  claim: "missing teardown",
+                  sources: ["review-T1a", "review-T1b"],
+                  verdict: "keep",
+                  evidence: "review-T1a:foo.ts:10",
+                },
+              ],
+              recommended_action: "apply review-T1a",
+              applied_winner: "review-T1a",
+            } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkInvoke(65, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: {
+        counts: { total: number; distill: number };
+        findings: Array<{
+          taskId: string;
+          category: string;
+          kind: string;
+          distillReport?: {
+            recommendedAction: string;
+            appliedWinner?: string;
+            findings: Array<{ claim: string; sources: string[]; verdict: string }>;
+          };
+        }>;
+      };
+    };
+    assert.equal(result.structuredContent.counts.total, 1);
+    assert.equal(result.structuredContent.counts.distill, 1);
+    const f = result.structuredContent.findings[0]!;
+    assert.equal(f.taskId, "distill-review-T1");
+    assert.equal(f.category, "distill");
+    assert.equal(f.kind, "distill");
+    assert.ok(f.distillReport);
+    assert.equal(f.distillReport!.recommendedAction, "apply review-T1a");
+    assert.equal(f.distillReport!.appliedWinner, "review-T1a");
+    assert.equal(f.distillReport!.findings.length, 1);
+    assert.deepEqual(f.distillReport!.findings[0]!.sources, ["review-T1a", "review-T1b"]);
+  });
+
   it("filters to a single task when taskId is provided", async () => {
     seedBoard("hydra_session_test", {
       state: "done",

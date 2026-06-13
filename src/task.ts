@@ -2,7 +2,7 @@ import type { Board, Task, TaskArtifacts } from "./board.js";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-export type TaskKind = "work" | "review";
+export type TaskKind = "work" | "review" | "distill";
 
 /** Shape of a review result emitted by a worker agent. */
 export interface ReviewResult {
@@ -65,6 +65,12 @@ Then classify each finding by severity:
 
 End your message with a structured \`hydra-result\` block recording your decision. The planner CANNOT proceed without that block.`;
 
+const DISTILL_SYSTEM = `You are a distiller agent on a multi-agent coding project. A competition reviewer was asked to pick a winner from N candidate implementations and could not — it returned \`synthesize\`. Your job is to read those candidates plus the reviewer's notes and emit a **source-cited** merge report.
+
+You do not write code. You do not merge diffs. You produce a structured report whose every finding cites the specific candidate(s) it came from, and whose \`recommended_action\` tells the planner what to do next (apply one candidate as winner, rework it, or start fresh).
+
+Every claim you make MUST be tied to one or more candidate task ids via \`sources\`. Findings with empty or unknown sources will be rejected by the parser and this turn will be re-run from scratch — ungrounded prose is the failure mode we're designing against.`;
+
 // Trailing instructions for the single-reviewee review prompt. This is
 // the last thing the reviewer sees before its turn — placed at the
 // bottom (not mixed in with general result instructions) because chatty
@@ -122,6 +128,47 @@ Write whatever prose / per-candidate analysis you need first, then end with:
 \`\`\`
 
 (\`winner\` is required for \`decision: "winner"\`; omit for \`synthesize\`.)
+
+This block MUST be the literal last thing in your reply — after any prose,
+tool-call output, or code samples. The fence must be exactly \`\`\`hydra-result
+(not \`\`\`json, not unfenced JSON). The planner parses this fence; nothing
+else.`;
+
+const REVIEW_RESULT_INSTRUCTIONS_DISTILL = `## How to respond
+
+**THE FINAL CONTENT OF YOUR REPLY MUST BE A \`hydra-result\` BLOCK.** Without
+it the planner cannot record the distilled report and the work is wasted.
+
+Write whatever prose / per-candidate analysis you need first, then end with:
+
+\`\`\`hydra-result
+{
+  "summary":            "one-paragraph overview of the merged picture",
+  "findings": [
+    {
+      "claim":    "what is true across / between the candidates",
+      "sources":  ["Tx", "Ty"],
+      "verdict":  "keep|drop|defer",
+      "evidence": "Tx:path hunk N; Ty:path hunk M"
+    }
+  ],
+  "recommended_action": "apply Tx | rework | new-work",
+  "rework_brief":       "required when recommended_action is rework or new-work",
+  "unresolved":         ["open questions, if any"]
+}
+\`\`\`
+
+**Citation rules — these are enforced by the parser:**
+- Every \`finding\` MUST carry a non-empty \`sources\` array.
+- Every entry in \`sources\` MUST be the id of one of the candidate tasks
+  listed above (see the \`## Candidate Tx\` sections).
+- For \`recommended_action: "apply Tx"\`, Tx MUST be one of the candidates.
+- For \`recommended_action: "rework"\` or \`"new-work"\`, \`rework_brief\`
+  MUST be a non-empty string describing what the follow-up work task
+  should do.
+
+Findings without sources or with unknown source ids will be rejected and
+this turn will be re-run. Don't paraphrase — cite.
 
 This block MUST be the literal last thing in your reply — after any prose,
 tool-call output, or code samples. The fence must be exactly \`\`\`hydra-result
@@ -578,6 +625,272 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       ].join("\n");
     },
   },
+  distill: {
+    buildPrompt(task: Task, board: Board): string {
+      const parts: string[] = [];
+      parts.push(DISTILL_SYSTEM);
+      parts.push("");
+      parts.push("## Task");
+      parts.push(`**${task.id} — ${task.title}**`);
+      if (task.why) {
+        parts.push("");
+        parts.push(`**Why:** ${task.why}`);
+      }
+      if (task.what) {
+        parts.push("");
+        parts.push(`**What:** ${task.what}`);
+      }
+      if (task.constraints) {
+        parts.push("");
+        parts.push(`**Constraints:** ${task.constraints}`);
+      }
+      const brief = formatContractBrief(board);
+      if (brief) {
+        parts.push("");
+        parts.push(brief);
+      }
+      const attachments = formatAttachments(board);
+      if (attachments) {
+        parts.push("");
+        parts.push(attachments);
+      }
+
+      const reviewsList = Array.isArray(task.reviews) ? task.reviews : [];
+      parts.push("");
+      parts.push("## Why no winner was picked");
+      const distillOfId = task.distillOf;
+      const originatingReview = distillOfId
+        ? board.tasks.find((t) => t.id === distillOfId)
+        : undefined;
+      if (originatingReview && originatingReview.artifacts) {
+        const a = originatingReview.artifacts as Record<string, unknown>;
+        const notes = typeof a.notes === "string" ? a.notes : "";
+        parts.push(
+          `The reviewer (${originatingReview.id} — ${originatingReview.title}) returned \`synthesize\` rather than picking a single winner.`,
+        );
+        if (notes) {
+          parts.push("");
+          parts.push("Reviewer notes:");
+          parts.push("```");
+          parts.push(notes);
+          parts.push("```");
+        } else {
+          parts.push("");
+          parts.push("(Reviewer left no notes.)");
+        }
+      } else {
+        parts.push(
+          "(No originating review notes available — proceed from the candidate artifacts alone.)",
+        );
+      }
+
+      parts.push("");
+      parts.push("## Candidates");
+      parts.push(
+        `Each \`## Candidate Tx\` section below contains that worker's full \`artifacts\` block — including the same daemon-audited \`verified_diff\` (files actually edited + sample hunks) that the judge saw. Treat \`verified_diff\` as evidence; the worker's \`summary\` / \`files_changed\` are claims.`,
+      );
+      for (const revId of reviewsList) {
+        const rev = board.tasks.find((t) => t.id === revId);
+        parts.push("");
+        parts.push(`### Candidate ${revId}${rev?.title ? ` — ${rev.title}` : ""}`);
+        if (rev && rev.status === "done" && rev.artifacts) {
+          parts.push(JSON.stringify(rev.artifacts, null, 2));
+        } else {
+          parts.push("(no artifacts available)");
+        }
+      }
+
+      parts.push("");
+      parts.push("## Distill instructions");
+      parts.push(
+        `Produce a structured, **source-cited** report that merges what's salvageable across the candidates and recommends a next step.`,
+        ``,
+        `**Do this in order:**`,
+        `  1. Read each candidate's \`verified_diff\` and compare against the reviewed spec (\`what\` / \`why\` / \`constraints\` of the task they were attempting).`,
+        `  2. Extract \`findings\` — concrete claims about the candidates. Each finding cites \`sources\` (candidate ids) and a \`verdict\` (keep / drop / defer).`,
+        `  3. Pick a \`recommended_action\`:`,
+        `     - \`apply Tx\` — one candidate is good enough as-is; name it. Mirrors the judge's "winner" path.`,
+        `     - \`rework\` — fix one of the candidates; \`rework_brief\` describes what changes.`,
+        `     - \`new-work\` — start fresh from scratch; \`rework_brief\` describes the work.`,
+        `  4. List \`unresolved\` questions that couldn't be answered from the artifacts.`,
+      );
+      if (task.attemptCount > 0 && task.reviewFeedback?.length) {
+        parts.push("");
+        parts.push("## Previous attempt feedback");
+        for (const entry of task.reviewFeedback) {
+          parts.push(`- ${entry}`);
+        }
+      }
+      parts.push("");
+      parts.push(REVIEW_RESULT_INSTRUCTIONS_DISTILL);
+      return parts.join("\n");
+    },
+
+    extractResult(text: string): unknown {
+      const labelled = /```hydra-result\s*\n([\s\S]*?)\n```/;
+      const fallback = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+      const m = text.match(labelled);
+      if (m && m[1] !== undefined) {
+        try {
+          return JSON.parse(m[1]);
+        } catch {
+          // fall through to fallback
+        }
+      }
+      let last: string | undefined;
+      for (const match of text.matchAll(fallback)) {
+        if (match[1] !== undefined) {
+          last = match[1];
+        }
+      }
+      if (last === undefined) return undefined;
+      try {
+        return JSON.parse(last);
+      } catch {
+        return undefined;
+      }
+    },
+
+    normalizeResult(raw: unknown, reviewsList?: string[]): NormalizedResult | undefined {
+      if (!raw || typeof raw !== "object") return undefined;
+      const obj = raw as Record<string, unknown>;
+      const warnings: string[] = [];
+
+      const summary =
+        typeof obj.summary === "string" && obj.summary.trim().length > 0
+          ? obj.summary.trim()
+          : undefined;
+      if (!summary) {
+        warnings.push("distill missing summary");
+        return undefined;
+      }
+
+      const findingsRaw = obj.findings;
+      if (!Array.isArray(findingsRaw) || findingsRaw.length === 0) {
+        warnings.push("distill findings must be a non-empty array");
+        return undefined;
+      }
+
+      const findings: Array<{
+        claim: string;
+        sources: string[];
+        verdict: string;
+        evidence: string;
+      }> = [];
+      const reviewSet = new Set(reviewsList ?? []);
+      for (let i = 0; i < findingsRaw.length; i++) {
+        const f = findingsRaw[i];
+        if (!f || typeof f !== "object" || Array.isArray(f)) {
+          warnings.push(`findings[${i}] should be an object`);
+          return undefined;
+        }
+        const fr = f as Record<string, unknown>;
+        const claim = typeof fr.claim === "string" ? fr.claim : "";
+        if (!claim) {
+          warnings.push(`findings[${i}] missing claim`);
+          return undefined;
+        }
+        const verdict = fr.verdict;
+        if (verdict !== "keep" && verdict !== "drop" && verdict !== "defer") {
+          warnings.push(`findings[${i}] verdict must be keep|drop|defer`);
+          return undefined;
+        }
+        const evidence = typeof fr.evidence === "string" ? fr.evidence : "";
+        if (!evidence) {
+          warnings.push(`findings[${i}] missing evidence`);
+          return undefined;
+        }
+        const sourcesRaw = fr.sources;
+        if (!Array.isArray(sourcesRaw) || sourcesRaw.length === 0) {
+          warnings.push(`findings[${i}] has empty sources`);
+          return undefined;
+        }
+        const sources: string[] = [];
+        for (const s of sourcesRaw) {
+          if (typeof s !== "string") {
+            warnings.push(`findings[${i}] sources had non-string entry`);
+            return undefined;
+          }
+          if (reviewsList && !reviewSet.has(s)) {
+            warnings.push(`findings[${i}] source "${s}" not found in reviews list`);
+            return undefined;
+          }
+          sources.push(s);
+        }
+        findings.push({ claim, sources, verdict, evidence });
+      }
+
+      const action = obj.recommended_action;
+      if (typeof action !== "string" || action.trim().length === 0) {
+        warnings.push("distill missing recommended_action");
+        return undefined;
+      }
+      const applyMatch = /^apply\s+(\S+)$/.exec(action.trim());
+      const reworkBrief =
+        typeof obj.rework_brief === "string" ? obj.rework_brief.trim() : "";
+      let normalizedAction = action.trim();
+      let appliedWinner: string | undefined;
+      if (applyMatch) {
+        const tx = applyMatch[1]!;
+        if (reviewsList && !reviewSet.has(tx)) {
+          warnings.push(`recommended_action "apply ${tx}" references non-reviewee`);
+          return undefined;
+        }
+        appliedWinner = tx;
+        normalizedAction = `apply ${tx}`;
+      } else if (normalizedAction === "rework" || normalizedAction === "new-work") {
+        if (!reworkBrief) {
+          warnings.push(
+            `recommended_action "${normalizedAction}" requires rework_brief`,
+          );
+          return undefined;
+        }
+      } else {
+        warnings.push(
+          `recommended_action must be "apply Tx" | "rework" | "new-work"`,
+        );
+        return undefined;
+      }
+
+      const unresolved = Array.isArray(obj.unresolved)
+        ? obj.unresolved.filter((v): v is string => typeof v === "string")
+        : undefined;
+
+      const artifacts: TaskArtifacts = { summary };
+      const rec = artifacts as Record<string, unknown>;
+      rec.findings = findings;
+      rec.recommended_action = normalizedAction;
+      if (appliedWinner) rec.applied_winner = appliedWinner;
+      if (reworkBrief) rec.rework_brief = reworkBrief;
+      if (unresolved && unresolved.length > 0) rec.unresolved = unresolved;
+
+      return { artifacts, warnings };
+    },
+
+    buildResumePrompt(task: Task): string {
+      return [
+        `[hydra-acp-planner: resuming after restart]`,
+        ``,
+        `You were previously distilling **${task.id} — ${task.title}**.`,
+        ``,
+        `Continue from where you left off. If you were mid-analysis, finish it. If you were already done but never emitted your hydra-result block, emit it now (don't redo the distillation).`,
+        ``,
+        `When finished, end your message with the same fenced \`\`\`hydra-result block format described earlier (summary + findings[] with non-empty sources + recommended_action).`,
+      ].join("\n");
+    },
+
+    buildRepromptPrompt(task: Task): string {
+      return [
+        `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block, or the block failed validation.`,
+        ``,
+        `Please emit it now — do NOT redo the analysis. Every \`finding\` must have a non-empty \`sources\` array drawn from the candidate ids listed in the prompt. \`recommended_action\` must be \`apply Tx\`, \`rework\`, or \`new-work\` (and rework/new-work require \`rework_brief\`):`,
+        ``,
+        "```hydra-result",
+        `{"summary":"...","findings":[{"claim":"...","sources":["Tx"],"verdict":"keep","evidence":"Tx:path hunk N"}],"recommended_action":"apply Tx"}`,
+        "```",
+      ].join("\n");
+    },
+  },
 };
 
 export { PROMPTS };
@@ -642,4 +955,29 @@ export function buildResumeReviewPrompt(task: Task): string {
 
 export function buildRepromptForReviewPrompt(task: Task): string {
   return promptsFor("review").buildRepromptPrompt(task);
+}
+
+// ── Distill helpers (thin wrappers) ──────────────────────────────────────
+
+export function buildDistillPrompt(task: Task, board: Board): string {
+  return promptsFor("distill").buildPrompt(task, board);
+}
+
+export function extractDistillBlock(text: string): unknown {
+  return promptsFor("distill").extractResult(text);
+}
+
+export function normalizeDistill(
+  raw: unknown,
+  reviewsList?: string[],
+): NormalizedResult | undefined {
+  return promptsFor("distill").normalizeResult(raw, reviewsList);
+}
+
+export function buildResumeDistillPrompt(task: Task): string {
+  return promptsFor("distill").buildResumePrompt(task);
+}
+
+export function buildRepromptForDistillPrompt(task: Task): string {
+  return promptsFor("distill").buildRepromptPrompt(task);
 }

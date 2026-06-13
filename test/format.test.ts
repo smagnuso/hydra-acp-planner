@@ -241,6 +241,77 @@ describe("formatStatus", () => {
     );
   });
 
+  it("renders a distill task with header, summary, findings (with sources), and recommended_action", () => {
+    const out = formatStatus(
+      board({
+        tasks: [
+          task("T1", { status: "superseded" }),
+          task("T1a", { status: "superseded" }),
+          task("T1b", { status: "superseded" }),
+          task("T2", {
+            kind: "review",
+            reviews: ["T1", "T1a", "T1b"],
+            status: "done",
+          }),
+          task("T2d", {
+            kind: "distill",
+            reviews: ["T1", "T1a", "T1b"],
+            distillOf: "T2",
+            status: "done",
+            artifacts: {
+              summary: "Three approaches; T1a is correct on hashing",
+              findings: [
+                {
+                  claim: "T1a uses bcrypt; T1/T1b use sha256",
+                  sources: ["T1", "T1a", "T1b"],
+                  verdict: "keep",
+                },
+                {
+                  claim: "T1b lacks rate limiting",
+                  sources: ["T1b"],
+                  verdict: "drop",
+                },
+              ],
+              recommended_action: "apply T1a",
+            } as unknown as Task["artifacts"],
+          }),
+        ],
+      }),
+      true,
+    );
+    assert.match(out, /T2d\s+Task T2d.*Distilled from T1, T1a, T1b/);
+    assert.match(out, /summary: Three approaches; T1a is correct on hashing/);
+    assert.match(out, /findings:/);
+    assert.match(
+      out,
+      /- T1a uses bcrypt; T1\/T1b use sha256 \(keep\)\s+sources: \[T1, T1a, T1b\]/,
+    );
+    assert.match(
+      out,
+      /- T1b lacks rate limiting \(drop\)\s+sources: \[T1b\]/,
+    );
+    assert.match(out, /recommended_action: apply T1a/);
+  });
+
+  it("does not regress competition review rendering when a distill is also present", () => {
+    const out = formatStatus(
+      board({
+        tasks: [
+          task("T1", { status: "awaiting_review" }),
+          task("T1a", { status: "awaiting_review" }),
+          task("T2", {
+            kind: "review",
+            reviews: ["T1", "T1a"],
+            status: "done",
+          }),
+        ],
+      }),
+      true,
+    );
+    assert.match(out, /T2\s+Task T2.*reviewees: \[T1, T1a\]/);
+    assert.doesNotMatch(out, /Distilled from/);
+  });
+
   it("places the Planner line before task list when no Sessions table", () => {
     const out = formatStatus(
       board({ tasks: [task("T1", { status: "pending" })] }),
@@ -368,6 +439,41 @@ describe("formatCompletionFindings", () => {
     assert.equal(out, "");
   });
 
+  it("surfaces completed distill tasks with their report", () => {
+    const out = formatCompletionFindings(
+      board({
+        tasks: [
+          task("distill-review-T3", {
+            title: "Distill of T3 reviews",
+            kind: "distill",
+            status: "done",
+            reviews: ["review-T3a", "review-T3b"],
+            artifacts: {
+              summary: "merged 2 reviews; both agree on missing teardown",
+              ...({
+                findings: [
+                  {
+                    claim: "WS not closed on error path",
+                    sources: ["review-T3a", "review-T3b"],
+                    verdict: "keep",
+                    evidence: "review-T3a:agent-auth.ts:198",
+                  },
+                ],
+                recommended_action: "apply review-T3a",
+                applied_winner: "review-T3a",
+              } as object),
+            },
+          }),
+        ],
+      }),
+    );
+    assert.match(out, /\[distill\] distill-review-T3/);
+    assert.match(out, /recommended_action: apply review-T3a/);
+    assert.match(out, /applied_winner: review-T3a/);
+    assert.match(out, /\[keep\] WS not closed/);
+    assert.match(out, /sources: review-T3a,review-T3b/);
+  });
+
   it("surfaces failed tasks with their summary", () => {
     const out = formatCompletionFindings(
       board({
@@ -470,6 +576,86 @@ describe("collectFindings", () => {
     assert.equal(out.length, 1);
     assert.equal(out[0].category, "follow_ups");
     assert.deepEqual(out[0].followUps, ["fix:48", "fix:198-207"]);
+  });
+
+  it("emits a distill finding for a completed distill task with mirrored report", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("distill-review-T1", {
+            title: "Distill of T1 reviews",
+            kind: "distill",
+            status: "done",
+            reviews: ["review-T1a", "review-T1b"],
+            artifacts: {
+              summary: "merged 2 reviews",
+              ...({
+                findings: [
+                  {
+                    claim: "missing teardown",
+                    sources: ["review-T1a", "review-T1b"],
+                    verdict: "keep",
+                    evidence: "review-T1a:foo.ts:10",
+                  },
+                  {
+                    claim: "noisy log",
+                    sources: ["review-T1a"],
+                    verdict: "drop",
+                    evidence: "review-T1a:bar.ts:5",
+                  },
+                ],
+                recommended_action: "apply review-T1a",
+                applied_winner: "review-T1a",
+                unresolved: ["test coverage for retry path"],
+              } as object),
+            },
+          }),
+        ],
+      }),
+    );
+    assert.equal(out.length, 1);
+    const f = out[0]!;
+    assert.equal(f.category, "distill");
+    assert.equal(f.kind, "distill");
+    assert.ok(f.distillReport);
+    assert.equal(f.distillReport!.recommendedAction, "apply review-T1a");
+    assert.equal(f.distillReport!.appliedWinner, "review-T1a");
+    assert.equal(f.distillReport!.findings.length, 2);
+    assert.deepEqual(f.distillReport!.findings[0]!.sources, ["review-T1a", "review-T1b"]);
+    assert.deepEqual(f.distillReport!.unresolved, ["test coverage for retry path"]);
+  });
+
+  it("populates reworkBrief on distill findings recommending rework", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("distill-review-T2", {
+            kind: "distill",
+            status: "done",
+            reviews: ["review-T2a"],
+            artifacts: {
+              summary: "reviews disagree on approach",
+              ...({
+                findings: [
+                  {
+                    claim: "approach unclear",
+                    sources: ["review-T2a"],
+                    verdict: "defer",
+                    evidence: "review-T2a:plan.md",
+                  },
+                ],
+                recommended_action: "rework",
+                rework_brief: "redo the parser to handle edge case X",
+              } as object),
+            },
+          }),
+        ],
+      }),
+    );
+    assert.equal(out.length, 1);
+    assert.equal(out[0]!.distillReport!.recommendedAction, "rework");
+    assert.equal(out[0]!.distillReport!.reworkBrief, "redo the parser to handle edge case X");
+    assert.equal(out[0]!.distillReport!.appliedWinner, undefined);
   });
 
   it("filters by taskId when provided", () => {

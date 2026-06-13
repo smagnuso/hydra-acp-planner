@@ -445,7 +445,7 @@ export function formatStatusBody(
   const renderedReviews = new Set<string>();
 
   for (const task of board.tasks) {
-    if (task.kind === "review") {
+    if (task.kind === "review" || task.kind === "distill") {
       const line = renderReviewTask(task, renderedReviews, {
         indent: "    ",
         renderTaskTag: (t) => formatTaskTag(t, board),
@@ -509,12 +509,22 @@ export type FindingCategory =
   | "review_reject"
   | "review_amend"
   | "review_fix"
-  | "follow_ups";
+  | "follow_ups"
+  | "distill";
+
+export interface DistillReport {
+  summary: string;
+  findings: Array<{ claim: string; sources: string[]; verdict: string; evidence: string }>;
+  recommendedAction: string;
+  appliedWinner?: string;
+  reworkBrief?: string;
+  unresolved?: string[];
+}
 
 export interface Finding {
   taskId: string;
   title: string;
-  kind: "work" | "review";
+  kind: "work" | "review" | "distill";
   status: Task["status"];
   category: FindingCategory;
   summary: string | null;
@@ -523,6 +533,7 @@ export interface Finding {
   decision: string | null;
   attemptCount: number;
   verifiedDiff: TaskArtifacts["verified_diff"] | null;
+  distillReport?: DistillReport;
 }
 
 export interface CollectFindingsOptions {
@@ -554,11 +565,45 @@ export function collectFindings(
       typeof a.review_decision === "string" ? a.review_decision : null;
     const verifiedDiff =
       (a.verified_diff as TaskArtifacts["verified_diff"] | undefined) ?? null;
-    const kind: "work" | "review" = t.kind === "review" ? "review" : "work";
+    const kind: "work" | "review" | "distill" =
+      t.kind === "review" ? "review" : t.kind === "distill" ? "distill" : "work";
 
     let category: FindingCategory | null = null;
+    let distillReport: DistillReport | undefined;
     if (t.status === "failed") {
       category = "failed";
+    } else if (t.status === "done" && kind === "distill") {
+      category = "distill";
+      const dFindingsRaw = Array.isArray(a.findings) ? a.findings : [];
+      const dFindings: DistillReport["findings"] = [];
+      for (const fr of dFindingsRaw) {
+        if (!fr || typeof fr !== "object") continue;
+        const r = fr as Record<string, unknown>;
+        const claim = typeof r.claim === "string" ? r.claim : "";
+        const verdict = typeof r.verdict === "string" ? r.verdict : "";
+        const evidence = typeof r.evidence === "string" ? r.evidence : "";
+        const sources = Array.isArray(r.sources)
+          ? r.sources.filter((v): v is string => typeof v === "string")
+          : [];
+        dFindings.push({ claim, sources, verdict, evidence });
+      }
+      const recommendedAction =
+        typeof a.recommended_action === "string" ? a.recommended_action : "";
+      const appliedWinner =
+        typeof a.applied_winner === "string" ? a.applied_winner : undefined;
+      const reworkBrief =
+        typeof a.rework_brief === "string" ? a.rework_brief : undefined;
+      const unresolved = Array.isArray(a.unresolved)
+        ? a.unresolved.filter((v): v is string => typeof v === "string")
+        : undefined;
+      distillReport = {
+        summary: summary ?? "",
+        findings: dFindings,
+        recommendedAction,
+        ...(appliedWinner ? { appliedWinner } : {}),
+        ...(reworkBrief ? { reworkBrief } : {}),
+        ...(unresolved && unresolved.length > 0 ? { unresolved } : {}),
+      };
     } else if (t.status === "done" && kind === "review" && decision) {
       if (decision === "reject") category = "review_reject";
       else if (decision === "amend") category = "review_amend";
@@ -583,6 +628,7 @@ export function collectFindings(
       decision,
       attemptCount: t.attemptCount,
       verifiedDiff,
+      ...(distillReport ? { distillReport } : {}),
     });
   }
   return out;
@@ -601,9 +647,11 @@ export function formatCompletionFindings(board: Board): string {
     const tag =
       f.category === "failed"
         ? "[!]"
-        : f.kind === "review"
-          ? `[${f.decision ?? "review"}]`
-          : "[x]";
+        : f.kind === "distill"
+          ? "[distill]"
+          : f.kind === "review"
+            ? `[${f.decision ?? "review"}]`
+            : "[x]";
     const headSuffix =
       f.category === "failed"
         ? " — failed"
@@ -613,6 +661,29 @@ export function formatCompletionFindings(board: Board): string {
     const lines = [`   ${tag} ${f.taskId}  ${f.title}${headSuffix}`];
     if (f.category === "failed" && f.summary) {
       lines.push(`       ${truncate(f.summary)}`);
+    }
+    if (f.kind === "distill" && f.distillReport) {
+      const dr = f.distillReport;
+      if (dr.summary) {
+        lines.push(`       ${truncate(dr.summary)}`);
+      }
+      lines.push(`       recommended_action: ${dr.recommendedAction}`);
+      if (dr.appliedWinner) {
+        lines.push(`       applied_winner: ${dr.appliedWinner}`);
+      }
+      if (dr.reworkBrief) {
+        lines.push(`       rework_brief: ${truncate(dr.reworkBrief)}`);
+      }
+      for (const df of dr.findings) {
+        const srcs = df.sources.join(",");
+        const line = `       • [${df.verdict}] ${df.claim} (sources: ${srcs})`;
+        lines.push(truncate(line));
+      }
+      if (dr.unresolved && dr.unresolved.length > 0) {
+        for (const u of dr.unresolved) {
+          lines.push(`       ? ${u}`);
+        }
+      }
     }
     if (f.notes) {
       lines.push(`       ${truncate(f.notes).split("\n").join("\n       ")}`);

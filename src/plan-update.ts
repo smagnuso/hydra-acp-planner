@@ -212,7 +212,7 @@ export function buildAsciiPlanText(board: Board): string {
     if (w.currentTaskId) workerByTask.set(w.currentTaskId, wid);
   }
   for (const t of board.tasks) {
-    if (t.kind === "review") {
+    if (t.kind === "review" || t.kind === "distill") {
       const line = renderReviewTask(t, renderedReviews, { indent: "    ", renderTaskTag: tagFor });
       if (line) lines.push(line);
       continue;

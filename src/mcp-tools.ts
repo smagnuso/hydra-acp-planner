@@ -134,7 +134,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         fleetDefaults: {
           type: "object",
           description:
-            "Optional. Session-level defaults applied to tasks that don't carry per-task overrides. Set when the user expresses a session-wide preference ('use claude for everything', 'prefer haiku where possible').",
+            "Optional. Session-level defaults applied to tasks that don't carry per-task overrides. Set when the user expresses a session-wide preference ('use claude for everything', 'prefer haiku where possible'). The `work`, `review`, and `distill` sub-objects scope defaults to a kind; `distill` falls through to `review` for agent/model when unset.",
           properties: {
             agent: {
               type: "string",
@@ -144,6 +144,34 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
             model: {
               type: "string",
               description: "Default model id passed through to spawned workers.",
+            },
+            work: {
+              type: "object",
+              description:
+                "Optional. Defaults applied only to kind='work' tasks.",
+              properties: {
+                agent: { type: "string" },
+                model: { type: "string" },
+              },
+            },
+            review: {
+              type: "object",
+              description:
+                "Optional. Defaults applied only to kind='review' tasks. runOn pins the lane (orchestrator|worker); without it the bridge picks a lane from agent/model presence.",
+              properties: {
+                agent: { type: "string" },
+                model: { type: "string" },
+                runOn: { type: "string", enum: ["orchestrator", "worker"] },
+              },
+            },
+            distill: {
+              type: "object",
+              description:
+                "Optional. Defaults applied only to bridge-synthesized kind='distill' tasks. Falls through to fleetDefaults.review.{agent,model} per-field when unset.",
+              properties: {
+                agent: { type: "string" },
+                model: { type: "string" },
+              },
             },
           },
         },
@@ -207,7 +235,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
                 type: "string",
                 enum: ["work", "review"],
                 description:
-                  "Task kind. Defaults to 'work'. Use 'review' to author a hand-rolled review task (e.g. a competition referee); pair with `reviews` to point at the work tasks being reviewed.",
+                  "Task kind. Defaults to 'work'. Use 'review' to author a hand-rolled review task (e.g. a competition referee); pair with `reviews` to point at the work tasks being reviewed. The 'distill' kind exists but is bridge-synthesized only (spawned when a competition reviewer returns decision='synthesize'); the decomposer must never emit kind='distill' — plan acceptance will reject it.",
               },
               reviews: {
                 description:

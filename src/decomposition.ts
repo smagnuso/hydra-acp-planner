@@ -396,6 +396,31 @@ function validateKind(v: unknown): "work" | "review" | undefined {
   return undefined;
 }
 
+// Plan-acceptance guard: distill tasks are bridge-synthesized only —
+// they're spawned when a competition reviewer returns decision="synthesize".
+// The decomposer (or any MCP set_plan caller) must never emit kind="distill".
+// Throws a clear error naming the offending task ids so the caller can fix
+// their output.
+export function assertNoDecomposerDistill(raw: unknown): void {
+  if (!raw || typeof raw !== "object") return;
+  const tasks = (raw as { tasks?: unknown }).tasks;
+  if (!Array.isArray(tasks)) return;
+  const offenders: string[] = [];
+  for (const t of tasks) {
+    if (!t || typeof t !== "object") continue;
+    const rec = t as Record<string, unknown>;
+    if (rec.kind === "distill") {
+      const id = typeof rec.id === "string" ? rec.id : "<no id>";
+      offenders.push(id);
+    }
+  }
+  if (offenders.length > 0) {
+    throw new Error(
+      `decomposer emitted kind="distill" for task(s) ${offenders.join(", ")}; distill tasks are bridge-synthesized from competition reviewer synthesize decisions and must not appear in decomposer output`,
+    );
+  }
+}
+
 // Coerce a `reviews` field from raw input. Accepts string or array of
 // strings (matching the Task.reviews shape). Returns undefined when
 // missing or malformed.

@@ -205,6 +205,299 @@ describe("competition integration — winner + supersede + unblock", () => {
     assert.ok(eligible.has("T5"), "dependent on superseded loser should be eligible");
   });
 
+  it("synthesize decision spawns a distill task, rewires dependents, leaves reviewees untouched", async () => {
+    const t1 = workTask("T1");
+    const t2 = workTask("T2");
+    const t3 = workTask("T3");
+    const rev = reviewTask("R1", ["T1", "T2", "T3"]);
+    const dep = workTask("T4", {
+      deps: ["R1"],
+      status: "pending",
+      artifacts: undefined,
+    });
+    const other = workTask("T5", {
+      deps: ["T9"],
+      status: "pending",
+      artifacts: undefined,
+    });
+    const board = makeBoard([t1, t2, t3, rev, dep, other]);
+    primeWorkerForReview(
+      "R1",
+      '```hydra-result\n{"decision":"synthesize","notes":"no clear winner — overlapping merits"}\n```',
+    );
+
+    await complete(board, rev);
+    await settle();
+
+    const w1 = board.tasks.find((t) => t.id === "T1")!;
+    const w2 = board.tasks.find((t) => t.id === "T2")!;
+    const w3 = board.tasks.find((t) => t.id === "T3")!;
+    const rt = board.tasks.find((t) => t.id === "R1")!;
+    const distill = board.tasks.find((t) => t.id === "R1d");
+
+    assert.equal(w1.status, "awaiting_review", "reviewee T1 untouched");
+    assert.equal(w2.status, "awaiting_review", "reviewee T2 untouched");
+    assert.equal(w3.status, "awaiting_review", "reviewee T3 untouched");
+    assert.equal(rt.status, "done", "review marked done");
+
+    assert.ok(distill, "distill task R1d created");
+    assert.equal(distill!.kind, "distill");
+    assert.equal(distill!.distillOf, "R1");
+    assert.deepEqual(distill!.deps, ["T1", "T2", "T3"]);
+    assert.deepEqual(distill!.reviews, ["T1", "T2", "T3"]);
+    assert.equal(distill!.status, "pending");
+    assert.equal(distill!.attemptCount, 0);
+    assert.equal(distill!.assignedTo, null);
+
+    const depAfter = board.tasks.find((t) => t.id === "T4")!;
+    assert.deepEqual(
+      depAfter.deps,
+      ["R1", "R1d"],
+      "dependent on R1 should also depend on R1d (review id preserved)",
+    );
+
+    const otherAfter = board.tasks.find((t) => t.id === "T5")!;
+    assert.deepEqual(
+      otherAfter.deps,
+      ["T9"],
+      "unrelated task deps untouched",
+    );
+  });
+
+  it("distill apply-Tx produces the same reviewee board state as a real winner verdict", async () => {
+    // Drive the real winner path on board A, then drive the distill
+    // apply-Tx path on board B, and assert reviewee statuses match.
+    const winnerReviewees = ["T1", "T2", "T3"].map((id) =>
+      workTask(id, { artifacts: { summary: `${id} approach` } }),
+    );
+    const winnerReview = reviewTask("R1", ["T1", "T2", "T3"]);
+    const boardA = makeBoard([...winnerReviewees, winnerReview]);
+    primeWorkerForReview(
+      "R1",
+      '```hydra-result\n{"decision":"winner","winner":"T2","notes":"v2 best"}\n```',
+    );
+    await complete(boardA, winnerReview);
+    await settle();
+    const winnerSnap = ["T1", "T2", "T3"].map((id) => {
+      const t = boardA.tasks.find((x) => x.id === id)!;
+      return { id, status: t.status };
+    });
+
+    // Distill apply-Tx: simulate a synthesized distill task that has
+    // already been spawned by T2's handleReviewSynthesize.
+    boards.clear();
+    const distillReviewees = ["T1", "T2", "T3"].map((id) =>
+      workTask(id, { artifacts: { summary: `${id} approach` } }),
+    );
+    const originatingReview: Task = {
+      id: "R1",
+      title: "review R1",
+      deps: ["T1", "T2", "T3"],
+      status: "done",
+      assignedTo: null,
+      attemptCount: 1,
+      kind: "review",
+      reviews: ["T1", "T2", "T3"],
+      artifacts: { summary: "synthesize", review_decision: "synthesize", notes: "no clear winner" },
+    } as Task;
+    const distill: Task = {
+      id: "R1d",
+      title: "distill R1",
+      deps: ["T1", "T2", "T3"],
+      status: "assigned",
+      assignedTo: WORKER,
+      attemptCount: 1,
+      kind: "distill",
+      reviews: ["T1", "T2", "T3"],
+      distillOf: "R1",
+    } as Task;
+    const boardB = makeBoard([...distillReviewees, originatingReview, distill]);
+    primeWorkerForReview(
+      "R1d",
+      '```hydra-result\n{"summary":"T2 is the strongest baseline",' +
+      '"findings":[{"claim":"T2 covers the edge case","sources":["T2"],"verdict":"keep","evidence":"T2:src/foo.ts hunk 1"}],' +
+      '"recommended_action":"apply T2"}\n```',
+    );
+    await complete(boardB, distill);
+    await settle();
+
+    const distillSnap = ["T1", "T2", "T3"].map((id) => {
+      const t = boardB.tasks.find((x) => x.id === id)!;
+      return { id, status: t.status };
+    });
+    assert.deepEqual(
+      distillSnap,
+      winnerSnap,
+      "distill apply-Tx must produce the same reviewee statuses as the real winner verdict",
+    );
+    // Distill itself should be done; report surfaced on originating review.
+    const distillAfter = boardB.tasks.find((t) => t.id === "R1d")!;
+    const reviewAfter = boardB.tasks.find((t) => t.id === "R1")!;
+    assert.equal(distillAfter.status, "done");
+    const reviewArtifacts = reviewAfter.artifacts as Record<string, unknown>;
+    assert.ok(reviewArtifacts.distill, "distill report surfaced on originating review");
+    assert.equal(
+      (reviewArtifacts.distill as Record<string, unknown>).applied_winner,
+      "T2",
+    );
+  });
+
+  it("distill rework supersedes all reviewees, spawns follow-up work, rewires dependents", async () => {
+    const t1 = workTask("T1", { artifacts: { summary: "v1" } });
+    const t2 = workTask("T2", { artifacts: { summary: "v2" } });
+    const originatingReview: Task = {
+      id: "R1",
+      title: "review R1",
+      deps: ["T1", "T2"],
+      status: "done",
+      assignedTo: null,
+      attemptCount: 1,
+      kind: "review",
+      reviews: ["T1", "T2"],
+      artifacts: { summary: "synthesize", review_decision: "synthesize", notes: "split" },
+    } as Task;
+    const distill: Task = {
+      id: "R1d",
+      title: "distill R1",
+      deps: ["T1", "T2"],
+      status: "assigned",
+      assignedTo: WORKER,
+      attemptCount: 1,
+      kind: "distill",
+      reviews: ["T1", "T2"],
+      distillOf: "R1",
+    } as Task;
+    // Dependents: T4 depended on R1 (T2 appended R1d via handleReviewSynthesize),
+    // T5 unrelated.
+    const t4 = workTask("T4", {
+      deps: ["R1", "R1d"],
+      status: "pending",
+      artifacts: undefined,
+    });
+    const t5 = workTask("T5", {
+      deps: ["T9"],
+      status: "pending",
+      artifacts: undefined,
+    });
+    const board = makeBoard([t1, t2, originatingReview, distill, t4, t5]);
+    primeWorkerForReview(
+      "R1d",
+      '```hydra-result\n{"summary":"both candidates miss the spec",' +
+      '"findings":[{"claim":"neither handles streaming","sources":["T1","T2"],"verdict":"drop","evidence":"T1:src/x.ts hunk 2; T2:src/x.ts hunk 1"}],' +
+      '"recommended_action":"rework","rework_brief":"redo with streaming support"}\n```',
+    );
+
+    await complete(board, distill);
+    await settle();
+
+    const t1After = board.tasks.find((t) => t.id === "T1")!;
+    const t2After = board.tasks.find((t) => t.id === "T2")!;
+    const distillAfter = board.tasks.find((t) => t.id === "R1d")!;
+    assert.equal(t1After.status, "superseded");
+    assert.equal(t2After.status, "superseded");
+    assert.equal(distillAfter.status, "done");
+
+    const newWork = board.tasks.find((t) => t.id === "R1dw");
+    assert.ok(newWork, "follow-up work task R1dw spawned");
+    assert.equal(newWork!.kind, "work");
+    assert.equal(newWork!.what, "redo with streaming support");
+    assert.equal(newWork!.status, "pending");
+
+    const t4After = board.tasks.find((t) => t.id === "T4")!;
+    assert.deepEqual(
+      t4After.deps,
+      ["R1", "R1dw"],
+      "dependent's R1d dep replaced by the new work task id; review id preserved",
+    );
+    const t5After = board.tasks.find((t) => t.id === "T5")!;
+    assert.deepEqual(t5After.deps, ["T9"], "unrelated deps untouched");
+
+    // Report surfaced on the originating review.
+    const reviewAfter = board.tasks.find((t) => t.id === "R1")!;
+    const reviewArtifacts = reviewAfter.artifacts as Record<string, unknown>;
+    assert.ok(reviewArtifacts.distill);
+    assert.equal(
+      (reviewArtifacts.distill as Record<string, unknown>).recommended_action,
+      "rework",
+    );
+  });
+
+  it("distill new-work behaves like rework (supersede + spawn + rewire)", async () => {
+    const t1 = workTask("T1");
+    const t2 = workTask("T2");
+    const originatingReview: Task = {
+      id: "R1",
+      title: "review R1",
+      deps: ["T1", "T2"],
+      status: "done",
+      assignedTo: null,
+      attemptCount: 1,
+      kind: "review",
+      reviews: ["T1", "T2"],
+    } as Task;
+    const distill: Task = {
+      id: "R1d",
+      title: "distill R1",
+      deps: ["T1", "T2"],
+      status: "assigned",
+      assignedTo: WORKER,
+      attemptCount: 1,
+      kind: "distill",
+      reviews: ["T1", "T2"],
+      distillOf: "R1",
+    } as Task;
+    const board = makeBoard([t1, t2, originatingReview, distill]);
+    primeWorkerForReview(
+      "R1d",
+      '```hydra-result\n{"summary":"both wrong direction",' +
+      '"findings":[{"claim":"both miss the contract","sources":["T1","T2"],"verdict":"drop","evidence":"T1:hunk 1; T2:hunk 1"}],' +
+      '"recommended_action":"new-work","rework_brief":"start over with the new spec"}\n```',
+    );
+    await complete(board, distill);
+    await settle();
+
+    assert.equal(board.tasks.find((t) => t.id === "T1")!.status, "superseded");
+    assert.equal(board.tasks.find((t) => t.id === "T2")!.status, "superseded");
+    assert.equal(board.tasks.find((t) => t.id === "R1d")!.status, "done");
+    const spawned = board.tasks.find((t) => t.id === "R1dw");
+    assert.ok(spawned);
+    assert.equal(spawned!.what, "start over with the new spec");
+  });
+
+  it("distill max-attempts fails all reviewees with canonical feedback and marks distill failed", async () => {
+    const t1 = workTask("T1");
+    const t2 = workTask("T2");
+    const distill: Task = {
+      id: "R1d",
+      title: "distill R1",
+      deps: ["T1", "T2"],
+      status: "assigned",
+      assignedTo: WORKER,
+      attemptCount: 1,
+      kind: "distill",
+      reviews: ["T1", "T2"],
+      distillOf: "R1",
+    } as Task;
+    const board = makeBoard([t1, t2, distill]);
+
+    // Invoke the private failure handler directly — this is the entry
+    // point the dispatcher uses when a distill task exhausts its
+    // reprompt budget on malformed/unciteable output.
+    await (bridge as unknown as {
+      handleDistillFailure: (t: Task, b: Board, sid: string) => void;
+    }).handleDistillFailure(distill, board, ORCH);
+
+    const t1After = board.tasks.find((t) => t.id === "T1")!;
+    const t2After = board.tasks.find((t) => t.id === "T2")!;
+    const distillAfter = board.tasks.find((t) => t.id === "R1d")!;
+    const expected = "distill R1d: max attempts exceeded";
+    assert.equal(t1After.status, "failed");
+    assert.equal(t2After.status, "failed");
+    assert.deepEqual(t1After.reviewFeedback, [expected]);
+    assert.deepEqual(t2After.reviewFeedback, [expected]);
+    assert.equal(distillAfter.status, "failed");
+  });
+
   it("non-winner decision on a competition fails all reviewees; dependent stays blocked", async () => {
     const t1 = workTask("T1");
     const t2 = workTask("T2");

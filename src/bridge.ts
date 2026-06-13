@@ -83,6 +83,7 @@ import {
   loadBoard,
   newBoard,
   nowIso,
+  parseFleetDefaultsFromObject,
   pickEligible,
   resolveAgent,
   resolveModel,
@@ -116,6 +117,7 @@ import {
   extractAddTaskBlock,
   extractJsonBlock,
   formatPlanSummary,
+  assertNoDecomposerDistill,
   normalizeAddedTasks,
   normalizeDecomposition,
   sweepLineConcurrencyCap,
@@ -1305,11 +1307,31 @@ export class PlannerBridge {
     // Parse the accumulated reply.
     const existingIds = new Set(board.tasks.map((t) => t.id));
     const rawBlock = extractAddTaskBlock(state.addAccumulator);
-    const result = rawBlock === undefined
-      ? undefined
-      : normalizeAddedTasks(rawBlock, existingIds);
+    let distillReject: string | undefined;
+    let result: ReturnType<typeof normalizeAddedTasks> | undefined;
+    if (rawBlock !== undefined) {
+      try {
+        // Guard parity with set_plan / finishDecomposition: distill tasks
+        // are bridge-synthesized only and must never be smuggled in via
+        // mid-flight add_task.
+        assertNoDecomposerDistill(rawBlock);
+        result = normalizeAddedTasks(rawBlock, existingIds);
+      } catch (err) {
+        distillReject = (err as Error).message;
+      }
+    }
     state.awaitingAdd = false;
     state.addAccumulator = "";
+
+    if (distillReject) {
+      log.warn(`add: rejected for ${board.projectId}: ${distillReject}`);
+      await this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `Add-task rejected for ${shortProjectId(board.projectId)}: ${distillReject}`,
+      );
+      this.client.reply(reqId, { text: "" });
+      return;
+    }
 
     if (!result) {
       log.warn(`add: parse failed for ${board.projectId}`);
@@ -2296,11 +2318,13 @@ export class PlannerBridge {
     let reviewAgent: string | undefined;
     let reviewModel: string | undefined;
     let reviewRunOn: "orchestrator" | "worker" | undefined;
+    let distillAgent: string | undefined;
+    let distillModel: string | undefined;
     let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
     let overrideHint: boolean | undefined;
     let compete = false;
     const attachPaths: string[] = [];
-    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete|attach)\s+(\S+)\s*/;
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|distill-agent|distill-model|compete|attach)\s+(\S+)\s*/;
     while (true) {
       const m = descRemaining.match(flagRe);
       if (!m) break;
@@ -2329,6 +2353,10 @@ export class PlannerBridge {
         if (value === "worker" || value === "orchestrator") {
           reviewRunOn = value as "orchestrator" | "worker";
         }
+      } else if (key === "distill-agent") {
+        distillAgent = value;
+      } else if (key === "distill-model") {
+        distillModel = value;
       } else if (key === "override-hint") {
         overrideHint = value === "true";
       } else if (key === "compete") {
@@ -2345,7 +2373,7 @@ export class PlannerBridge {
     }
     if (!descRemaining) {
       this.client.reply(reqId, {
-        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--attach <path>]... <description>`",
+        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--distill-agent ID] [--distill-model ID] [--attach <path>]... <description>`",
       });
       return;
     }
@@ -2385,6 +2413,11 @@ export class PlannerBridge {
       if (reviewAgent !== undefined) boardFleetDefaults.review.agent = reviewAgent;
       if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
       if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
+    }
+    if (distillAgent !== undefined || distillModel !== undefined) {
+      boardFleetDefaults.distill = {};
+      if (distillAgent !== undefined) boardFleetDefaults.distill.agent = distillAgent;
+      if (distillModel !== undefined) boardFleetDefaults.distill.model = distillModel;
     }
 
     const board = newBoard({
@@ -2675,11 +2708,13 @@ export class PlannerBridge {
     let reviewAgent: string | undefined;
     let reviewModel: string | undefined;
     let reviewRunOn: "orchestrator" | "worker" | undefined;
+    let distillAgent: string | undefined;
+    let distillModel: string | undefined;
     let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
     let overrideHint: boolean | undefined;
     let compete = false;
     const attachPaths: string[] = [];
-    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|compete|attach)\s+(\S+)\s*/;
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|distill-agent|distill-model|compete|attach)\s+(\S+)\s*/;
     while (true) {
       const m = argsRemaining.match(flagRe);
       if (!m) break;
@@ -2708,6 +2743,10 @@ export class PlannerBridge {
         if (value === "worker" || value === "orchestrator") {
           reviewRunOn = value as "orchestrator" | "worker";
         }
+      } else if (key === "distill-agent") {
+        distillAgent = value;
+      } else if (key === "distill-model") {
+        distillModel = value;
       } else if (key === "override-hint") {
         overrideHint = value === "true";
       } else if (key === "compete") {
@@ -2724,7 +2763,7 @@ export class PlannerBridge {
     }
     if (argsRemaining.trim().length > 0) {
       this.client.reply(reqId, {
-        text: `planner start: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner start [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--attach <path>]...\` (no description — uses the conversation).`,
+        text: `planner start: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner start [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--distill-agent ID] [--distill-model ID] [--attach <path>]...\` (no description — uses the conversation).`,
       });
       return;
     }
@@ -2764,6 +2803,11 @@ export class PlannerBridge {
       if (reviewAgent !== undefined) boardFleetDefaults.review.agent = reviewAgent;
       if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
       if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
+    }
+    if (distillAgent !== undefined || distillModel !== undefined) {
+      boardFleetDefaults.distill = {};
+      if (distillAgent !== undefined) boardFleetDefaults.distill.agent = distillAgent;
+      if (distillModel !== undefined) boardFleetDefaults.distill.model = distillModel;
     }
 
     const board = newBoard({
@@ -3561,10 +3605,30 @@ export class PlannerBridge {
     }
 
     const raw = extractJsonBlock(state.decompositionAccumulator);
-    const result = raw === undefined ? undefined : normalizeDecomposition(raw);
+    let result: ReturnType<typeof normalizeDecomposition> | undefined;
+    let distillReject: string | undefined;
+    if (raw !== undefined) {
+      try {
+        assertNoDecomposerDistill(raw);
+        result = normalizeDecomposition(raw);
+      } catch (err) {
+        distillReject = (err as Error).message;
+      }
+    }
 
     state.awaitingDecomposition = false;
     state.decompositionAccumulator = "";
+
+    if (distillReject) {
+      log.warn(`decomposition rejected for ${board.projectId}: ${distillReject}`);
+      setBoardState(board, "failed");
+      saveBoard(board, sessionId);
+      void this.emitSyntheticMessage(
+        sessionId,
+        `Decomposition rejected for ${shortProjectId(board.projectId)}: ${distillReject}`,
+      );
+      return;
+    }
 
     if (!result) {
       log.warn(`decomposition parse failed for ${board.projectId}; accumulator length=${state.decompositionAccumulator.length}`);
@@ -4240,7 +4304,10 @@ export class PlannerBridge {
     }
     const p = promptsFor(task.kind ?? 'work');
     const raw = p.extractResult(workerState.resultAccumulator);
-    const result = raw === undefined ? undefined : p.normalizeResult(raw);
+    const reviewsList = task.kind === 'distill' && Array.isArray(task.reviews)
+      ? task.reviews
+      : undefined;
+    const result = raw === undefined ? undefined : p.normalizeResult(raw, reviewsList);
 
     if (!result) {
       // Reprompt up to twice before giving up. Common failure: agent
@@ -4293,6 +4360,15 @@ export class PlannerBridge {
       // task accordingly.
       this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
       this.handleReviewComplete(task, board, orchestratorSessionId, result);
+      void this.scheduleEligibleTasks(orchestratorSessionId, board);
+      return;
+    }
+
+    if (taskKind === 'distill') {
+      // Distill tasks: parser already validated source citations
+      // and recommended_action. Drive the per-action dispatch and
+      // surface the report on the originating review.
+      this.handleDistillComplete(task, board, orchestratorSessionId, result);
       void this.scheduleEligibleTasks(orchestratorSessionId, board);
       return;
     }
@@ -4501,12 +4577,12 @@ export class PlannerBridge {
     const notes = (normalized.artifacts as Record<string, unknown>).notes as string ?? "";
     const isCompetition = Array.isArray(reviews) && reviews.length > 1;
 
-    // Competition reviews only accept "winner" or "synthesize" (which we
-    // treat as winner with no valid winnerId — fails all reviewees). Other
-    // decisions on a competition are reviewer error.
+    // Competition reviews only accept "winner" or "synthesize". Other
+    // decisions on a competition are reviewer error — routed to the
+    // winner handler with no valid winnerId, which fails all reviewees.
     if (isCompetition && decision !== "winner" && decision !== "synthesize") {
       log.warn(
-        `review ${reviewTask.id}: competition received non-winner decision '${decision}', treating as winner with no valid winnerId`,
+        `review ${reviewTask.id}: competition received invalid decision '${decision}', treating as winner with no valid winnerId`,
       );
       this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
       return;
@@ -4526,8 +4602,10 @@ export class PlannerBridge {
         this.handleReviewFix(reviewTask, normalized, notes, board, orchestratorSessionId);
         break;
       case "winner":
-      case "synthesize":
         this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
+        break;
+      case "synthesize":
+        this.handleReviewSynthesize(reviewTask, normalized, notes, board, orchestratorSessionId);
         break;
       default:
         log.warn(
@@ -4784,6 +4862,324 @@ export class PlannerBridge {
     });
   }
 
+  // Synthesize: competition reviewer found no clear winner. Spawn a
+  // distill task that consumes the candidates and the reviewer's notes,
+  // and rewire any tasks that depended on the review so they also wait
+  // for the distill. Reviewees are left in their current status
+  // (typically awaiting_review) — handleDistillComplete decides their
+  // final disposition.
+  private handleReviewSynthesize(
+    reviewTask: Task,
+    _normalized: NormalizedResult,
+    _notes: string,
+    board: Board,
+    orchestratorSessionId: string,
+  ): void {
+    const reviews = reviewTask.reviews;
+    if (!reviews || typeof reviews === "string" || reviews.length < 2) {
+      log.warn(
+        `review ${reviewTask.id}: synthesize decision on non-competition review, treating as reject`,
+      );
+      this.handleReviewReject(
+        reviewTask,
+        board,
+        orchestratorSessionId,
+        "synthesize decision is only valid on competition reviews",
+      );
+      return;
+    }
+
+    const reviewIds = [...reviews];
+    const distillId = `${reviewTask.id}d`;
+
+    if (board.tasks.some((t) => t.id === distillId)) {
+      log.warn(
+        `review ${reviewTask.id}: distill task ${distillId} already exists; skipping synthesis`,
+      );
+      return;
+    }
+
+    const distill: Task = {
+      id: distillId,
+      title: `distill ${reviewTask.id}`,
+      deps: [...reviewIds],
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      kind: "distill",
+      reviews: [...reviewIds],
+      distillOf: reviewTask.id,
+    };
+    board.tasks.push(distill);
+
+    // Rewire: any task that had reviewTask.id in deps now also depends
+    // on the distill task. Preserve the review id so history reads
+    // naturally; the distill is an additional gate.
+    for (const t of board.tasks) {
+      if (t.id === distillId) continue;
+      if (!t.deps.includes(reviewTask.id)) continue;
+      if (t.deps.includes(distillId)) continue;
+      t.deps.push(distillId);
+    }
+
+    reviewTask.status = "done";
+    reviewTask.finishedAt = nowIso();
+    reviewTask.assignedTo = null;
+
+    saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+
+    log.info(
+      `review ${reviewTask.id}: synthesize — spawned distill ${distillId} over [${reviewIds.join(", ")}]`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${reviewTask.id} synthesize — spawned ${distillId} to merge [${reviewIds.join(", ")}]`,
+      { event: "task-review-synthesize", taskId: reviewTask.id, distillTaskId: distillId },
+    );
+  }
+
+  // Distill complete: route on recommended_action. Surface the
+  // structured report onto the originating review's artifacts.distill
+  // in all branches. Apply-Tx mirrors handleReviewWinner. Rework/new-work
+  // supersedes all reviewees, spawns a follow-up work task, and rewires
+  // dependents to point at the new work task instead of the distill.
+  private handleDistillComplete(
+    distillTask: Task,
+    board: Board,
+    orchestratorSessionId: string,
+    normalized: NormalizedResult | undefined,
+  ): void {
+    const reviews = distillTask.reviews;
+    if (!reviews || typeof reviews === "string" || reviews.length < 1) {
+      log.warn(
+        `distill ${distillTask.id}: malformed reviews field, cannot dispatch completion`,
+      );
+      return;
+    }
+    const reviewIds = [...reviews];
+
+    if (!normalized) {
+      log.warn(
+        `distill ${distillTask.id}: missing or malformed result, failing reviewees`,
+      );
+      this.handleDistillFailure(distillTask, board, orchestratorSessionId);
+      return;
+    }
+
+    // Surface the structured report on the distill task itself so
+    // collectFindings / get_findings can read it. markTaskDone is
+    // bypassed for distill (see processCompleteResult), so we assign
+    // here. Both branches below leave this in place.
+    distillTask.artifacts = normalized.artifacts as TaskArtifacts;
+
+    // Always surface the structured report onto the originating
+    // review task via distillOf lookup. Consumers that only know the
+    // review id still find the merged output.
+    const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+    if (distillTask.distillOf) {
+      const originatingReview = byId.get(distillTask.distillOf);
+      if (originatingReview) {
+        const merged: TaskArtifacts = { ...(originatingReview.artifacts ?? {}) };
+        (merged as Record<string, unknown>).distill = normalized.artifacts;
+        originatingReview.artifacts = merged;
+      }
+    }
+
+    const artifacts = normalized.artifacts as Record<string, unknown>;
+    const appliedWinner = typeof artifacts.applied_winner === "string"
+      ? artifacts.applied_winner
+      : undefined;
+    const recommended = typeof artifacts.recommended_action === "string"
+      ? artifacts.recommended_action
+      : undefined;
+    const reworkBrief = typeof artifacts.rework_brief === "string"
+      ? artifacts.rework_brief
+      : undefined;
+    const summaryNote = typeof artifacts.summary === "string"
+      ? artifacts.summary
+      : "";
+
+    // Branch (a): apply Tx — treat as winner. Mirror handleReviewWinner.
+    if (appliedWinner && reviewIds.includes(appliedWinner)) {
+      const winnerTask = byId.get(appliedWinner);
+      if (!winnerTask) {
+        log.warn(
+          `distill ${distillTask.id}: applied_winner ${appliedWinner} not in board, failing`,
+        );
+        this.handleDistillFailure(distillTask, board, orchestratorSessionId);
+        return;
+      }
+
+      this.finishReview({
+        reviewedTask: winnerTask,
+        reviewTask: distillTask,
+        board,
+        orchestratorSessionId,
+        mergeArtifacts: (a) => {
+          if (summaryNote) {
+            if (!a.decisions) a.decisions = [];
+            a.decisions.push(`[distill winner] ${summaryNote}`);
+          }
+        },
+        logMessage: `distill ${distillTask.id}: applied ${appliedWinner} as winner`,
+        eventMessage: `${distillTask.id} distilled: ${appliedWinner} declared winner; other reviewees superseded`,
+        eventTag: "task-distill-winner",
+      });
+
+      for (const id of reviewIds) {
+        if (id === appliedWinner) continue;
+        const other = byId.get(id);
+        if (!other) continue;
+        if (other.status === "done" || other.status === "superseded") continue;
+        other.status = "superseded";
+        other.finishedAt = nowIso();
+        other.assignedTo = null;
+        log.info(
+          `distill ${distillTask.id}: superseded ${id} in favor of ${appliedWinner}`,
+        );
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${id} superseded by ${appliedWinner}`,
+          { event: "task-superseded", taskId: id },
+        );
+      }
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      return;
+    }
+
+    // Branch (b): rework / new-work — supersede all reviewees and
+    // spawn a follow-up work task. Dependents that pointed at the
+    // distill now point at the new work task instead.
+    if (recommended === "rework" || recommended === "new-work") {
+      if (!reworkBrief) {
+        log.warn(
+          `distill ${distillTask.id}: ${recommended} missing rework_brief, failing`,
+        );
+        this.handleDistillFailure(distillTask, board, orchestratorSessionId);
+        return;
+      }
+
+      for (const id of reviewIds) {
+        const other = byId.get(id);
+        if (!other) continue;
+        if (other.status === "done" || other.status === "superseded") continue;
+        other.status = "superseded";
+        other.finishedAt = nowIso();
+        other.assignedTo = null;
+        log.info(
+          `distill ${distillTask.id}: superseded ${id} for ${recommended}`,
+        );
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${id} superseded by ${distillTask.id} ${recommended}`,
+          { event: "task-superseded", taskId: id },
+        );
+      }
+
+      const newWorkId = `${distillTask.id}w`;
+      const alreadyExists = board.tasks.some((t) => t.id === newWorkId);
+      if (!alreadyExists) {
+        const newWork: Task = {
+          id: newWorkId,
+          title: `${recommended} from ${distillTask.id}`,
+          what: reworkBrief,
+          deps: [],
+          status: "pending",
+          assignedTo: null,
+          attemptCount: 0,
+          kind: "work",
+        };
+        board.tasks.push(newWork);
+      }
+
+      // Rewire: any task whose deps contains the distill id should
+      // depend on the new work task instead.
+      for (const t of board.tasks) {
+        if (t.id === newWorkId) continue;
+        const idx = t.deps.indexOf(distillTask.id);
+        if (idx < 0) continue;
+        t.deps.splice(idx, 1, newWorkId);
+        // Dedupe in case the new work id was already present.
+        const seen = new Set<string>();
+        t.deps = t.deps.filter((d) => {
+          if (seen.has(d)) return false;
+          seen.add(d);
+          return true;
+        });
+      }
+
+      distillTask.status = "done";
+      distillTask.finishedAt = nowIso();
+      distillTask.assignedTo = null;
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
+
+      log.info(
+        `distill ${distillTask.id}: ${recommended} — spawned ${newWorkId} from rework_brief`,
+      );
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `${distillTask.id} ${recommended}: spawned ${newWorkId}; reviewees [${reviewIds.join(", ")}] superseded`,
+        { event: "task-distill-rework", taskId: distillTask.id },
+      );
+      return;
+    }
+
+    log.warn(
+      `distill ${distillTask.id}: unrecognized recommended_action '${recommended}', failing reviewees`,
+    );
+    this.handleDistillFailure(distillTask, board, orchestratorSessionId);
+  }
+
+  // Distill failure: fail all reviewees with the canonical
+  // "distill <id>: max attempts exceeded" feedback and mark the
+  // distill task itself failed. Mirrors the no-valid-winner safety
+  // net in handleReviewWinner.
+  private handleDistillFailure(
+    distillTask: Task,
+    board: Board,
+    orchestratorSessionId: string,
+  ): void {
+    const reviews = distillTask.reviews;
+    if (!reviews || typeof reviews === "string") {
+      distillTask.status = "failed";
+      distillTask.finishedAt = nowIso();
+      distillTask.assignedTo = null;
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      return;
+    }
+    const feedback = `distill ${distillTask.id}: max attempts exceeded`;
+    const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+    for (const id of reviews) {
+      const other = byId.get(id);
+      if (!other) continue;
+      if (other.status === "done" || other.status === "superseded") continue;
+      other.status = "failed";
+      other.finishedAt = nowIso();
+      other.reviewFeedback = other.reviewFeedback ?? [];
+      if (!other.reviewFeedback.includes(feedback)) {
+        other.reviewFeedback.push(feedback);
+      }
+      other.assignedTo = null;
+      log.warn(
+        `distill ${distillTask.id}: failed reviewee ${id} — ${feedback}`,
+      );
+    }
+    distillTask.status = "failed";
+    distillTask.finishedAt = nowIso();
+    distillTask.assignedTo = null;
+    saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${distillTask.id} failed — all reviewees (${reviews.join(", ")}) failed with feedback "${feedback}"`,
+      { event: "task-distill-failed", taskId: distillTask.id },
+    );
+  }
+
   // Winner: competition mode — pick the winning task and supersede the rest.
   private handleReviewWinner(
     reviewTask: Task,
@@ -4985,6 +5381,13 @@ export class PlannerBridge {
     }
     saveBoard(board, orchestratorSessionId);
     this.emitPlanUpdate(orchestratorSessionId, board);
+
+    // Distill failure cascades to all reviewees with the canonical
+    // "max attempts exceeded" feedback (mirrors the no-valid-winner
+    // safety net on competition reviews).
+    if (task.kind === "distill") {
+      this.handleDistillFailure(task, board, orchestratorSessionId);
+    }
     // Prefix the user-facing failure line with task id + short worker
     // session id so a glance at the transcript tells you which task on
     // which worker died, without having to cross-reference the plan
@@ -5417,6 +5820,8 @@ export class PlannerBridge {
       taskId?: string;
       reviewedTaskId?: string;
       workerSessionId?: string;
+      distillTaskId?: string;
+      newTaskId?: string;
     },
   ): Promise<void> {
     const meta = plannerEvent
@@ -5642,10 +6047,13 @@ export class PlannerBridge {
     // Reuse the fenced-JSON normalizer — same task shape, same
     // validation. The agent's tool input is already structured but
     // may still be missing fields or carry invalid deps.
-    const normalized = normalizeDecomposition({
-      description,
-      tasks: tasksRaw,
-    });
+    const rawPlan = { description, tasks: tasksRaw };
+    try {
+      assertNoDecomposerDistill(rawPlan);
+    } catch (err) {
+      return this.replyMcpTextError(reqId, `set_plan: ${(err as Error).message}`);
+    }
+    const normalized = normalizeDecomposition(rawPlan);
     if (!normalized || normalized.tasks.length === 0) {
       return this.replyMcpTextError(
         reqId,
@@ -5684,34 +6092,10 @@ export class PlannerBridge {
     }
 
     // Parse fleet defaults + concurrencyCap + reviewPolicy from the tool args.
-    const fleetDefaultsRaw = args.fleetDefaults;
-    let fleetAgent: string | null = null;
-    let fleetModel: string | null = null;
-    let workAgent: string | undefined;
-    let workModel: string | undefined;
-    let reviewAgent: string | undefined;
-    let reviewModel: string | undefined;
-    let reviewRunOn: "orchestrator" | "worker" | undefined;
-    if (fleetDefaultsRaw && typeof fleetDefaultsRaw === "object" && !Array.isArray(fleetDefaultsRaw)) {
-      const fd = fleetDefaultsRaw as Record<string, unknown>;
-      if (typeof fd.agent === "string") fleetAgent = fd.agent;
-      if (typeof fd.model === "string") fleetModel = fd.model;
-      const workRaw = fd.work;
-      if (workRaw && typeof workRaw === "object" && !Array.isArray(workRaw)) {
-        const w = workRaw as Record<string, unknown>;
-        if (typeof w.agent === "string") workAgent = w.agent;
-        if (typeof w.model === "string") workModel = w.model;
-      }
-      const reviewRaw = fd.review;
-      if (reviewRaw && typeof reviewRaw === "object" && !Array.isArray(reviewRaw)) {
-        const r = reviewRaw as Record<string, unknown>;
-        if (typeof r.agent === "string") reviewAgent = r.agent;
-        if (typeof r.model === "string") reviewModel = r.model;
-        if (typeof r.runOn === "string" && (r.runOn === "orchestrator" || r.runOn === "worker")) {
-          reviewRunOn = r.runOn as "orchestrator" | "worker";
-        }
-      }
-    }
+    // Delegated to parseFleetDefaultsFromObject so the work/review/distill
+    // sub-bucket shape stays in one place (board.ts) and is unit-testable
+    // without the bridge.
+    const boardFleetDefaults = parseFleetDefaultsFromObject(args.fleetDefaults);
     const concurrencyCapRaw = args.concurrencyCap;
     const concurrencyCap =
       typeof concurrencyCapRaw === "number" && Number.isFinite(concurrencyCapRaw) && concurrencyCapRaw > 0
@@ -5735,22 +6119,6 @@ export class PlannerBridge {
       }
     } else {
       boardReviewPolicy = undefined;
-    }
-
-    const boardFleetDefaults: import("./board.js").FleetDefaults = {
-      agent: fleetAgent,
-      model: fleetModel,
-    };
-    if (workAgent !== undefined || workModel !== undefined) {
-      boardFleetDefaults.work = {};
-      if (workAgent !== undefined) boardFleetDefaults.work.agent = workAgent;
-      if (workModel !== undefined) boardFleetDefaults.work.model = workModel;
-    }
-    if (reviewAgent !== undefined || reviewModel !== undefined || reviewRunOn !== undefined) {
-      boardFleetDefaults.review = {};
-      if (reviewAgent !== undefined) boardFleetDefaults.review.agent = reviewAgent;
-      if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
-      if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
     }
 
     const contractBriefRaw = args.contractBrief;
@@ -5962,6 +6330,7 @@ export class PlannerBridge {
         f.category === "review_fix",
     ).length;
     const followUps = findings.filter((f) => f.category === "follow_ups").length;
+    const distill = findings.filter((f) => f.category === "distill").length;
     const forkNote = viaFork
       ? ` (read-only: viewing parent session ${shortSessionId(ownerSessionId)})`
       : "";
@@ -5998,6 +6367,7 @@ export class PlannerBridge {
         failed,
         reviewIssues,
         followUps,
+        distill,
       },
       findings,
     });

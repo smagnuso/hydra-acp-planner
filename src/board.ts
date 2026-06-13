@@ -95,8 +95,14 @@ export interface Task {
   artifacts?: TaskArtifacts | null;
   startedAt?: string | null;
   finishedAt?: string | null;
-  kind?: "work" | "review";
+  kind?: "work" | "review" | "distill";
   reviews?: string | string[];
+  // For kind="distill" tasks: id of the originating review task whose
+  // `synthesize` decision caused the bridge to spawn this distiller.
+  // Set by the bridge at synthesis time; never authored by the
+  // decomposer. Used to surface the distill report back onto the
+  // originating review's artifacts.distill.
+  distillOf?: string;
   runOn?: "orchestrator" | "worker";
   reviewFeedback?: string[];
   riskLevel?: "low" | "medium" | "high";
@@ -139,6 +145,12 @@ export interface FleetDefaults {
   model: string | null;
   work?: { agent?: string; model?: string };
   review?: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" };
+  // Defaults for kind="distill" tasks. Falls through to `review` for
+  // agent/model when unset (a distiller is just a specialized reviewer
+  // — same lane, same default expertise unless explicitly overridden).
+  // Resolved at dispatch time, not at config load, so a later change
+  // to fleetDefaults.review propagates without re-saving distill tasks.
+  distill?: { agent?: string; model?: string };
 }
 
 // Resolution chain:
@@ -158,7 +170,12 @@ export function resolveAgent(
   if (task.agent) return task.agent;
   const kind = task.kind ?? "work";
   const fleet = board.fleetDefaults;
-  const kindAgent = kind === "review" ? fleet.review?.agent : fleet.work?.agent;
+  const kindAgent =
+    kind === "review"
+      ? fleet.review?.agent
+      : kind === "distill"
+        ? (fleet.distill?.agent ?? fleet.review?.agent)
+        : fleet.work?.agent;
   if (kindAgent) return kindAgent;
   if (fleet.agent) return fleet.agent;
   if (board.orchestratorAgent) return board.orchestratorAgent;
@@ -172,7 +189,12 @@ export function resolveModel(
   if (task.model) return task.model;
   const kind = task.kind ?? "work";
   const fleet = board.fleetDefaults;
-  const kindModel = kind === "review" ? fleet.review?.model : fleet.work?.model;
+  const kindModel =
+    kind === "review"
+      ? fleet.review?.model
+      : kind === "distill"
+        ? (fleet.distill?.model ?? fleet.review?.model)
+        : fleet.work?.model;
   if (kindModel) return kindModel;
   if (fleet.model) return fleet.model;
   if (board.orchestratorModel) return board.orchestratorModel;
@@ -438,6 +460,7 @@ export function forkBoard(opts: {
       model: src.fleetDefaults.model,
       work: src.fleetDefaults.work ? { ...src.fleetDefaults.work } : undefined,
       review: src.fleetDefaults.review ? { ...src.fleetDefaults.review } : undefined,
+      ...(src.fleetDefaults.distill ? { distill: { ...src.fleetDefaults.distill } } : {}),
     },
     reviewPolicy: src.reviewPolicy ? { ...src.reviewPolicy } : undefined,
     tasks: src.tasks.map((t) => ({
@@ -459,6 +482,7 @@ export function forkBoard(opts: {
       finishedAt: null,
       kind: t.kind ?? "work",
       reviews: Array.isArray(t.reviews) ? [...t.reviews] : t.reviews,
+      distillOf: t.distillOf,
       runOn: t.runOn,
       reviewFeedback: undefined,
       riskLevel: t.riskLevel,
@@ -474,6 +498,49 @@ export function forkBoard(opts: {
     executionMs: undefined,
     executionStartedAt: null,
   };
+}
+
+// Parse a fleetDefaults blob from the public config surface (MCP
+// set_plan tool args). Lenient: unknown keys and bad types are
+// dropped silently — the same posture the inline parser had before
+// this was extracted. Exported so distill/review parity is unit-
+// testable without standing up the full bridge.
+export function parseFleetDefaultsFromObject(raw: unknown): FleetDefaults {
+  const fd: FleetDefaults = { agent: null, model: null };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fd;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.agent === "string") fd.agent = r.agent;
+  if (typeof r.model === "string") fd.model = r.model;
+  if (r.work && typeof r.work === "object" && !Array.isArray(r.work)) {
+    const w = r.work as Record<string, unknown>;
+    const bucket: { agent?: string; model?: string } = {};
+    if (typeof w.agent === "string") bucket.agent = w.agent;
+    if (typeof w.model === "string") bucket.model = w.model;
+    if (bucket.agent !== undefined || bucket.model !== undefined) fd.work = bucket;
+  }
+  if (r.review && typeof r.review === "object" && !Array.isArray(r.review)) {
+    const rv = r.review as Record<string, unknown>;
+    const bucket: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" } = {};
+    if (typeof rv.agent === "string") bucket.agent = rv.agent;
+    if (typeof rv.model === "string") bucket.model = rv.model;
+    if (typeof rv.runOn === "string" && (rv.runOn === "orchestrator" || rv.runOn === "worker")) {
+      bucket.runOn = rv.runOn;
+    }
+    if (bucket.agent !== undefined || bucket.model !== undefined || bucket.runOn !== undefined) {
+      fd.review = bucket;
+    }
+  }
+  // Distill sub-bucket. Falls through to review.{agent,model} at
+  // resolve time (see resolveAgent/resolveModel above); we only
+  // materialize the bucket here when the user explicitly set it.
+  if (r.distill && typeof r.distill === "object" && !Array.isArray(r.distill)) {
+    const d = r.distill as Record<string, unknown>;
+    const bucket: { agent?: string; model?: string } = {};
+    if (typeof d.agent === "string") bucket.agent = d.agent;
+    if (typeof d.model === "string") bucket.model = d.model;
+    if (bucket.agent !== undefined || bucket.model !== undefined) fd.distill = bucket;
+  }
+  return fd;
 }
 
 export function newBoard(opts: {
@@ -512,11 +579,51 @@ function migrateBoard(b: Board): void {
   }
 }
 
+// Rehydrate-time invariant: handleReviewSynthesize marks the review
+// done AND persists a sibling distill task in the same saveBoard call,
+// but a crash between the in-memory mutation and rename(2) — or a
+// truncated write that loses the distill but keeps the review — would
+// leave a done review with review_decision="synthesize" and no distill
+// sibling. The cohort then deadlocks: reviewees stay awaiting_review
+// with nothing to consume them.
+//
+// Recovery choice: revert the orphan review back to pending. Rationale:
+// it's a one-field reset that re-uses the existing happy-path
+// (handleReviewSynthesize will run again on the next dispatch and
+// spawn the distill atomically). Re-spawning the distill from here
+// would mean duplicating the rewire logic from bridge.ts inside
+// board.ts, which crosses a layering boundary and is harder to keep
+// in sync. The cost is one extra review run — cheap and idempotent.
+function recoverOrphanSynthesize(b: Board): void {
+  const distillByOriginator = new Map<string, Task>();
+  for (const t of b.tasks) {
+    if (t.kind === "distill" && typeof t.distillOf === "string") {
+      distillByOriginator.set(t.distillOf, t);
+    }
+  }
+  for (const t of b.tasks) {
+    if (t.kind !== "review") continue;
+    if (t.status !== "done") continue;
+    const decision = (t.artifacts as Record<string, unknown> | undefined)?.review_decision;
+    if (decision !== "synthesize") continue;
+    if (distillByOriginator.has(t.id)) continue;
+    t.status = "pending";
+    t.finishedAt = null;
+    t.assignedTo = null;
+    if (t.artifacts) {
+      const next = { ...(t.artifacts as Record<string, unknown>) };
+      delete next.review_decision;
+      t.artifacts = next as TaskArtifacts;
+    }
+  }
+}
+
 export function loadBoard(projectId: string): Board | undefined {
   try {
     const raw = readFileSync(boardPath(projectId), "utf8");
     const parsed = JSON.parse(raw) as Board;
     migrateBoard(parsed);
+    recoverOrphanSynthesize(parsed);
     return parsed;
   } catch {
     return undefined;

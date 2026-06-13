@@ -13,7 +13,10 @@ import {
   loadBoard,
   newBoard,
   newProjectId,
+  parseFleetDefaultsFromObject,
   pickEligible,
+  resolveAgent,
+  resolveModel,
   saveBoard,
   shortProjectId,
   shortSessionId,
@@ -21,6 +24,7 @@ import {
   type Board,
   type Task,
 } from "../src/board.ts";
+import { assertNoDecomposerDistill, extractAddTaskBlock } from "../src/decomposition.ts";
 
 // board.ts derives all paths from $HOME/.hydra-acp/planner — to avoid
 // stomping a developer's real planner state during tests, we redirect
@@ -803,6 +807,288 @@ describe("reviewPolicy and fleetDefaults shape", () => {
   it("reviewPolicy is optional and undefined by default", () => {
     const b = newBoard({ description: "x" });
     assert.equal(b.reviewPolicy, undefined);
+  });
+});
+
+describe("distill kind (T1 schema groundwork)", () => {
+  it("persists a kind='distill' task through saveBoard/loadBoard", () => {
+    const sessionId = "hydra_session_distill_rt";
+    const board = newBoard({ description: "distill round-trip" });
+    const distillTask: Task = {
+      id: "T2d",
+      title: "Distill T1/T1a/T1b",
+      deps: ["T1", "T1a", "T1b"],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "distill",
+      reviews: ["T1", "T1a", "T1b"],
+      distillOf: "T2",
+    };
+    board.tasks = [distillTask];
+    saveBoard(board, sessionId);
+
+    const loaded = loadBoard(board.projectId);
+    assert.ok(loaded, "loaded board");
+    assert.equal(loaded!.tasks.length, 1);
+    const t = loaded!.tasks[0]!;
+    assert.equal(t.kind, "distill");
+    assert.equal(t.distillOf, "T2");
+    assert.deepEqual(t.reviews, ["T1", "T1a", "T1b"]);
+    assert.deepEqual(t.deps, ["T1", "T1a", "T1b"]);
+  });
+
+  it("fleetDefaults.distill falls through to fleetDefaults.review for agent/model", () => {
+    const board = newBoard({
+      description: "fallthrough",
+      fleetDefaults: { agent: "fleet-agent", model: "fleet-model" },
+    });
+    board.fleetDefaults.review = { agent: "reviewer-agent", model: "reviewer-model" };
+    const distillTask: Task = {
+      id: "T2d",
+      title: "Distill",
+      deps: [],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "distill",
+      reviews: ["T1"],
+      distillOf: "T2",
+    };
+
+    // No distill bucket → falls through to review.
+    assert.equal(resolveAgent(distillTask, board), "reviewer-agent");
+    assert.equal(resolveModel(distillTask, board), "reviewer-model");
+
+    // Distill bucket explicit values override review.
+    board.fleetDefaults.distill = { agent: "distiller", model: "distiller-model" };
+    assert.equal(resolveAgent(distillTask, board), "distiller");
+    assert.equal(resolveModel(distillTask, board), "distiller-model");
+
+    // Distill bucket partial: model unset → model falls through to review,
+    // agent stays on distill bucket.
+    board.fleetDefaults.distill = { agent: "distill-only" };
+    assert.equal(resolveAgent(distillTask, board), "distill-only");
+    assert.equal(resolveModel(distillTask, board), "reviewer-model");
+  });
+
+  it("set_plan public config surface routes fleetDefaults.distill onto the board", () => {
+    // Simulates the MCP set_plan tool args shape — the public config
+    // surface for distill overrides. The parser must land distill on
+    // board.fleetDefaults.distill verbatim (no merge with review).
+    const fd = parseFleetDefaultsFromObject({
+      agent: "fleet-agent",
+      model: "fleet-model",
+      review: { agent: "reviewer", model: "opus" },
+      distill: { agent: "distiller", model: "haiku" },
+    });
+    const board = newBoard({ description: "distill config surface", fleetDefaults: fd });
+    assert.deepEqual(board.fleetDefaults.distill, { agent: "distiller", model: "haiku" });
+    assert.equal(board.fleetDefaults.review!.agent, "reviewer");
+
+    const distillTask: Task = {
+      id: "T2d",
+      title: "Distill",
+      deps: [],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "distill",
+      reviews: ["T1"],
+      distillOf: "T2",
+    };
+    assert.equal(resolveAgent(distillTask, board), "distiller");
+    assert.equal(resolveModel(distillTask, board), "haiku");
+  });
+
+  it("public config surface with only review set → distill falls through to review", () => {
+    // Same parser, but the user only configured review. The resolver's
+    // existing fall-through (T1 in-memory shape) must still pick up
+    // review.{agent,model} for a kind='distill' task.
+    const fd = parseFleetDefaultsFromObject({
+      review: { agent: "reviewer-agent", model: "reviewer-model" },
+    });
+    const board = newBoard({ description: "fallthrough via surface", fleetDefaults: fd });
+    assert.equal(board.fleetDefaults.distill, undefined);
+
+    const distillTask: Task = {
+      id: "T2d",
+      title: "Distill",
+      deps: [],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "distill",
+      reviews: ["T1"],
+      distillOf: "T2",
+    };
+    assert.equal(resolveAgent(distillTask, board), "reviewer-agent");
+    assert.equal(resolveModel(distillTask, board), "reviewer-model");
+  });
+
+  it("rejects decomposer output containing kind='distill'", () => {
+    assert.throws(
+      () =>
+        assertNoDecomposerDistill({
+          tasks: [
+            { id: "T1", title: "work", deps: [] },
+            { id: "Tbad", title: "synth", deps: [], kind: "distill" },
+          ],
+        }),
+      (err: Error) =>
+        /distill/i.test(err.message) && /Tbad/.test(err.message) && /bridge-synthesized|decomposer/i.test(err.message),
+    );
+  });
+
+  it("rejects add_task output containing kind='distill' with the same phrasing as set_plan", () => {
+    // Mirrors the add_task path in bridge.handleAdd: extract the
+    // hydra-add-task block, then run the same guard set_plan uses.
+    const reply = [
+      "Here you go:",
+      "```hydra-add-task",
+      JSON.stringify({
+        tasks: [
+          { id: "T9", title: "smuggled", deps: [], kind: "distill" },
+        ],
+      }),
+      "```",
+    ].join("\n");
+    const raw = extractAddTaskBlock(reply);
+    assert.throws(
+      () => assertNoDecomposerDistill(raw),
+      (err: Error) =>
+        /distill/i.test(err.message) &&
+        /T9/.test(err.message) &&
+        /bridge-synthesized|decomposer/i.test(err.message),
+    );
+  });
+
+  it("accepts decomposer output without distill kinds", () => {
+    assert.doesNotThrow(() =>
+      assertNoDecomposerDistill({
+        tasks: [
+          { id: "T1", title: "w", deps: [] },
+          { id: "T2", title: "r", deps: ["T1"], kind: "review", reviews: ["T1"] },
+        ],
+      }),
+    );
+  });
+});
+
+describe("rehydrate orphan synthesize recovery (T3)", () => {
+  it("reverts a done review with decision=synthesize and no sibling distill back to pending", () => {
+    const b = newBoard({ description: "orphan synth" });
+    b.tasks = [
+      { id: "T1", title: "w1", deps: [], status: "awaiting_review", attemptCount: 0, kind: "work" },
+      { id: "T2", title: "w2", deps: [], status: "awaiting_review", attemptCount: 0, kind: "work" },
+      {
+        id: "R",
+        title: "review",
+        deps: ["T1", "T2"],
+        status: "done",
+        attemptCount: 1,
+        kind: "review",
+        reviews: ["T1", "T2"],
+        finishedAt: "2025-01-01T00:00:00.000Z",
+        artifacts: { review_decision: "synthesize", notes: "no clear winner" } as never,
+      },
+    ];
+    saveBoard(b, "hydra_session_orphan");
+
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    const review = loaded!.tasks.find((t) => t.id === "R")!;
+    assert.equal(review.status, "pending");
+    assert.equal(review.finishedAt, null);
+    assert.equal(review.assignedTo, null);
+    assert.equal(
+      (review.artifacts as Record<string, unknown> | undefined)?.review_decision,
+      undefined,
+    );
+
+    const eligible = pickEligible(loaded!);
+    assert.ok(eligible, "review should be eligible after recovery");
+    assert.equal(eligible!.id, "R");
+  });
+
+  it("leaves a healthy synthesize→distill pair untouched", () => {
+    const b = newBoard({ description: "healthy synth" });
+    b.tasks = [
+      { id: "T1", title: "w1", deps: [], status: "awaiting_review", attemptCount: 0, kind: "work" },
+      { id: "T2", title: "w2", deps: [], status: "awaiting_review", attemptCount: 0, kind: "work" },
+      {
+        id: "R",
+        title: "review",
+        deps: ["T1", "T2"],
+        status: "done",
+        attemptCount: 1,
+        kind: "review",
+        reviews: ["T1", "T2"],
+        finishedAt: "2025-01-01T00:00:00.000Z",
+        artifacts: { review_decision: "synthesize" } as never,
+      },
+      {
+        id: "Rd",
+        title: "distill R",
+        deps: ["T1", "T2"],
+        status: "pending",
+        attemptCount: 0,
+        kind: "distill",
+        reviews: ["T1", "T2"],
+        distillOf: "R",
+      },
+    ];
+    saveBoard(b, "hydra_session_ok");
+
+    const loaded = loadBoard(b.projectId);
+    const review = loaded!.tasks.find((t) => t.id === "R")!;
+    assert.equal(review.status, "done");
+    assert.equal(
+      (review.artifacts as Record<string, unknown>).review_decision,
+      "synthesize",
+    );
+  });
+
+  it("does not touch reviews with a non-synthesize decision", () => {
+    const b = newBoard({ description: "winner review" });
+    b.tasks = [
+      {
+        id: "R",
+        title: "review",
+        deps: [],
+        status: "done",
+        attemptCount: 1,
+        kind: "review",
+        reviews: ["T1", "T2"],
+        finishedAt: "2025-01-01T00:00:00.000Z",
+        artifacts: { review_decision: "winner", winner: "T1" } as never,
+      },
+    ];
+    saveBoard(b, "hydra_session_winner");
+
+    const loaded = loadBoard(b.projectId);
+    const review = loaded!.tasks.find((t) => t.id === "R")!;
+    assert.equal(review.status, "done");
   });
 });
 
