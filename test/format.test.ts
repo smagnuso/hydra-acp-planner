@@ -444,17 +444,59 @@ describe("formatSessionsTable", () => {
     assert.match(out, /worker\s+\S*WORKER1\s+-\s+-\s+-\s+2/);
   });
 
-  it("surfaces the AGENT|MODEL tag for the worker's current task", () => {
+  it("prefers worker.agent/model (spawn-time truth) over the task-level override", () => {
     const out = formatSessionsTable(
       board({
-        workers: { hydra_session_WORKER2: { currentTaskId: "T7", tasksCompleted: [] } },
+        workers: {
+          hydra_session_WORKER2: {
+            currentTaskId: "T7",
+            tasksCompleted: [],
+            agent: "code-claude",
+            model: "sonnet",
+          },
+        },
         tasks: [
           task("T7", { status: "assigned", assignedTo: "hydra_session_WORKER2", agent: "code-claude", model: "opus" }),
         ],
       }),
       undefined,
     );
-    assert.match(out, /code-claude·opus/);
+    assert.match(out, /code-claude·sonnet/);
+    assert.doesNotMatch(out, /code-claude·opus/);
+  });
+
+  it("shows the spawn-time agent even when fleetDefaults would re-resolve to something else", () => {
+    const out = formatSessionsTable(
+      board({
+        fleetDefaults: { agent: "code-claude", model: "opus" },
+        workers: {
+          hydra_session_WORKER3: {
+            currentTaskId: "T8",
+            tasksCompleted: [],
+            agent: "sonnet",
+          },
+        },
+        tasks: [
+          task("T8", { status: "assigned", assignedTo: "hydra_session_WORKER3" }),
+        ],
+      }),
+      undefined,
+    );
+    assert.match(out, /sonnet/);
+    assert.doesNotMatch(out, /opus/);
+  });
+
+  it("falls back to the task-level agent when the worker record has no agent/model", () => {
+    const out = formatSessionsTable(
+      board({
+        workers: { hydra_session_WORKER4: { currentTaskId: "T9", tasksCompleted: [] } },
+        tasks: [
+          task("T9", { status: "assigned", assignedTo: "hydra_session_WORKER4", agent: "opus" }),
+        ],
+      }),
+      undefined,
+    );
+    assert.match(out, /opus/);
   });
 });
 

@@ -181,7 +181,7 @@ export function executionTimeMs(board: Board, now: number = Date.now()): number 
 //   SESSION      short session id (prefix stripped)
 //   TASK         task id assigned to that worker, or "-"
 //   STATE        task status, or "-" for the orchestrator
-//   AGENT|MODEL  the effective override for that worker, or "-"
+//   AGENT|MODEL  agent·model the worker was actually spawned with, or "-"
 //   DONE         tasksCompleted count from board.workers, or "-"
 //   TITLE        truncated task title
 export function formatSessionsTable(
@@ -257,11 +257,11 @@ export function formatSessionsTable(
       const lastId = w.tasksCompleted[w.tasksCompleted.length - 1];
       t = lastId ? taskById.get(lastId) : undefined;
     }
-    const taskTag = t ? formatTaskTag(t, board).trim().replace(/^\{|\}$/g, "") : "";
     const workerTag = w.agent || w.model
       ? (w.agent && w.model ? `${w.agent}·${w.model}` : (w.agent ?? w.model ?? ""))
       : "";
-    const agentCell = taskTag.length > 0 ? taskTag : workerTag;
+    const taskTag = t ? formatTaskTag(t, board).trim().replace(/^\{|\}$/g, "") : "";
+    const agentCell = workerTag.length > 0 ? workerTag : taskTag;
     const totalTasks = w.tasksCompleted.length + (w.currentTaskId ? 1 : 0);
     rows.push({
       role: "worker",
