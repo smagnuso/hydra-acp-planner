@@ -459,6 +459,229 @@ describe("distill integration — max attempts", () => {
   });
 });
 
+// ── user-authored distill (no distillOf) ─────────────────────
+//
+// A user authors kind:"distill" in set_plan with reviews:[T1,T2,T3]
+// to merge N independent inputs into one cited report. The reviewees
+// are inputs to the merge, not work-to-supersede: recommended_action
+// is informational and produces no side effects on the board.
+
+function authoredDistill(id: string, reviews: string[], overrides: Partial<Task> = {}): Task {
+  return {
+    id,
+    title: `merge ${reviews.join(",")}`,
+    deps: reviews,
+    status: "assigned",
+    assignedTo: WORKER,
+    attemptCount: 1,
+    kind: "distill",
+    reviews,
+    ...overrides,
+  } as Task;
+}
+
+function doneWork(id: string, overrides: Partial<Task> = {}): Task {
+  return {
+    id,
+    title: `work ${id}`,
+    deps: [],
+    status: "done",
+    assignedTo: null,
+    attemptCount: 1,
+    artifacts: { summary: `${id} output` },
+    kind: "work",
+    ...overrides,
+  } as Task;
+}
+
+describe("distill integration — user-authored (no distillOf)", () => {
+  it("merges N done work inputs into a cited report; reviewees stay done; dependents unblock", async () => {
+    const t1 = doneWork("T1");
+    const t2 = doneWork("T2");
+    const t3 = doneWork("T3");
+    const d = authoredDistill("T4", ["T1", "T2", "T3"]);
+    const dep = workTask("T5", { deps: ["T4"], status: "pending", artifacts: undefined });
+    const board = makeBoard([t1, t2, t3, d, dep], "T4");
+    primeWorker(
+      "T4",
+      '```hydra-result\n{"summary":"merged angles",' +
+      '"findings":[{"claim":"all three agree on X","sources":["T1","T2","T3"],"verdict":"keep","evidence":"T1:a; T2:b; T3:c"}],' +
+      '"recommended_action":"new-work","rework_brief":"follow-up exploration"}\n```',
+    );
+
+    await complete(board, d);
+    await settle();
+
+    assert.equal(board.tasks.find((t) => t.id === "T1")!.status, "done");
+    assert.equal(board.tasks.find((t) => t.id === "T2")!.status, "done");
+    assert.equal(board.tasks.find((t) => t.id === "T3")!.status, "done");
+    const dAfter = board.tasks.find((t) => t.id === "T4")!;
+    assert.equal(dAfter.status, "done");
+    const artifacts = dAfter.artifacts as Record<string, unknown>;
+    assert.ok(Array.isArray(artifacts.findings));
+    assert.equal((artifacts.findings as unknown[]).length, 1);
+
+    const eligible = pickEligible(board);
+    assert.equal(eligible?.id, "T5", "dependent unblocks after distill completes");
+  });
+
+  it("recommended_action='apply T1' is informational: applied_winner recorded, no supersedes, T1 untouched", async () => {
+    const t1 = doneWork("T1");
+    const t2 = doneWork("T2");
+    const t3 = doneWork("T3");
+    const d = authoredDistill("T4", ["T1", "T2", "T3"]);
+    const board = makeBoard([t1, t2, t3, d], "T4");
+    primeWorker(
+      "T4",
+      '```hydra-result\n{"summary":"T1 strongest",' +
+      '"findings":[{"claim":"T1 covers spec","sources":["T1"],"verdict":"keep","evidence":"T1:foo"}],' +
+      '"recommended_action":"apply T1"}\n```',
+    );
+
+    await complete(board, d);
+    await settle();
+
+    const t1After = board.tasks.find((t) => t.id === "T1")!;
+    const t2After = board.tasks.find((t) => t.id === "T2")!;
+    const t3After = board.tasks.find((t) => t.id === "T3")!;
+    const dAfter = board.tasks.find((t) => t.id === "T4")!;
+
+    assert.equal(t1After.status, "done", "T1 already done — left as-is");
+    assert.equal(t2After.status, "done", "T2 NOT superseded for user-authored distill");
+    assert.equal(t3After.status, "done", "T3 NOT superseded for user-authored distill");
+    assert.equal(dAfter.status, "done");
+    const artifacts = dAfter.artifacts as Record<string, unknown>;
+    assert.equal(artifacts.applied_winner, "T1", "applied_winner still recorded on distill artifacts");
+    assert.equal(artifacts.recommended_action, "apply T1");
+  });
+
+  it("recommended_action='rework' records rework_brief but spawns no follow-up and supersedes nothing", async () => {
+    const t1 = doneWork("T1");
+    const t2 = doneWork("T2");
+    const d = authoredDistill("T4", ["T1", "T2"]);
+    const board = makeBoard([t1, t2, d], "T4");
+    primeWorker(
+      "T4",
+      '```hydra-result\n{"summary":"both off-spec",' +
+      '"findings":[{"claim":"neither handles X","sources":["T1","T2"],"verdict":"drop","evidence":"T1:a; T2:b"}],' +
+      '"recommended_action":"rework","rework_brief":"add streaming"}\n```',
+    );
+
+    await complete(board, d);
+    await settle();
+
+    const t1After = board.tasks.find((t) => t.id === "T1")!;
+    const t2After = board.tasks.find((t) => t.id === "T2")!;
+    const dAfter = board.tasks.find((t) => t.id === "T4")!;
+    assert.equal(t1After.status, "done", "reviewee NOT superseded");
+    assert.equal(t2After.status, "done", "reviewee NOT superseded");
+    assert.equal(dAfter.status, "done");
+
+    const spawned = board.tasks.find((t) => t.id === "T4w");
+    assert.equal(spawned, undefined, "no follow-up work task spawned");
+
+    const artifacts = dAfter.artifacts as Record<string, unknown>;
+    assert.equal(artifacts.rework_brief, "add streaming");
+    assert.equal(artifacts.recommended_action, "rework");
+  });
+
+  it("failure path fails only the distill; reviewees untouched", async () => {
+    const t1 = doneWork("T1");
+    const t2 = doneWork("T2");
+    const d = authoredDistill("T4", ["T1", "T2"]);
+    const board = makeBoard([t1, t2, d], "T4");
+
+    const bad =
+      '```hydra-result\n{"summary":"x",' +
+      '"findings":[{"claim":"y","sources":[],"verdict":"keep","evidence":"z"}],' +
+      '"recommended_action":"apply T1"}\n```';
+
+    primeWorker("T4", bad);
+    await complete(board, d);
+    await settle();
+    assert.equal(board.tasks.find((t) => t.id === "T4")!.status, "assigned");
+
+    setWorkerReply("T4", bad, 1);
+    await complete(board, d);
+    await settle();
+    assert.equal(board.tasks.find((t) => t.id === "T4")!.status, "assigned");
+
+    setWorkerReply("T4", bad, 2);
+    await complete(board, d);
+    await settle();
+
+    const t1After = board.tasks.find((t) => t.id === "T1")!;
+    const t2After = board.tasks.find((t) => t.id === "T2")!;
+    const dAfter = board.tasks.find((t) => t.id === "T4")!;
+    assert.equal(dAfter.status, "failed");
+    assert.equal(t1After.status, "done", "reviewee not cascaded for user-authored distill");
+    assert.equal(t2After.status, "done", "reviewee not cascaded for user-authored distill");
+    assert.equal(t1After.reviewFeedback, undefined);
+    assert.equal(t2After.reviewFeedback, undefined);
+  });
+});
+
+describe("distill integration — noop", () => {
+  it("user-authored distill emits noop: artifacts recorded, done, reviewees untouched, dependents unblock", async () => {
+    const t1 = doneWork("T1");
+    const t2 = doneWork("T2");
+    const t3 = doneWork("T3");
+    const d = authoredDistill("T4", ["T1", "T2", "T3"]);
+    const dep = workTask("T5", { deps: ["T4"], status: "pending", artifacts: undefined });
+    const board = makeBoard([t1, t2, t3, d, dep], "T4");
+    primeWorker(
+      "T4",
+      '```hydra-result\n{"summary":"informational merge",' +
+      '"findings":[{"claim":"all three agree","sources":["T1","T2","T3"],"verdict":"keep","evidence":"T1:a; T2:b; T3:c"}],' +
+      '"recommended_action":"noop"}\n```',
+    );
+
+    await complete(board, d);
+    await settle();
+
+    const dAfter = board.tasks.find((t) => t.id === "T4")!;
+    assert.equal(dAfter.status, "done");
+    const artifacts = dAfter.artifacts as Record<string, unknown>;
+    assert.equal(artifacts.recommended_action, "noop");
+    assert.equal(artifacts.applied_winner, undefined);
+    assert.equal(artifacts.rework_brief, undefined);
+    assert.equal(board.tasks.find((t) => t.id === "T1")!.status, "done");
+    assert.equal(board.tasks.find((t) => t.id === "T2")!.status, "done");
+    assert.equal(board.tasks.find((t) => t.id === "T3")!.status, "done");
+    assert.equal(board.tasks.find((t) => t.id === "T4w"), undefined, "no follow-up work spawned");
+
+    const eligible = pickEligible(board);
+    assert.equal(eligible?.id, "T5", "dependent unblocks after distill noop");
+  });
+
+  it("bridge-spawned distill emits noop: routed through handleDistillFailure, reviewees fail with canonical feedback", async () => {
+    const t1 = workTask("T1");
+    const t2 = workTask("T2");
+    const review = doneReview("R1", ["T1", "T2"]);
+    const distill = distillTask("R1d", ["T1", "T2"], "R1");
+    const board = makeBoard([t1, t2, review, distill], "R1d");
+    primeWorker(
+      "R1d",
+      '```hydra-result\n{"summary":"dodging the call",' +
+      '"findings":[{"claim":"both have merits","sources":["T1","T2"],"verdict":"keep","evidence":"T1:a; T2:b"}],' +
+      '"recommended_action":"noop"}\n```',
+    );
+
+    await complete(board, distill);
+    await settle();
+
+    const expected = "distill R1d: max attempts exceeded";
+    const t1After = board.tasks.find((t) => t.id === "T1")!;
+    const t2After = board.tasks.find((t) => t.id === "T2")!;
+    const distillAfter = board.tasks.find((t) => t.id === "R1d")!;
+    assert.equal(distillAfter.status, "failed");
+    assert.equal(t1After.status, "failed");
+    assert.equal(t2After.status, "failed");
+    assert.deepEqual(t1After.reviewFeedback, [expected]);
+    assert.deepEqual(t2After.reviewFeedback, [expected]);
+  });
+});
+
 describe("distill integration — lane resolution at dispatch", () => {
   it("distill with no agent/model and no runOn config resolves to worker default", () => {
     const board = newBoard({ description: "lane defaults" });

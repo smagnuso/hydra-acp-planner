@@ -152,7 +152,7 @@ Write whatever prose / per-candidate analysis you need first, then end with:
       "evidence": "Tx:path hunk N; Ty:path hunk M"
     }
   ],
-  "recommended_action": "apply Tx | rework | new-work",
+  "recommended_action": "apply Tx | rework | new-work | noop",
   "rework_brief":       "required when recommended_action is rework or new-work",
   "unresolved":         ["open questions, if any"]
 }
@@ -166,6 +166,8 @@ Write whatever prose / per-candidate analysis you need first, then end with:
 - For \`recommended_action: "rework"\` or \`"new-work"\`, \`rework_brief\`
   MUST be a non-empty string describing what the follow-up work task
   should do.
+- \`noop\` — the report is purely informational; the planner takes no
+  action on reviewees. Only meaningful for user-authored distill tasks.
 
 Findings without sources or with unknown source ids will be rejected and
 this turn will be re-run. Don't paraphrase — cite.
@@ -712,6 +714,7 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         `     - \`apply Tx\` — one candidate is good enough as-is; name it. Mirrors the judge's "winner" path.`,
         `     - \`rework\` — fix one of the candidates; \`rework_brief\` describes what changes.`,
         `     - \`new-work\` — start fresh from scratch; \`rework_brief\` describes the work.`,
+        `     - \`noop\` — the report is purely informational; no action on reviewees. Only meaningful for user-authored distill tasks (where reviewees are inputs, not work-to-supersede).`,
         `  4. List \`unresolved\` questions that couldn't be answered from the artifacts.`,
       );
       if (task.attemptCount > 0 && task.reviewFeedback?.length) {
@@ -845,9 +848,14 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
           );
           return undefined;
         }
+      } else if (normalizedAction === "noop") {
+        // noop is informational: no winner, no rework_brief required.
+        // Bridge enforces the user-authored-only restriction in
+        // handleDistillComplete; the parser accepts it unconditionally
+        // so citation enforcement still applies.
       } else {
         warnings.push(
-          `recommended_action must be "apply Tx" | "rework" | "new-work"`,
+          `recommended_action must be "apply Tx" | "rework" | "new-work" | "noop"`,
         );
         return undefined;
       }
@@ -883,7 +891,7 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       return [
         `Your previous reply for ${task.id} didn't end with the required \`hydra-result\` block, or the block failed validation.`,
         ``,
-        `Please emit it now — do NOT redo the analysis. Every \`finding\` must have a non-empty \`sources\` array drawn from the candidate ids listed in the prompt. \`recommended_action\` must be \`apply Tx\`, \`rework\`, or \`new-work\` (and rework/new-work require \`rework_brief\`):`,
+        `Please emit it now — do NOT redo the analysis. Every \`finding\` must have a non-empty \`sources\` array drawn from the candidate ids listed in the prompt. \`recommended_action\` must be \`apply Tx\`, \`rework\`, \`new-work\`, or \`noop\` (rework/new-work require \`rework_brief\`; noop means informational only and is only valid for user-authored distill):`,
         ``,
         "```hydra-result",
         `{"summary":"...","findings":[{"claim":"...","sources":["Tx"],"verdict":"keep","evidence":"Tx:path hunk N"}],"recommended_action":"apply Tx"}`,

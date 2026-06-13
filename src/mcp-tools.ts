@@ -234,9 +234,9 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
               },
               kind: {
                 type: "string",
-                enum: ["work", "review"],
+                enum: ["work", "review", "distill"],
                 description:
-                  "Task kind. Defaults to 'work'. Use 'review' to author a hand-rolled review task (e.g. a competition referee); pair with `reviews` to point at the work tasks being reviewed. The 'distill' kind exists but is bridge-synthesized only (spawned when a competition reviewer returns decision='synthesize'); the decomposer must never emit kind='distill' — plan acceptance will reject it.",
+                  "Task kind. Defaults to 'work'. Use 'review' to author a hand-rolled review task (e.g. a competition referee); pair with `reviews` to point at the work tasks being reviewed. Use 'distill' to merge N independent inputs into one source-cited findings report — requires a non-empty `reviews` field naming the source task ids (typically also listed in `deps`). User-authored distill produces an informational cited report; its `recommended_action` does NOT mutate the reviewees (they are inputs, not work-to-supersede). Bridge-spawned distill (from competition reviewer decision='synthesize') still applies winners and spawns rework follow-ups via its own internal `distillOf` linkage.",
               },
               reviews: {
                 description:

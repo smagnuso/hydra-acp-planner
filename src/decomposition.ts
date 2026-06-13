@@ -391,16 +391,20 @@ function validateReviewHint(v: unknown): "skip" | "optional" | "recommended" | "
 // Coerce a `kind` field from raw input. Defaults to undefined (work)
 // when missing or invalid — preserves the existing default of "work"
 // semantics throughout the planner.
-function validateKind(v: unknown): "work" | "review" | undefined {
-  if (v === "work" || v === "review") return v;
+function validateKind(v: unknown): "work" | "review" | "distill" | undefined {
+  if (v === "work" || v === "review" || v === "distill") return v;
   return undefined;
 }
 
-// Plan-acceptance guard: distill tasks are bridge-synthesized only —
-// they're spawned when a competition reviewer returns decision="synthesize".
-// The decomposer (or any MCP set_plan caller) must never emit kind="distill".
-// Throws a clear error naming the offending task ids so the caller can fix
-// their output.
+// Plan-acceptance guard: user-authored kind="distill" is allowed but
+// MUST include a non-empty `reviews` field naming the source tasks
+// it cites. Without sources, the distiller has no citation domain
+// and the prompt has no candidates section. Bridge-spawned distills
+// always set `reviews` themselves, so this is purely a sanity check
+// on plan input. Throws a clear error naming the offending task ids
+// so the caller can fix their output. (Historical name preserved
+// for import stability; semantics relaxed per the kind:"distill"
+// authorability change.)
 export function assertNoDecomposerDistill(raw: unknown): void {
   if (!raw || typeof raw !== "object") return;
   const tasks = (raw as { tasks?: unknown }).tasks;
@@ -409,14 +413,19 @@ export function assertNoDecomposerDistill(raw: unknown): void {
   for (const t of tasks) {
     if (!t || typeof t !== "object") continue;
     const rec = t as Record<string, unknown>;
-    if (rec.kind === "distill") {
+    if (rec.kind !== "distill") continue;
+    const reviews = rec.reviews;
+    const hasReviews =
+      (typeof reviews === "string" && reviews.length > 0) ||
+      (Array.isArray(reviews) && reviews.length > 0);
+    if (!hasReviews) {
       const id = typeof rec.id === "string" ? rec.id : "<no id>";
       offenders.push(id);
     }
   }
   if (offenders.length > 0) {
     throw new Error(
-      `decomposer emitted kind="distill" for task(s) ${offenders.join(", ")}; distill tasks are bridge-synthesized from competition reviewer synthesize decisions and must not appear in decomposer output`,
+      `kind="distill" task(s) ${offenders.join(", ")} missing required non-empty \`reviews\` field; a distill needs source task ids to cite (e.g. reviews: [T1, T2, T3])`,
     );
   }
 }

@@ -338,6 +338,50 @@ describe("set_plan", () => {
     });
   });
 
+  it("accepts user-authored kind='distill' with non-empty reviews", async () => {
+    dispatch(
+      mkInvoke(232, "set_plan", {
+        description: "user-authored distill",
+        tasks: [
+          { id: "T1", title: "angle 1", deps: [] },
+          { id: "T2", title: "angle 2", deps: [] },
+          {
+            id: "T3",
+            title: "merge",
+            deps: ["T1", "T2"],
+            kind: "distill",
+            reviews: ["T1", "T2"],
+          },
+        ],
+      }),
+    );
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { isError?: boolean; structuredContent?: { taskCount: number } };
+    assert.notEqual(result.isError, true, "set_plan should accept user-authored distill");
+    const board = boards.get("hydra_session_test")!;
+    const distill = board.tasks.find((t) => t.id === "T3")!;
+    assert.equal(distill.kind, "distill");
+    assert.deepEqual(distill.reviews, ["T1", "T2"]);
+  });
+
+  it("rejects user-authored kind='distill' missing reviews", async () => {
+    dispatch(
+      mkInvoke(233, "set_plan", {
+        description: "bad distill",
+        tasks: [
+          { id: "T1", title: "w", deps: [] },
+          { id: "T2", title: "merge", deps: ["T1"], kind: "distill" },
+        ],
+      }),
+    );
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /reviews/i);
+  });
+
   it("seeds orchestratorAgent/Model from fetchSessionInfo at board-create time", async () => {
     const localClient = new FakeClient();
     const localBridge = new PlannerBridge({

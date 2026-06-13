@@ -1052,7 +1052,7 @@ describe("distill kind (T1 schema groundwork)", () => {
     assert.deepEqual(fd3.distill, { agent: "d" });
   });
 
-  it("rejects decomposer output containing kind='distill'", () => {
+  it("rejects kind='distill' with no reviews field", () => {
     assert.throws(
       () =>
         assertNoDecomposerDistill({
@@ -1062,13 +1062,23 @@ describe("distill kind (T1 schema groundwork)", () => {
           ],
         }),
       (err: Error) =>
-        /distill/i.test(err.message) && /Tbad/.test(err.message) && /bridge-synthesized|decomposer/i.test(err.message),
+        /distill/i.test(err.message) && /Tbad/.test(err.message) && /reviews/i.test(err.message),
     );
   });
 
-  it("rejects add_task output containing kind='distill' with the same phrasing as set_plan", () => {
-    // Mirrors the add_task path in bridge.handleAdd: extract the
-    // hydra-add-task block, then run the same guard set_plan uses.
+  it("rejects kind='distill' with an empty reviews array", () => {
+    assert.throws(
+      () =>
+        assertNoDecomposerDistill({
+          tasks: [
+            { id: "Tbad", title: "synth", deps: [], kind: "distill", reviews: [] },
+          ],
+        }),
+      (err: Error) => /Tbad/.test(err.message) && /reviews/i.test(err.message),
+    );
+  });
+
+  it("rejects add_task output containing kind='distill' missing reviews", () => {
     const reply = [
       "Here you go:",
       "```hydra-add-task",
@@ -1082,10 +1092,19 @@ describe("distill kind (T1 schema groundwork)", () => {
     const raw = extractAddTaskBlock(reply);
     assert.throws(
       () => assertNoDecomposerDistill(raw),
-      (err: Error) =>
-        /distill/i.test(err.message) &&
-        /T9/.test(err.message) &&
-        /bridge-synthesized|decomposer/i.test(err.message),
+      (err: Error) => /T9/.test(err.message) && /reviews/i.test(err.message),
+    );
+  });
+
+  it("accepts kind='distill' with non-empty reviews (user-authored merge)", () => {
+    assert.doesNotThrow(() =>
+      assertNoDecomposerDistill({
+        tasks: [
+          { id: "T1", title: "w1", deps: [] },
+          { id: "T2", title: "w2", deps: [] },
+          { id: "T3", title: "merge", deps: ["T1", "T2"], kind: "distill", reviews: ["T1", "T2"] },
+        ],
+      }),
     );
   });
 

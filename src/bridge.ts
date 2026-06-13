@@ -4982,7 +4982,7 @@ export class PlannerBridge {
 
     if (!normalized) {
       log.warn(
-        `distill ${distillTask.id}: missing or malformed result, failing reviewees`,
+        `distill ${distillTask.id}: missing or malformed result, failing`,
       );
       this.handleDistillFailure(distillTask, board, orchestratorSessionId);
       return;
@@ -4993,6 +4993,30 @@ export class PlannerBridge {
     // bypassed for distill (see processCompleteResult), so we assign
     // here. Both branches below leave this in place.
     distillTask.artifacts = normalized.artifacts as TaskArtifacts;
+
+    // User-authored distill (no distillOf): the reviewees are inputs
+    // to the merge, not work-to-supersede. recommended_action is
+    // informational only — record artifacts (including applied_winner
+    // and rework_brief) on the distill task, mark it done, and leave
+    // reviewees and the board structure otherwise untouched. The user
+    // can act on recommended_action externally if they choose.
+    if (!distillTask.distillOf) {
+      distillTask.status = "done";
+      distillTask.finishedAt = nowIso();
+      distillTask.assignedTo = null;
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      const reviewIdsStr = reviewIds.join(", ");
+      log.info(
+        `distill ${distillTask.id}: user-authored merge of [${reviewIdsStr}] done — recommended_action is informational`,
+      );
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `${distillTask.id} distilled merge of [${reviewIdsStr}] (informational; reviewees untouched)`,
+        { event: "task-distill-authored", taskId: distillTask.id },
+      );
+      return;
+    }
 
     // Always surface the structured report onto the originating
     // review task via distillOf lookup. Consumers that only know the
@@ -5148,6 +5172,18 @@ export class PlannerBridge {
       return;
     }
 
+    if (recommended === "noop") {
+      // Bridge-spawned distill (distillOf set) emitting noop means the
+      // LLM dodged the synthesize decision it was spawned to make.
+      // Route through the canonical failure cascade so reviewees fail
+      // with the standard feedback — same safety net as max-attempts.
+      log.warn(
+        `distill ${distillTask.id}: bridge-spawned distill emitted noop, treating as failure`,
+      );
+      this.handleDistillFailure(distillTask, board, orchestratorSessionId);
+      return;
+    }
+
     log.warn(
       `distill ${distillTask.id}: unrecognized recommended_action '${recommended}', failing reviewees`,
     );
@@ -5170,6 +5206,26 @@ export class PlannerBridge {
       distillTask.assignedTo = null;
       saveBoard(board, orchestratorSessionId);
       this.emitPlanUpdate(orchestratorSessionId, board);
+      return;
+    }
+    // User-authored distill (no distillOf): the reviewees are inputs,
+    // not competition siblings. Fail the distill itself only — the
+    // cascade exists to break stuck competition cohorts, which does
+    // not apply here.
+    if (!distillTask.distillOf) {
+      distillTask.status = "failed";
+      distillTask.finishedAt = nowIso();
+      distillTask.assignedTo = null;
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
+      log.warn(
+        `distill ${distillTask.id}: user-authored merge failed — reviewees untouched`,
+      );
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `${distillTask.id} failed (user-authored distill; reviewees untouched)`,
+        { event: "task-distill-failed", taskId: distillTask.id },
+      );
       return;
     }
     const feedback = `distill ${distillTask.id}: max attempts exceeded`;

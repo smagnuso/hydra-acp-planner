@@ -1044,6 +1044,34 @@ describe("normalizeDistill", () => {
     assert.equal(r, undefined);
   });
 
+  it("accepts 'noop' with no rework_brief and no applied_winner", () => {
+    const r = normalizeDistill(
+      {
+        summary: "merged angles",
+        findings: [goodFinding],
+        recommended_action: "noop",
+      },
+      ["T1", "T2"],
+    );
+    assert.ok(r);
+    const rec = r!.artifacts as Record<string, unknown>;
+    assert.equal(rec.recommended_action, "noop");
+    assert.equal(rec.applied_winner, undefined);
+    assert.equal(rec.rework_brief, undefined);
+  });
+
+  it("'noop' still enforces citation rules on sources", () => {
+    const r = normalizeDistill(
+      {
+        summary: "x",
+        findings: [{ ...goodFinding, sources: ["T9"] }],
+        recommended_action: "noop",
+      },
+      ["T1", "T2"],
+    );
+    assert.equal(r, undefined);
+  });
+
   it("preserves unresolved when provided", () => {
     const r = normalizeDistill(
       {

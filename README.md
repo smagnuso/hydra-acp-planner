@@ -416,6 +416,47 @@ work tasks for the same dependency and a single competition review that
 picks a winner. Superseded tasks are persisted but don't block
 dependents.
 
+### User-authored distill: N-input cited merges
+
+The `distill` kind exists internally to merge competition reviews into
+one cited report. You can also author it directly in `set_plan` to
+merge N independent inputs — useful when you want multiple angle-
+specific reviews of an external artifact (a PR diff, a design doc,
+a benchmark) collapsed into a single source-cited findings report.
+
+```yaml
+tasks:
+  - id: T1
+    kind: work
+    what: Review the attached PR diff for security issues. Cite line ranges.
+  - id: T2
+    kind: work
+    what: Review the attached PR diff for API design. Cite line ranges.
+  - id: T3
+    kind: work
+    what: Review the attached PR diff for test coverage. Cite line ranges.
+  - id: T4
+    kind: distill
+    deps: [T1, T2, T3]
+    reviews: [T1, T2, T3]
+    what: Merge the three angle-specific reviews into one cited report.
+    # The distiller may set recommended_action to "apply Tx",
+    # "rework", "new-work", or "noop" — all informational here.
+```
+
+`reviews` is required and must be non-empty — it is the citation
+domain the distiller is allowed to source from. User-authored distill
+differs from the competition+synthesize flow in one important way: its
+`recommended_action` is **informational only**. The reviewees are
+inputs to the merge, not competition siblings, so neither
+`apply Tx` nor `rework` mutates them — nothing is superseded and no
+follow-up work task is spawned. Use `noop` when the report is purely
+informational and you don't want to invent a `rework_brief` just to
+satisfy the parser. The cited report lands on the distill
+task's artifacts (visible via `get_findings`); acting on it is up to
+you. Use competition+synthesize instead when you want N parallel
+implementations of the same work with automatic winner-selection.
+
 ### CLI flags
 
 | Flag | Effect |
