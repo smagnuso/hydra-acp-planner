@@ -3179,9 +3179,18 @@ export class PlannerBridge {
       return;
     }
     if (isOrchestrator(workerSessionId)) {
-      // Shouldn't happen — we don't attach as a client to the
-      // orchestrator session. Pass-through reply with cancelled so the
-      // daemon's broadcast can still settle from another client.
+      // We DO end up here in practice: ensureClientAttached attaches us
+      // as a peer client on our own orchestrator session (for prompt
+      // injection), so when forwardPermissionToOrchestrator forwards a
+      // worker's permission request to that session, the daemon broadcasts
+      // session/request_permission back to every attached client —
+      // including us. We must respond with MethodNotFound (-32601) so the
+      // daemon treats it as an abstention rather than a vote. Replying
+      // with a real outcome ({outcome:"cancelled"} etc) would race the
+      // user's TUI and could settle the request before the user clicks.
+      // The daemon's handlePermissionRequest waits for ALL clients to
+      // error before settling-as-rejected, so this abstention is harmless
+      // as long as the user's TUI eventually answers.
       this.client.replyError(req.id, -32601, "planner does not handle orchestrator-session permissions");
       return;
     }
