@@ -450,6 +450,25 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+// Case-insensitive task lookup against board.tasks[i].id. Intended for
+// user-supplied taskId arguments (slash command args, MCP tool args,
+// CLI args) where the user may type `t1` for a task whose canonical
+// id is `T1`. Returns the first match in declaration order, or
+// undefined when nothing matches.
+//
+// Internal callers that already hold an id from board state (deps
+// arrays, reviews refs, distillOf, review-id construction in
+// src/task.ts) MUST keep direct `===` comparisons — those ids are
+// already canonical and any case mismatch there is a real bug we
+// don't want to paper over.
+export function findTaskById(board: Board, taskId: string): Task | undefined {
+  const needle = taskId.toLowerCase();
+  for (const t of board.tasks) {
+    if (t.id.toLowerCase() === needle) return t;
+  }
+  return undefined;
+}
+
 // Make a fresh ready-to-run copy of an existing board.
 //
 // Use case: `/hydra planner fork <projectId>` — the user lost the

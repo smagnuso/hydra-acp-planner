@@ -1557,3 +1557,84 @@ describe("remove", () => {
     assert.match(result.content[0]!.text, /Removed project/);
   });
 });
+
+// ── Case-insensitive user-supplied taskId lookup ───────────
+
+describe("case-insensitive taskId lookup", () => {
+  it("/hydra planner findings t1 matches a board task stored as T1", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "did stuff",
+            ...({ follow_ups: ["fix:foo.ts:10"] } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkSlash(900, "findings", "T1"));
+    await settle();
+    const upperText = (client.lastReply().result as { text: string }).text;
+
+    dispatch(mkSlash(901, "findings", "t1"));
+    await settle();
+    const lowerText = (client.lastReply().result as { text: string }).text;
+
+    assert.equal(lowerText, upperText);
+    assert.match(lowerText, /=== T1/);
+  });
+
+  it("/hydra planner findings tXX (unknown) returns the unknown-task message regardless of case", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [{ id: "T1", title: "a", status: "done", artifacts: { summary: "ok" } }],
+    });
+
+    dispatch(mkSlash(902, "findings", "tXX"));
+    await settle();
+    const lowerText = (client.lastReply().result as { text: string }).text;
+    assert.match(lowerText, /no finding for task tXX/);
+
+    dispatch(mkSlash(903, "findings", "TXX"));
+    await settle();
+    const upperText = (client.lastReply().result as { text: string }).text;
+    assert.match(upperText, /no finding for task TXX/);
+  });
+
+  it("get_findings({taskId:'t1'}) returns the same finding as taskId:'T1'", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "did stuff",
+            ...({ follow_ups: ["fix:foo.ts:10"] } as object),
+          },
+        },
+      ],
+    });
+
+    dispatch(mkInvoke(910, "get_findings", { taskId: "T1" }));
+    await settle();
+    const upper = client.lastReply().result as {
+      structuredContent: { findings: Array<{ taskId: string }> };
+    };
+
+    dispatch(mkInvoke(911, "get_findings", { taskId: "t1" }));
+    await settle();
+    const lower = client.lastReply().result as {
+      structuredContent: { findings: Array<{ taskId: string }> };
+    };
+
+    assert.equal(lower.structuredContent.findings.length, 1);
+    assert.equal(lower.structuredContent.findings.length, upper.structuredContent.findings.length);
+    assert.equal(lower.structuredContent.findings[0]!.taskId, "T1");
+  });
+});

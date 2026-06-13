@@ -77,6 +77,7 @@ import { resolve as resolvePath } from "node:path";
 import {
   allTerminal,
   canonicalProjectId,
+  findTaskById,
   forkBoard,
   inFlightCount,
   listProjects,
@@ -587,6 +588,76 @@ export class PlannerBridge {
       }
     } catch (err) {
       log.debug(`seedOrchestratorIdentity ${sessionId}: ${(err as Error).message}`);
+    }
+  }
+
+  // Post-spawn refinement of Worker.agent/Worker.model from the
+  // daemon's authoritative per-session info. Composes on top of the
+  // pre-spawn resolve chain and the orchestrator-fallback eager record:
+  // when both layers above leave us with null (real case: orchestrator
+  // identity never seeded), the daemon still knows what the child
+  // session is running on — ask it. Best-effort: fetch failures and
+  // empty fields leave the eager record intact.
+  private async refineWorkerFromDaemon(
+    orchestratorSessionId: string,
+    childSessionId: string,
+    setModelPromise: Promise<unknown> | null,
+  ): Promise<void> {
+    if (setModelPromise) {
+      try {
+        await setModelPromise;
+      } catch {
+        // already logged; we still want to capture post-set_model state.
+      }
+    }
+    const fetcher = this.fetchSessionInfoOverride
+      ?? ((sid: string) =>
+        fetchSessionInfo(sid, {
+          daemonHttpBase: this.daemonHttpBase,
+          token: this.daemonToken,
+        }));
+    const attempt = async (): Promise<boolean> => {
+      let info: import("./util/session-info.js").SessionInfo | undefined;
+      try {
+        info = await fetcher(childSessionId);
+      } catch (err) {
+        log.debug(
+          `refineWorkerFromDaemon ${childSessionId}: ${(err as Error).message}`,
+        );
+        return true;
+      }
+      if (!info) return false;
+      const board = boards.get(orchestratorSessionId);
+      if (!board) return true;
+      const worker = board.workers[childSessionId];
+      if (!worker) return true;
+      let changed = false;
+      if (
+        typeof info.agentId === "string"
+        && info.agentId.length > 0
+        && worker.agent !== info.agentId
+      ) {
+        worker.agent = info.agentId;
+        changed = true;
+      }
+      if (
+        typeof info.currentModel === "string"
+        && info.currentModel.length > 0
+        && worker.model !== info.currentModel
+      ) {
+        worker.model = info.currentModel;
+        changed = true;
+      }
+      if (changed) {
+        saveBoard(board, orchestratorSessionId);
+        this.emitPlanUpdate(orchestratorSessionId, board);
+      }
+      return true;
+    };
+    if (await attempt()) return;
+    for (let i = 0; i < 2; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (await attempt()) return;
     }
   }
 
@@ -1419,7 +1490,7 @@ export class PlannerBridge {
     const ctx = this.requireBoard(reqId, sessionId);
     if (!ctx) return;
     const { board, orchestratorSessionId } = ctx;
-    const task = board.tasks.find((t) => t.id === taskId);
+    const task = findTaskById(board, taskId);
     if (!task) {
       this.client.reply(reqId, { text: `No task '${taskId}' in this project.` });
       return;
@@ -1637,13 +1708,13 @@ export class PlannerBridge {
       }
       resetIds = failed.map((t) => t.id);
     } else {
-      const task = board.tasks.find((t) => t.id === taskId);
+      const task = findTaskById(board, taskId);
       if (!task) {
         this.client.reply(reqId, { text: `No task '${taskId}' in this project.` });
         return;
       }
       this.retryOne(board, orchestratorSessionId, task);
-      resetIds = [taskId];
+      resetIds = [task.id];
     }
 
     saveBoard(board, orchestratorSessionId);
@@ -2064,7 +2135,7 @@ export class PlannerBridge {
     }
     const { board, ownerSessionId, viaFork } = resolved;
     const taskId = args.length > 0 ? args.split(/\s+/)[0] : undefined;
-    if (taskId && !board.tasks.some((t) => t.id === taskId)) {
+    if (taskId && !findTaskById(board, taskId)) {
       this.client.reply(reqId, {
         text: `no finding for task ${taskId} (it may not have surfaced — check \`/hydra planner status\`).`,
       });
@@ -4089,28 +4160,33 @@ export class PlannerBridge {
     // session/set_model on the live session. Fire-and-forget: if the
     // worker's agent doesn't accept the model, log a warning and let
     // the task run on the agent's default model.
-    if (effectiveModel) {
-      this.client
-        .request("session/set_model", {
-          sessionId: childSessionId,
-          modelId: effectiveModel,
-        })
-        .catch((err) => {
-          log.warn(
-            `task ${task.id} set_model "${effectiveModel}" failed; worker will run on default: ${(err as Error).message}`,
-          );
-        });
-    }
+    const setModelPromise: Promise<unknown> | null = effectiveModel
+      ? this.client
+          .request("session/set_model", {
+            sessionId: childSessionId,
+            modelId: effectiveModel,
+          })
+          .catch((err) => {
+            log.warn(
+              `task ${task.id} set_model "${effectiveModel}" failed; worker will run on default: ${(err as Error).message}`,
+            );
+          })
+      : null;
 
     // Fill in the real worker id now that we have it. Status was
     // already flipped to "assigned" at the top of this function;
     // assignedTo was held null until the childSessionId existed.
     task.assignedTo = childSessionId;
-    // effectiveAgent/Model can be null when no override is configured for
-    // this task and no fleet default exists. The spawned worker session
-    // inherits the orchestrator's agent/model in that case (hydra-acp
-    // child_session/spawn behavior), so persist that fallback here so the
-    // sessions table reflects what the worker is actually using.
+    // Worker agent/model resolution is layered:
+    //   1) pre-spawn resolve chain (task override → fleet default → board)
+    //      yields effectiveAgent/effectiveModel.
+    //   2) orchestrator-fallback fills the eager Worker record below when
+    //      the resolve chain returned null (project 2e1b3ed2bbcd).
+    //   3) post-spawn daemon session-info fetch (refineWorkerFromDaemon
+    //      below) is authoritative when available and overwrites the
+    //      eager values — the daemon knows what the spawned session is
+    //      actually running on, even when the orchestrator's own
+    //      identity was never seeded.
     const persistedAgent = effectiveAgent ?? board.orchestratorAgent ?? null;
     const persistedModel = effectiveModel ?? board.orchestratorModel ?? null;
     board.workers[childSessionId] = {
@@ -4120,6 +4196,17 @@ export class PlannerBridge {
       model: persistedModel,
     };
     saveBoard(board, orchestratorSessionId);
+
+    // Refine agent/model from daemon session info post-spawn. Chained
+    // off set_model so we observe the post-set_model state; fired
+    // directly when set_model wasn't attempted (daemon picks a default
+    // we want to learn). Fire-and-forget — failure must not block the
+    // prompt dispatch or clobber the eager values above.
+    void this.refineWorkerFromDaemon(
+      orchestratorSessionId,
+      childSessionId,
+      setModelPromise,
+    );
 
     setWorkerState(childSessionId, {
       orchestratorSessionId,
@@ -6467,7 +6554,7 @@ export class PlannerBridge {
         ? args.taskId
         : undefined;
     const includeApproved = args?.includeApproved === true;
-    if (taskId && !board.tasks.some((t) => t.id === taskId)) {
+    if (taskId && !findTaskById(board, taskId)) {
       return this.replyMcpResult(
         reqId,
         `No task '${taskId}' on project ${shortProjectId(board.projectId)}.`,
@@ -6694,7 +6781,7 @@ export class PlannerBridge {
     const ctx = this.requireBoardForTool(sessionId);
     if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
     const { board } = ctx;
-    const task = board.tasks.find((t) => t.id === taskId);
+    const task = findTaskById(board, taskId);
     if (!task)
       return this.replyMcpTextError(
         reqId,
@@ -6797,7 +6884,7 @@ export class PlannerBridge {
     const ctx = this.requireBoardForTool(sessionId);
     if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
     const { board } = ctx;
-    const task = board.tasks.find((t) => t.id === taskId);
+    const task = findTaskById(board, taskId);
     if (!task) return this.replyMcpTextError(reqId, `skip: no task '${taskId}' in this project`);
     if (task.status === "done") {
       return this.replyMcpResult(reqId, `${taskId} is already done.`);
@@ -6852,10 +6939,10 @@ export class PlannerBridge {
       }
       resetIds = failed.map((t) => t.id);
     } else {
-      const task = board.tasks.find((t) => t.id === taskId);
+      const task = findTaskById(board, taskId);
       if (!task) return this.replyMcpTextError(reqId, `retry: no task '${taskId}' in this project`);
       this.retryOne(board, sessionId, task);
-      resetIds = [taskId];
+      resetIds = [task.id];
     }
 
     saveBoard(board, sessionId);

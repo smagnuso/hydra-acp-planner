@@ -587,8 +587,9 @@ export function collectFindings(
   opts: CollectFindingsOptions = {},
 ): Finding[] {
   const out: Finding[] = [];
+  const needle = opts.taskId ? opts.taskId.toLowerCase() : undefined;
   for (const t of board.tasks) {
-    if (opts.taskId && t.id !== opts.taskId) continue;
+    if (needle !== undefined && t.id.toLowerCase() !== needle) continue;
     const a = (t.artifacts ?? {}) as Record<string, unknown>;
     const summary = typeof a.summary === "string" ? a.summary : null;
     const notes = typeof a.notes === "string" ? a.notes : null;

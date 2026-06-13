@@ -7,6 +7,7 @@ import {
   allTerminal,
   BOARD_SCHEMA_VERSION,
   canonicalProjectId,
+  findTaskById,
   forkBoard,
   inFlightCount,
   listProjects,
@@ -1557,5 +1558,57 @@ describe("forkBoard", () => {
       const forked = forkBoard({ source: srcBoard({ state }) });
       assert.equal(forked.state, "ready");
     }
+  });
+});
+
+describe("findTaskById", () => {
+  function mk(id: string): Task {
+    return { id, title: id, deps: [], status: "pending", attemptCount: 0 };
+  }
+  function mkBoard(tasks: Task[]): Board {
+    return {
+      version: BOARD_SCHEMA_VERSION,
+      projectId: "proj_find",
+      description: "x",
+      state: "running",
+      createdAt: "",
+      updatedAt: "",
+      fleetDefaults: { agent: null, model: null },
+      tasks,
+      workers: {},
+      concurrencyCap: 1,
+    };
+  }
+
+  it("matches lowercase user input against an uppercase stored id", () => {
+    const b = mkBoard([mk("T1"), mk("T2")]);
+    const t = findTaskById(b, "t1");
+    assert.ok(t);
+    assert.equal(t!.id, "T1");
+  });
+
+  it("matches exact-case input", () => {
+    const b = mkBoard([mk("T1")]);
+    assert.equal(findTaskById(b, "T1")?.id, "T1");
+  });
+
+  it("returns undefined when nothing matches", () => {
+    const b = mkBoard([mk("T1")]);
+    assert.equal(findTaskById(b, "tXX"), undefined);
+  });
+
+  it("matches mixed case in either direction", () => {
+    const b = mkBoard([mk("review-T1")]);
+    assert.equal(findTaskById(b, "REVIEW-t1")?.id, "review-T1");
+  });
+
+  it("internal deps lookups stay case-sensitive (deps:['t1'] does not silently match T1)", () => {
+    const t1: Task = { id: "T1", title: "T1", deps: [], status: "done", attemptCount: 0 };
+    const t2: Task = { id: "T2", title: "T2", deps: ["t1"], status: "pending", attemptCount: 0 };
+    const b = mkBoard([t1, t2]);
+    // pickEligible builds an id->task Map keyed on the literal stored id.
+    // deps:['t1'] does not equal 'T1' under === so T2 should be blocked
+    // (no silent case-insensitive match for internal references).
+    assert.equal(pickEligible(b), undefined);
   });
 });
