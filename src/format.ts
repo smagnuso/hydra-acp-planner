@@ -1,7 +1,7 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { resolveAgent, resolveModel, shortProjectId, shortSessionId, type Board, type Task, type WorkerUsage } from "./board.js";
+import { resolveAgent, resolveModel, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
 import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
 
 // Format a cost amount with the worker's reported currency. Falls back
@@ -499,4 +499,128 @@ export function formatStatus(
   orchestratorSessionId?: string,
 ): string {
   return formatStatusBody(board, orchestratorSessionId, `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`);
+}
+
+// A structured finding the orchestrator agent should act on after a
+// project completes (or while one is running, for already-finished
+// tasks). Returned by collectFindings and the get_findings MCP tool.
+export type FindingCategory =
+  | "failed"
+  | "review_reject"
+  | "review_amend"
+  | "review_fix"
+  | "follow_ups";
+
+export interface Finding {
+  taskId: string;
+  title: string;
+  kind: "work" | "review";
+  status: Task["status"];
+  category: FindingCategory;
+  summary: string | null;
+  notes: string | null;
+  followUps: string[];
+  decision: string | null;
+  attemptCount: number;
+  verifiedDiff: TaskArtifacts["verified_diff"] | null;
+}
+
+export interface CollectFindingsOptions {
+  taskId?: string;
+  includeApproved?: boolean;
+}
+
+const APPROVED_DECISIONS = new Set(["approve", "winner", "synthesize"]);
+
+// Walk a board's tasks and return the subset that need attention,
+// pre-categorized for downstream consumers. Pure: same input → same
+// output, no I/O. Used by both formatCompletionFindings (inline text
+// in the project-complete summary) and the get_findings MCP tool
+// (structured payload the agent can iterate over).
+export function collectFindings(
+  board: Board,
+  opts: CollectFindingsOptions = {},
+): Finding[] {
+  const out: Finding[] = [];
+  for (const t of board.tasks) {
+    if (opts.taskId && t.id !== opts.taskId) continue;
+    const a = (t.artifacts ?? {}) as Record<string, unknown>;
+    const summary = typeof a.summary === "string" ? a.summary : null;
+    const notes = typeof a.notes === "string" ? a.notes : null;
+    const followUps = Array.isArray(a.follow_ups)
+      ? a.follow_ups.filter((v): v is string => typeof v === "string")
+      : [];
+    const decision =
+      typeof a.review_decision === "string" ? a.review_decision : null;
+    const verifiedDiff =
+      (a.verified_diff as TaskArtifacts["verified_diff"] | undefined) ?? null;
+    const kind: "work" | "review" = t.kind === "review" ? "review" : "work";
+
+    let category: FindingCategory | null = null;
+    if (t.status === "failed") {
+      category = "failed";
+    } else if (t.status === "done" && kind === "review" && decision) {
+      if (decision === "reject") category = "review_reject";
+      else if (decision === "amend") category = "review_amend";
+      else if (decision === "fix") category = "review_fix";
+      else if (opts.includeApproved && APPROVED_DECISIONS.has(decision)) {
+        category = "follow_ups";
+      }
+    } else if (t.status === "done" && kind === "work" && followUps.length > 0) {
+      category = "follow_ups";
+    }
+    if (!category) continue;
+
+    out.push({
+      taskId: t.id,
+      title: t.title,
+      kind,
+      status: t.status,
+      category,
+      summary,
+      notes,
+      followUps,
+      decision,
+      attemptCount: t.attemptCount,
+      verifiedDiff,
+    });
+  }
+  return out;
+}
+
+// Render the findings list as plain text for the project-complete
+// summary. Returns "" when nothing surfaces.
+export function formatCompletionFindings(board: Board): string {
+  const findings = collectFindings(board);
+  if (findings.length === 0) return "";
+  const NOTES_MAX = 600;
+  const truncate = (s: string): string =>
+    s.length > NOTES_MAX ? `${s.slice(0, NOTES_MAX)}…` : s;
+  const sections: string[] = [];
+  for (const f of findings) {
+    const tag =
+      f.category === "failed"
+        ? "[!]"
+        : f.kind === "review"
+          ? `[${f.decision ?? "review"}]`
+          : "[x]";
+    const headSuffix =
+      f.category === "failed"
+        ? " — failed"
+        : f.kind === "work" && f.summary
+          ? ` — ${truncate(f.summary)}`
+          : "";
+    const lines = [`   ${tag} ${f.taskId}  ${f.title}${headSuffix}`];
+    if (f.category === "failed" && f.summary) {
+      lines.push(`       ${truncate(f.summary)}`);
+    }
+    if (f.notes) {
+      lines.push(`       ${truncate(f.notes).split("\n").join("\n       ")}`);
+    }
+    for (const fu of f.followUps) {
+      lines.push(`       • ${fu}`);
+    }
+    sections.push(lines.join("\n"));
+  }
+  return `Findings:\n${sections.join("\n")}`;
 }

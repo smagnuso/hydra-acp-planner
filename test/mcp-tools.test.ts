@@ -157,6 +157,8 @@ function seedBoard(
       ...(t.artifacts !== undefined ? { artifacts: t.artifacts } : {}),
       ...(t.startedAt !== undefined ? { startedAt: t.startedAt } : {}),
       ...(t.finishedAt !== undefined ? { finishedAt: t.finishedAt } : {}),
+      ...(t.kind !== undefined ? { kind: t.kind } : {}),
+      ...(t.reviews !== undefined ? { reviews: t.reviews } : {}),
     }),
   );
   boards.set(sessionId, b);
@@ -582,6 +584,117 @@ describe("get_plan", () => {
     assert.equal(result.structuredContent.tasks[1]!.deps[0], "T1");
     assert.match(result.content[0]!.text, /T1 \[done\] first/);
     assert.match(result.content[0]!.text, /T2 \[pending\] second \(deps: T1\)/);
+  });
+});
+
+// ── get_findings ───────────────────────────────────────────
+
+describe("get_findings", () => {
+  it("returns hasProject:false when no board", async () => {
+    dispatch(mkInvoke(60, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { structuredContent: { hasProject: boolean; findings: unknown[] } };
+    assert.equal(result.structuredContent.hasProject, false);
+    assert.deepEqual(result.structuredContent.findings, []);
+  });
+
+  it("returns an empty list when the board has nothing to surface", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [{ id: "T1", title: "t", status: "done", artifacts: { summary: "ok" } }],
+    });
+    dispatch(mkInvoke(61, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: { findings: unknown[]; counts: { total: number } };
+    };
+    assert.equal(result.structuredContent.findings.length, 0);
+    assert.equal(result.structuredContent.counts.total, 0);
+    assert.match(result.content[0]!.text, /No findings/);
+  });
+
+  it("returns categorized findings: failed + review_reject + follow_ups", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        { id: "T1", title: "broke", status: "failed", artifacts: { summary: "compile error" } },
+        {
+          id: "review-T2",
+          title: "Review of T2",
+          status: "done",
+          kind: "review",
+          reviews: "T2",
+          artifacts: {
+            summary: "reject",
+            ...({ review_decision: "reject", notes: "spec X but diff Y" } as object),
+          },
+        },
+        {
+          id: "T3",
+          title: "code review",
+          status: "done",
+          artifacts: { summary: "2 issues", follow_ups: ["fix:48", "fix:198"] },
+        },
+      ],
+    });
+    dispatch(mkInvoke(62, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: {
+        counts: { total: number; failed: number; reviewIssues: number; followUps: number };
+        findings: Array<{ taskId: string; category: string; followUps: string[]; notes: string | null }>;
+      };
+    };
+    assert.equal(result.structuredContent.counts.total, 3);
+    assert.equal(result.structuredContent.counts.failed, 1);
+    assert.equal(result.structuredContent.counts.reviewIssues, 1);
+    assert.equal(result.structuredContent.counts.followUps, 1);
+    const byId = Object.fromEntries(
+      result.structuredContent.findings.map((f) => [f.taskId, f]),
+    );
+    assert.equal(byId.T1!.category, "failed");
+    assert.equal(byId["review-T2"]!.category, "review_reject");
+    assert.equal(byId["review-T2"]!.notes, "spec X but diff Y");
+    assert.deepEqual(byId.T3!.followUps, ["fix:48", "fix:198"]);
+    assert.match(result.content[0]!.text, /3 findings/);
+  });
+
+  it("filters to a single task when taskId is provided", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        { id: "T1", title: "a", status: "failed", artifacts: { summary: "x" } },
+        { id: "T2", title: "b", status: "failed", artifacts: { summary: "y" } },
+      ],
+    });
+    dispatch(mkInvoke(63, "get_findings", { taskId: "T2" }));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { structuredContent: { findings: Array<{ taskId: string }> } };
+    assert.equal(result.structuredContent.findings.length, 1);
+    assert.equal(result.structuredContent.findings[0]!.taskId, "T2");
+  });
+
+  it("reports unknown taskId cleanly", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [{ id: "T1", title: "a", status: "done", artifacts: { summary: "ok" } }],
+    });
+    dispatch(mkInvoke(64, "get_findings", { taskId: "T99" }));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: { unknownTaskId?: string; findings: unknown[] };
+    };
+    assert.equal(result.structuredContent.unknownTaskId, "T99");
+    assert.deepEqual(result.structuredContent.findings, []);
+    assert.match(result.content[0]!.text, /No task 'T99'/);
   });
 });
 

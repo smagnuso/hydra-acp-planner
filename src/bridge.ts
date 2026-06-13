@@ -54,7 +54,7 @@ import {
   extractUsageUpdate,
   updateKind,
 } from "./util/text.js";
-import { formatBoardContext, formatStatus, totalUsage } from "./format.js";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatStatus, totalUsage } from "./format.js";
 import {
   buildAsciiPlanEnvelope,
   buildPlanUpdateEnvelope,
@@ -3704,7 +3704,13 @@ export class PlannerBridge {
         ? `Project ${shortProjectId(board.projectId)} done with ${failed} failure${failed === 1 ? "" : "s"} (${done}/${board.tasks.length} done).`
         : `Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`;
       const statusDump = formatStatus(board, attachedSessions.has(orchestratorSessionId), orchestratorSessionId);
-      const summary = `${headline}\n\n${statusDump}`;
+      const findings = formatCompletionFindings(board);
+      const pointer = findings
+        ? `\n\n(Call \`get_findings\` for the structured list — taskId, category, follow-ups, notes, verified_diff.)`
+        : "";
+      const summary = findings
+        ? `${headline}\n\n${statusDump}\n\n${findings}${pointer}`
+        : `${headline}\n\n${statusDump}`;
       if (!resolveHeldTurn(orchestratorSessionId, {
         reason: failed > 0 ? "failed" : "complete",
         text: summary,
@@ -5538,6 +5544,8 @@ export class PlannerBridge {
           return await this.toolExecute(req.id, sessionId);
         case "get_plan":
           return await this.toolGetPlan(req.id, sessionId);
+        case "get_findings":
+          return await this.toolGetFindings(req.id, sessionId, args);
         case "get_status":
           return await this.toolGetStatus(req.id, sessionId);
         case "add_task":
@@ -5904,6 +5912,85 @@ export class PlannerBridge {
         assignedTo: t.assignedTo,
         artifacts: t.artifacts,
       })),
+    });
+  }
+
+  private async toolGetFindings(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    const resolved = await this.resolveBoardForRead(sessionId);
+    if (!resolved) {
+      return this.replyMcpResult(reqId, "No project on this session.", {
+        hasProject: false,
+        findings: [],
+      });
+    }
+    const { board, ownerSessionId, viaFork } = resolved;
+    const taskId =
+      typeof args?.taskId === "string" && args.taskId.length > 0
+        ? args.taskId
+        : undefined;
+    const includeApproved = args?.includeApproved === true;
+    if (taskId && !board.tasks.some((t) => t.id === taskId)) {
+      return this.replyMcpResult(
+        reqId,
+        `No task '${taskId}' on project ${shortProjectId(board.projectId)}.`,
+        {
+          hasProject: true,
+          projectId: board.projectId,
+          findings: [],
+          unknownTaskId: taskId,
+        },
+      );
+    }
+    const findings = collectFindings(board, { taskId, includeApproved });
+    const failed = findings.filter((f) => f.category === "failed").length;
+    const reviewIssues = findings.filter((f) =>
+      f.category === "review_reject" ||
+        f.category === "review_amend" ||
+        f.category === "review_fix",
+    ).length;
+    const followUps = findings.filter((f) => f.category === "follow_ups").length;
+    const forkNote = viaFork
+      ? ` (read-only: viewing parent session ${shortSessionId(ownerSessionId)})`
+      : "";
+    const headline =
+      findings.length === 0
+        ? `No findings on project ${shortProjectId(board.projectId)}${forkNote}.`
+        : `${findings.length} finding${findings.length === 1 ? "" : "s"} on project ${shortProjectId(board.projectId)}${forkNote}: ${[
+            failed ? `${failed} failed` : null,
+            reviewIssues ? `${reviewIssues} review issue${reviewIssues === 1 ? "" : "s"}` : null,
+            followUps ? `${followUps} with follow-ups` : null,
+          ].filter(Boolean).join(", ")}.`;
+    const text =
+      findings.length === 0
+        ? headline
+        : `${headline}\n${findings
+            .map(
+              (f) =>
+                `  - ${f.taskId} [${f.category}] ${f.title}${
+                  f.followUps.length > 0
+                    ? ` (${f.followUps.length} follow-up${f.followUps.length === 1 ? "" : "s"})`
+                    : ""
+                }`,
+            )
+            .join("\n")}`;
+    this.replyMcpResult(reqId, text, {
+      hasProject: true,
+      projectId: board.projectId,
+      state: board.state,
+      ownerSessionId,
+      viewedFromFork: viaFork,
+      readOnly: viaFork,
+      counts: {
+        total: findings.length,
+        failed,
+        reviewIssues,
+        followUps,
+      },
+      findings,
     });
   }
 

@@ -51,6 +51,14 @@ Workflow:
      per-task corrections, or stop / pause / resume to control \
      execution overall.
 
+  7. After a project completes (or if the user asks about review \
+     failures, follow-ups, or what came up in a finished task), \
+     call get_findings to retrieve the structured list of tasks \
+     that need attention — failed tasks, reviews that didn't \
+     approve, and follow-ups recorded by work tasks. The \
+     project-complete summary mentions get_findings when there's \
+     something to surface; reach for it then.
+
 User-stated preferences (worker count, preferred agent/model, \
 specific overrides for particular tasks) MUST be embedded in your \
 set_plan call exactly as specified — concurrencyCap for \
@@ -231,6 +239,26 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     inputSchema: {
       type: "object",
       properties: {},
+    },
+  },
+  {
+    name: "get_findings",
+    description:
+      "Return the structured list of tasks that need attention — failed tasks, reviews that rejected/amended/required fixes, and completed tasks that captured follow_ups. Use this after a project completes (or any time during a run) when the user asks to address review failures, fix what came up, or read the reviewer's notes. Each finding includes the taskId, a category (failed | review_reject | review_amend | review_fix | follow_ups), summary, untruncated notes, follow-ups, and verified_diff when available. Pass taskId to drill into one specific task. Pass includeApproved=true to also list approved reviews (audit / debugging only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: {
+          type: "string",
+          description:
+            "Optional. Restrict the result to one task id (e.g. 'T8'). When set, returns either that task's finding or an empty list if it has none.",
+        },
+        includeApproved: {
+          type: "boolean",
+          description:
+            "Optional. Default false. When true, also include approve/winner/synthesize review tasks in the result (otherwise they are filtered as nothing-to-do).",
+        },
+      },
     },
   },
   {

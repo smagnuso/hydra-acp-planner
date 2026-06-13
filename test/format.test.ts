@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatBoardContext, formatSessionsTable, formatStatus } from "../src/format.ts";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionsTable, formatStatus } from "../src/format.ts";
 import type { Board, Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -289,5 +289,218 @@ describe("formatSessionsTable", () => {
       undefined,
     );
     assert.match(out, /code-claude·opus/);
+  });
+});
+
+describe("formatCompletionFindings", () => {
+  it("returns empty string when nothing to surface", () => {
+    const out = formatCompletionFindings(
+      board({
+        tasks: [
+          task("T1", { status: "done", artifacts: { summary: "did the thing" } }),
+        ],
+      }),
+    );
+    assert.equal(out, "");
+  });
+
+  it("surfaces work-task follow_ups (the T8-style hand-rolled review case)", () => {
+    const out = formatCompletionFindings(
+      board({
+        tasks: [
+          task("T8", {
+            title: "Final code review",
+            status: "done",
+            artifacts: {
+              summary: "2 failures found; 24 checks pass",
+              follow_ups: [
+                "missing success message at agent-auth.ts:48",
+                "WS not closed on error path at agent-auth.ts:198-207",
+              ],
+            },
+          }),
+        ],
+      }),
+    );
+    assert.match(out, /^Findings:/);
+    assert.match(out, /T8 {2}Final code review/);
+    assert.match(out, /2 failures found/);
+    assert.match(out, /agent-auth\.ts:48/);
+    assert.match(out, /agent-auth\.ts:198-207/);
+  });
+
+  it("surfaces review-kind tasks with non-approve decisions, including notes", () => {
+    const out = formatCompletionFindings(
+      board({
+        tasks: [
+          task("review-T3", {
+            kind: "review",
+            reviews: "T3",
+            status: "done",
+            artifacts: {
+              summary: "reject",
+              ...({ review_decision: "reject", notes: "spec says X but diff shows Y" } as object),
+            },
+          }),
+        ],
+      }),
+    );
+    assert.match(out, /\[reject\] review-T3/);
+    assert.match(out, /spec says X but diff shows Y/);
+  });
+
+  it("omits approved review-kind tasks", () => {
+    const out = formatCompletionFindings(
+      board({
+        tasks: [
+          task("review-T1", {
+            kind: "review",
+            reviews: "T1",
+            status: "done",
+            artifacts: {
+              summary: "approve",
+              ...({ review_decision: "approve", notes: "lgtm" } as object),
+            },
+          }),
+        ],
+      }),
+    );
+    assert.equal(out, "");
+  });
+
+  it("surfaces failed tasks with their summary", () => {
+    const out = formatCompletionFindings(
+      board({
+        tasks: [
+          task("T4", {
+            status: "failed",
+            artifacts: { summary: "compile error in foo.ts" },
+          }),
+        ],
+      }),
+    );
+    assert.match(out, /\[!\] T4/);
+    assert.match(out, /compile error in foo\.ts/);
+  });
+});
+
+describe("collectFindings", () => {
+  it("returns empty list for a clean board", () => {
+    const out = collectFindings(
+      board({
+        tasks: [task("T1", { status: "done", artifacts: { summary: "ok" } })],
+      }),
+    );
+    assert.deepEqual(out, []);
+  });
+
+  it("categorizes a failed task as 'failed'", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("T1", { status: "failed", artifacts: { summary: "boom" } }),
+        ],
+      }),
+    );
+    assert.equal(out.length, 1);
+    assert.equal(out[0].category, "failed");
+    assert.equal(out[0].summary, "boom");
+    assert.equal(out[0].kind, "work");
+  });
+
+  it("categorizes review reject/amend/fix decisions correctly", () => {
+    const mk = (id: string, decision: string): Task =>
+      task(id, {
+        kind: "review",
+        reviews: id.replace("review-", ""),
+        status: "done",
+        artifacts: {
+          summary: decision,
+          ...({ review_decision: decision, notes: `notes-${decision}` } as object),
+        },
+      });
+    const out = collectFindings(
+      board({
+        tasks: [mk("review-T1", "reject"), mk("review-T2", "amend"), mk("review-T3", "fix")],
+      }),
+    );
+    assert.equal(out.length, 3);
+    assert.equal(out[0].category, "review_reject");
+    assert.equal(out[1].category, "review_amend");
+    assert.equal(out[2].category, "review_fix");
+    for (const f of out) {
+      assert.equal(f.kind, "review");
+      assert.ok(f.notes && f.notes.startsWith("notes-"));
+    }
+  });
+
+  it("omits approve/winner/synthesize unless includeApproved=true", () => {
+    const tasks: Task[] = [
+      task("review-T1", {
+        kind: "review",
+        reviews: "T1",
+        status: "done",
+        artifacts: {
+          summary: "approve",
+          ...({ review_decision: "approve", notes: "lgtm" } as object),
+        },
+      }),
+    ];
+    assert.equal(collectFindings(board({ tasks })).length, 0);
+    const withApproved = collectFindings(board({ tasks }), { includeApproved: true });
+    assert.equal(withApproved.length, 1);
+    assert.equal(withApproved[0].decision, "approve");
+  });
+
+  it("surfaces work-task follow_ups", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("T8", {
+            title: "Final code review",
+            status: "done",
+            artifacts: {
+              summary: "2 failures",
+              follow_ups: ["fix:48", "fix:198-207"],
+            },
+          }),
+        ],
+      }),
+    );
+    assert.equal(out.length, 1);
+    assert.equal(out[0].category, "follow_ups");
+    assert.deepEqual(out[0].followUps, ["fix:48", "fix:198-207"]);
+  });
+
+  it("filters by taskId when provided", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("T1", { status: "failed", artifacts: { summary: "x" } }),
+          task("T2", { status: "failed", artifacts: { summary: "y" } }),
+        ],
+      }),
+      { taskId: "T2" },
+    );
+    assert.equal(out.length, 1);
+    assert.equal(out[0].taskId, "T2");
+  });
+
+  it("includes verified_diff when present", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("T1", {
+            status: "failed",
+            artifacts: {
+              summary: "x",
+              verified_diff: { files: ["a.ts"], hunkCount: 2, sample: "..." },
+            },
+          }),
+        ],
+      }),
+    );
+    assert.equal(out[0].verifiedDiff?.files[0], "a.ts");
+    assert.equal(out[0].verifiedDiff?.hunkCount, 2);
   });
 });
