@@ -54,7 +54,7 @@ import {
   extractUsageUpdate,
   updateKind,
 } from "./util/text.js";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatStatus, totalUsage } from "./format.js";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatStatus, totalUsage, truncateNotes } from "./format.js";
 import {
   buildAsciiPlanEnvelope,
   buildPlanUpdateEnvelope,
@@ -6419,19 +6419,56 @@ export class PlannerBridge {
             reviewIssues ? `${reviewIssues} review issue${reviewIssues === 1 ? "" : "s"}` : null,
             followUps ? `${followUps} with follow-ups` : null,
           ].filter(Boolean).join(", ")}.`;
-    const text =
-      findings.length === 0
-        ? headline
-        : `${headline}\n${findings
-            .map(
-              (f) =>
-                `  - ${f.taskId} [${f.category}] ${f.title}${
-                  f.followUps.length > 0
-                    ? ` (${f.followUps.length} follow-up${f.followUps.length === 1 ? "" : "s"})`
-                    : ""
-                }`,
-            )
-            .join("\n")}`;
+    let text: string;
+    if (findings.length === 0) {
+      text = headline;
+    } else if (taskId) {
+      const blocks: string[] = [];
+      for (const f of findings) {
+        const statusSuffix = f.status === "failed" ? " (failed)" : "";
+        const lines = [
+          `=== ${f.taskId} [${f.category}] ${f.title}${statusSuffix}`,
+        ];
+        if (f.decision) {
+          lines.push(`decision: ${f.decision}`);
+        }
+        if (f.summary) {
+          lines.push(`summary: ${truncateNotes(f.summary)}`);
+        }
+        if (f.notes) {
+          const indented = truncateNotes(f.notes).split("\n").join("\n  ");
+          lines.push(`notes:\n  ${indented}`);
+        }
+        if (f.followUps.length > 0) {
+          const fuLines = f.followUps.map((fu) => `  - ${fu}`).join("\n");
+          lines.push(`follow_ups:\n${fuLines}`);
+        }
+        if (f.verifiedDiff) {
+          const vd = f.verifiedDiff;
+          const fileCount = vd.files.length;
+          const sampleFile = vd.files[0] ?? "n/a";
+          lines.push(
+            `verified_diff: ${fileCount} file(s), ${vd.hunkCount} hunk(s) (sample: ${sampleFile})`,
+          );
+        }
+        blocks.push(lines.join("\n"));
+      }
+      text = `${headline}\n${blocks.join("\n\n")}`;
+    } else {
+      const bullets = findings
+        .map(
+          (f) =>
+            `  - ${f.taskId} [${f.category}] ${f.title}${
+              f.followUps.length > 0
+                ? ` (${f.followUps.length} follow-up${f.followUps.length === 1 ? "" : "s"})`
+                : ""
+            }`,
+        )
+        .join("\n");
+      const footer =
+        `\n\n(Call get_findings({taskId: "Tx"}) for the full notes, follow-ups, and verified_diff on any task above.)`;
+      text = `${headline}\n${bullets}${footer}`;
+    }
     this.replyMcpResult(reqId, text, {
       hasProject: true,
       projectId: board.projectId,

@@ -273,7 +273,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "get_findings",
     description:
-      "Return the structured list of tasks that need attention — failed tasks, reviews that rejected/amended/required fixes, and completed tasks that captured follow_ups. Use this after a project completes (or any time during a run) when the user asks to address review failures, fix what came up, or read the reviewer's notes. Each finding includes the taskId, a category (failed | review_reject | review_amend | review_fix | follow_ups), summary, untruncated notes, follow-ups, and verified_diff when available. Pass taskId to drill into one specific task. Pass includeApproved=true to also list approved reviews (audit / debugging only).",
+      "Return the structured list of tasks that need attention — failed tasks, reviews that rejected/amended/required fixes, and completed tasks that captured follow_ups. Use this after a project completes (or any time during a run) when the user asks to address review failures, fix what came up, or read the reviewer's notes. Each finding includes the taskId, a category (failed | review_reject | review_amend | review_fix | follow_ups), summary, notes, follow-ups, and verified_diff when available. Two-call pattern: call with no args to list findings, then call again with `taskId` set to get the full notes and follow-ups for a specific task in content[0].text. Pass includeApproved=true to also list approved reviews (audit / debugging only).",
     inputSchema: {
       type: "object",
       properties: {

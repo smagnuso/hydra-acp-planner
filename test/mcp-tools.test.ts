@@ -804,6 +804,150 @@ describe("get_findings", () => {
     assert.equal(result.structuredContent.findings[0]!.taskId, "T2");
   });
 
+  it("appends drill-down footer to list-all text when there are findings", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        { id: "T1", title: "broke", status: "failed", artifacts: { summary: "x" } },
+      ],
+    });
+    dispatch(mkInvoke(70, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /get_findings\(\{taskId:/);
+    assert.match(result.content[0]!.text, /taskId/);
+  });
+
+  it("does not append footer when there are no findings", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [{ id: "T1", title: "t", status: "done", artifacts: { summary: "ok" } }],
+    });
+    dispatch(mkInvoke(71, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /No findings/);
+    assert.doesNotMatch(result.content[0]!.text, /get_findings\(\{taskId:/);
+  });
+
+  it("inlines notes and follow-ups when taskId is set", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "did stuff",
+            ...({
+              notes: "line one\nline two of notes",
+              follow_ups: ["fix:foo.ts:10", "investigate bar"],
+            } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkInvoke(72, "get_findings", { taskId: "T1" }));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: { findings: Array<{ taskId: string; notes: string | null }> };
+    };
+    const text = result.content[0]!.text;
+    assert.match(text, /=== T1/);
+    assert.match(text, /line one/);
+    assert.match(text, /line two of notes/);
+    assert.match(text, /- fix:foo\.ts:10/);
+    assert.match(text, /- investigate bar/);
+    // structuredContent regression guard
+    assert.equal(result.structuredContent.findings.length, 1);
+    assert.equal(result.structuredContent.findings[0]!.notes, "line one\nline two of notes");
+  });
+
+  it("includes decision string when drilling into a review task", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "review-T1",
+          title: "Review of T1",
+          status: "done",
+          kind: "review",
+          reviews: "T1",
+          artifacts: {
+            summary: "rejected",
+            ...({ review_decision: "reject", notes: "bad" } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkInvoke(73, "get_findings", { taskId: "review-T1" }));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /decision: reject/);
+  });
+
+  it("renders verified_diff as a one-line descriptor without the sample text", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "ok",
+            ...({
+              follow_ups: ["something"],
+              verified_diff: {
+                files: ["src/foo.ts", "src/bar.ts"],
+                hunkCount: 5,
+                sample: "VERY_LONG_DIFF_SAMPLE_TEXT_SHOULD_NOT_APPEAR",
+              },
+            } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkInvoke(74, "get_findings", { taskId: "T1" }));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    const text = result.content[0]!.text;
+    assert.match(text, /verified_diff: 2 file\(s\), 5 hunk\(s\)/);
+    assert.match(text, /sample: src\/foo\.ts/);
+    assert.doesNotMatch(text, /VERY_LONG_DIFF_SAMPLE_TEXT/);
+  });
+
+  it("truncates very long notes with the ellipsis pattern", async () => {
+    const longNotes = "x".repeat(2000);
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "ok",
+            ...({ notes: longNotes, follow_ups: ["a"] } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkInvoke(75, "get_findings", { taskId: "T1" }));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /…/);
+    assert.ok(!result.content[0]!.text.includes("x".repeat(1000)));
+  });
+
   it("reports unknown taskId cleanly", async () => {
     seedBoard("hydra_session_test", {
       state: "done",

@@ -670,12 +670,16 @@ export function collectFindings(
 
 // Render the findings list as plain text for the project-complete
 // summary. Returns "" when nothing surfaces.
+export const NOTES_MAX = 600;
+
+export function truncateNotes(s: string): string {
+  return s.length > NOTES_MAX ? `${s.slice(0, NOTES_MAX)}…` : s;
+}
+
 export function formatCompletionFindings(board: Board): string {
   const findings = collectFindings(board);
   if (findings.length === 0) return "";
-  const NOTES_MAX = 600;
-  const truncate = (s: string): string =>
-    s.length > NOTES_MAX ? `${s.slice(0, NOTES_MAX)}…` : s;
+  const truncate = truncateNotes;
   const sections: string[] = [];
   for (const f of findings) {
     const tag =
