@@ -17,6 +17,8 @@ import {
   pickEligible,
   resolveAgent,
   resolveModel,
+  resolveReviewLane,
+  resolveTaskLane,
   saveBoard,
   shortProjectId,
   shortSessionId,
@@ -944,6 +946,110 @@ describe("distill kind (T1 schema groundwork)", () => {
     };
     assert.equal(resolveAgent(distillTask, board), "reviewer-agent");
     assert.equal(resolveModel(distillTask, board), "reviewer-model");
+  });
+
+  const mkDistill = (overrides: Partial<Task> = {}): Task => ({
+    id: "R1d",
+    title: "distill R1",
+    deps: [],
+    agent: null,
+    model: null,
+    status: "pending",
+    assignedTo: null,
+    attemptCount: 0,
+    artifacts: null,
+    startedAt: null,
+    finishedAt: null,
+    kind: "distill",
+    reviews: ["T1", "T2"],
+    distillOf: "R1",
+    ...overrides,
+  });
+
+  it("resolveTaskLane: distill with no config → worker default", () => {
+    const board = newBoard({ description: "x" });
+    const r = resolveTaskLane(mkDistill(), board, "distill");
+    assert.deepEqual(r, { lane: "worker", reason: "default" });
+  });
+
+  it("resolveTaskLane: distill with task.runOn='orchestrator' → explicit-task", () => {
+    const board = newBoard({ description: "x" });
+    const r = resolveTaskLane(mkDistill({ runOn: "orchestrator" }), board, "distill");
+    assert.deepEqual(r, { lane: "orchestrator", reason: "explicit-task" });
+  });
+
+  it("resolveTaskLane: distill with fleetDefaults.distill.runOn='orchestrator' → explicit-fleet", () => {
+    const board = newBoard({
+      description: "x",
+      fleetDefaults: { agent: null, model: null, distill: { runOn: "orchestrator" } },
+    });
+    const r = resolveTaskLane(mkDistill(), board, "distill");
+    assert.deepEqual(r, { lane: "orchestrator", reason: "explicit-fleet" });
+  });
+
+  it("resolveTaskLane: distill with fleetDefaults.distill.agent='X' → worker, configured-agent", () => {
+    const board = newBoard({
+      description: "x",
+      fleetDefaults: { agent: null, model: null, distill: { agent: "X" } },
+    });
+    const r = resolveTaskLane(mkDistill(), board, "distill");
+    assert.deepEqual(r, { lane: "worker", reason: "configured-agent" });
+  });
+
+  it("resolveTaskLane: distill falls through to fleetDefaults.review.runOn when distill bucket absent", () => {
+    const board = newBoard({
+      description: "x",
+      fleetDefaults: { agent: null, model: null, review: { runOn: "orchestrator" } },
+    });
+    const r = resolveTaskLane(mkDistill(), board, "distill");
+    assert.deepEqual(r, { lane: "orchestrator", reason: "explicit-fleet" });
+  });
+
+  it("resolveReviewLane wrapper preserves existing review behavior (defaults to orchestrator)", () => {
+    const board = newBoard({ description: "x" });
+    const review: Task = {
+      id: "R1",
+      title: "review T1",
+      deps: ["T1"],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "review",
+    };
+    assert.deepEqual(resolveReviewLane(review, board), { lane: "orchestrator", reason: "default" });
+    assert.deepEqual(
+      resolveReviewLane({ ...review, runOn: "worker" }, board),
+      { lane: "worker", reason: "explicit-task" },
+    );
+    const boardCfg = newBoard({
+      description: "x",
+      fleetDefaults: { agent: null, model: null, review: { agent: "rev-agent" } },
+    });
+    assert.deepEqual(
+      resolveReviewLane(review, boardCfg),
+      { lane: "worker", reason: "configured-agent" },
+    );
+  });
+
+  it("parseFleetDefaultsFromObject reads distill.runOn", () => {
+    const fd = parseFleetDefaultsFromObject({
+      distill: { runOn: "orchestrator" },
+    });
+    assert.deepEqual(fd.distill, { runOn: "orchestrator" });
+    const fd2 = parseFleetDefaultsFromObject({
+      distill: { agent: "d", model: "m", runOn: "worker" },
+    });
+    assert.deepEqual(fd2.distill, { agent: "d", model: "m", runOn: "worker" });
+    // bad runOn dropped, other fields preserved
+    const fd3 = parseFleetDefaultsFromObject({
+      distill: { agent: "d", runOn: "nonsense" },
+    });
+    assert.deepEqual(fd3.distill, { agent: "d" });
   });
 
   it("rejects decomposer output containing kind='distill'", () => {

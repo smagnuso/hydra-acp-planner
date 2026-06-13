@@ -88,6 +88,7 @@ import {
   resolveAgent,
   resolveModel,
   resolveReviewLane,
+  resolveTaskLane,
   resolveRunOn,
   saveBoard,
   setBoardState,
@@ -2320,11 +2321,12 @@ export class PlannerBridge {
     let reviewRunOn: "orchestrator" | "worker" | undefined;
     let distillAgent: string | undefined;
     let distillModel: string | undefined;
+    let distillRunOn: "orchestrator" | "worker" | undefined;
     let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
     let overrideHint: boolean | undefined;
     let compete = false;
     const attachPaths: string[] = [];
-    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|distill-agent|distill-model|compete|attach)\s+(\S+)\s*/;
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|distill-agent|distill-model|distill-run-on|compete|attach)\s+(\S+)\s*/;
     while (true) {
       const m = descRemaining.match(flagRe);
       if (!m) break;
@@ -2357,6 +2359,10 @@ export class PlannerBridge {
         distillAgent = value;
       } else if (key === "distill-model") {
         distillModel = value;
+      } else if (key === "distill-run-on") {
+        if (value === "worker" || value === "orchestrator") {
+          distillRunOn = value as "orchestrator" | "worker";
+        }
       } else if (key === "override-hint") {
         overrideHint = value === "true";
       } else if (key === "compete") {
@@ -2373,7 +2379,7 @@ export class PlannerBridge {
     }
     if (!descRemaining) {
       this.client.reply(reqId, {
-        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--distill-agent ID] [--distill-model ID] [--attach <path>]... <description>`",
+        text: "planner create: missing description (only flags were provided). Usage: `/hydra planner create [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--distill-agent ID] [--distill-model ID] [--distill-run-on orchestrator|worker] [--attach <path>]... <description>`",
       });
       return;
     }
@@ -2414,10 +2420,11 @@ export class PlannerBridge {
       if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
       if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
     }
-    if (distillAgent !== undefined || distillModel !== undefined) {
+    if (distillAgent !== undefined || distillModel !== undefined || distillRunOn !== undefined) {
       boardFleetDefaults.distill = {};
       if (distillAgent !== undefined) boardFleetDefaults.distill.agent = distillAgent;
       if (distillModel !== undefined) boardFleetDefaults.distill.model = distillModel;
+      if (distillRunOn !== undefined) boardFleetDefaults.distill.runOn = distillRunOn;
     }
 
     const board = newBoard({
@@ -2710,11 +2717,12 @@ export class PlannerBridge {
     let reviewRunOn: "orchestrator" | "worker" | undefined;
     let distillAgent: string | undefined;
     let distillModel: string | undefined;
+    let distillRunOn: "orchestrator" | "worker" | undefined;
     let reviewPolicyMode: "off" | "hints" | "all" | "high-only" | undefined;
     let overrideHint: boolean | undefined;
     let compete = false;
     const attachPaths: string[] = [];
-    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|distill-agent|distill-model|compete|attach)\s+(\S+)\s*/;
+    const flagRe = /^--(workers|agent|model|review-policy|override-hint|work-agent|work-model|review-agent|review-model|review-run-on|distill-agent|distill-model|distill-run-on|compete|attach)\s+(\S+)\s*/;
     while (true) {
       const m = argsRemaining.match(flagRe);
       if (!m) break;
@@ -2747,6 +2755,10 @@ export class PlannerBridge {
         distillAgent = value;
       } else if (key === "distill-model") {
         distillModel = value;
+      } else if (key === "distill-run-on") {
+        if (value === "worker" || value === "orchestrator") {
+          distillRunOn = value as "orchestrator" | "worker";
+        }
       } else if (key === "override-hint") {
         overrideHint = value === "true";
       } else if (key === "compete") {
@@ -2763,7 +2775,7 @@ export class PlannerBridge {
     }
     if (argsRemaining.trim().length > 0) {
       this.client.reply(reqId, {
-        text: `planner start: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner start [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--distill-agent ID] [--distill-model ID] [--attach <path>]...\` (no description — uses the conversation).`,
+        text: `planner start: unexpected trailing argument "${argsRemaining.trim()}". Usage: \`/hydra planner start [--workers N] [--agent ID] [--model ID] [--review-policy MODE] [--override-hint true|false] [--compete true|false] [--work-agent ID] [--work-model ID] [--review-agent ID] [--review-model ID] [--review-run-on orchestrator|worker] [--distill-agent ID] [--distill-model ID] [--distill-run-on orchestrator|worker] [--attach <path>]...\` (no description — uses the conversation).`,
       });
       return;
     }
@@ -2804,10 +2816,11 @@ export class PlannerBridge {
       if (reviewModel !== undefined) boardFleetDefaults.review.model = reviewModel;
       if (reviewRunOn !== undefined) boardFleetDefaults.review.runOn = reviewRunOn;
     }
-    if (distillAgent !== undefined || distillModel !== undefined) {
+    if (distillAgent !== undefined || distillModel !== undefined || distillRunOn !== undefined) {
       boardFleetDefaults.distill = {};
       if (distillAgent !== undefined) boardFleetDefaults.distill.agent = distillAgent;
       if (distillModel !== undefined) boardFleetDefaults.distill.model = distillModel;
+      if (distillRunOn !== undefined) boardFleetDefaults.distill.runOn = distillRunOn;
     }
 
     const board = newBoard({
@@ -3820,20 +3833,21 @@ export class PlannerBridge {
       // strands new dependents), the user gets a fresh notification.
       this.blockedNotifiedFor.delete(board.projectId);
 
-// Phase 4a: orchestrator-lane review tasks. Default runOn for
-        // review tasks is "orchestrator"; "worker" is explicit opt-in.
-        // Orchestrator reviews don't count against concurrencyCap and
+// Phase 4a: orchestrator-lane review / distill tasks. Reviews default
+        // to the orchestrator lane; distills default to the worker lane.
+        // Either kind can be pinned via explicit runOn or fleet defaults.
+        // Orchestrator-lane tasks don't count against concurrencyCap and
         // are single-flight (only one at a time on the host session).
         //
-        // Smart routing: resolveReviewLane sends reviews to the worker
-        // lane whenever a review-targeted agent/model is configured (so
-        // the configured values are actually honored), and defaults to
-        // the orchestrator lane otherwise. Explicit runOn always wins.
-        if (task.kind === "review") {
-          const { lane, reason } = resolveReviewLane(task, board);
+        // Smart routing: resolveTaskLane sends tasks to the worker lane
+        // whenever a kind-targeted agent/model is configured (so the
+        // configured values are actually honored). Explicit runOn always
+        // wins.
+        if (task.kind === "review" || task.kind === "distill") {
+          const { lane, reason } = resolveTaskLane(task, board, task.kind);
           if (reason === "configured-agent" || reason === "configured-model") {
             log.info(
-              `review ${task.id}: routing to worker lane (${reason}) — configured ${reason === "configured-agent" ? "agent" : "model"} only takes effect on worker lane`,
+              `${task.kind} ${task.id}: routing to worker lane (${reason}) — configured ${reason === "configured-agent" ? "agent" : "model"} only takes effect on worker lane`,
             );
           }
           const runOn = lane;
@@ -4899,6 +4913,13 @@ export class PlannerBridge {
       return;
     }
 
+    // Intentionally leave runOn UNSET so resolveTaskLane can derive the
+    // lane at dispatch time from fleetDefaults.distill.runOn (falling
+    // through to .review.runOn) and per-task/fleet agent/model. Hard-
+    // coding runOn here would short-circuit the "configured-agent" /
+    // "configured-model" rules and silently strand the user's
+    // configured distill agent/model on a lane that doesn't honor them.
+    // Mirrors review-policy.ts:82.
     const distill: Task = {
       id: distillId,
       title: `distill ${reviewTask.id}`,

@@ -167,10 +167,11 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
             distill: {
               type: "object",
               description:
-                "Optional. Defaults applied only to bridge-synthesized kind='distill' tasks. Falls through to fleetDefaults.review.{agent,model} per-field when unset.",
+                "Optional. Defaults applied only to bridge-synthesized kind='distill' tasks. Falls through to fleetDefaults.review.{agent,model,runOn} per-field when unset. runOn pins the lane (orchestrator|worker); without it the bridge picks a lane from agent/model presence (defaulting to worker for distill).",
               properties: {
                 agent: { type: "string" },
                 model: { type: "string" },
+                runOn: { type: "string", enum: ["orchestrator", "worker"] },
               },
             },
           },

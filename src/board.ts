@@ -150,7 +150,7 @@ export interface FleetDefaults {
   // — same lane, same default expertise unless explicitly overridden).
   // Resolved at dispatch time, not at config load, so a later change
   // to fleetDefaults.review propagates without re-saving distill tasks.
-  distill?: { agent?: string; model?: string };
+  distill?: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" };
 }
 
 // Resolution chain:
@@ -208,46 +208,75 @@ export function resolveRunOn(task: Task, fleetDefaults: FleetDefaults): "orchest
   return "orchestrator";
 }
 
-// Decide where a review task should actually run.
+// Decide where a review or distill task should actually run.
 //
 // Rules, in priority order:
 //   1. Explicit task.runOn → honored.
-//   2. Explicit fleetDefaults.review.runOn → honored.
-//   3. Any configured review agent or model (per-task OR in
-//      fleetDefaults.review/.agent/.model) → worker lane. The configured
-//      values are only honored on the worker lane; orchestrator-lane
-//      reviews run on the host session with the host's agent/model.
-//      Treating any explicit config as "use worker" makes the configured
-//      values a hard contract instead of "use them only if they happen
-//      to match the host" (which would silently change behavior any
-//      time the host model changes).
-//   4. Default → orchestrator lane.
+//   2. Explicit fleetDefaults.<kind>.runOn → honored. For kind='distill',
+//      this falls through to fleetDefaults.review.runOn when distill
+//      doesn't carry one (matches how agent/model fall through — distill
+//      inherits review defaults unless explicitly overridden).
+//   3. Any configured kind-specific agent or model (per-task OR in
+//      fleetDefaults.<kind>.{agent,model}, with distill falling through
+//      to review.{agent,model}) → worker lane. The configured values are
+//      only honored on the worker lane; orchestrator-lane runs use the
+//      host session's agent/model. Treating any explicit config as "use
+//      worker" makes the configured values a hard contract instead of
+//      "use them only if they happen to match the host" (which would
+//      silently change behavior any time the host model changes).
+//   4. Default → orchestrator lane for kind='review', worker lane for
+//      kind='distill'. Distill defaults to worker because its job is
+//      structured-output generation over potentially-large candidate
+//      diffs; the host session is more valuable for interactive work.
+//      Reviews default to orchestrator because they're often fast and
+//      the host already has context.
 //
 // Returns: { lane, reason } so callers can log/explain the routing.
-export function resolveReviewLane(
+export function resolveTaskLane(
   task: Task,
   board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null; orchestratorModel?: string | null },
+  kind: "review" | "distill",
 ): { lane: "orchestrator" | "worker"; reason: "explicit-task" | "explicit-fleet" | "configured-agent" | "configured-model" | "default" } {
   if (task.runOn) {
     return { lane: task.runOn, reason: "explicit-task" };
   }
-  if (board.fleetDefaults.review?.runOn) {
-    return { lane: board.fleetDefaults.review.runOn, reason: "explicit-fleet" };
+  const fleet = board.fleetDefaults;
+  const fleetRunOn =
+    kind === "review"
+      ? fleet.review?.runOn
+      : (fleet.distill?.runOn ?? fleet.review?.runOn);
+  if (fleetRunOn) {
+    return { lane: fleetRunOn, reason: "explicit-fleet" };
   }
-  // Any review-specific or per-task agent/model configuration → worker
-  // lane. We only consult sources that meaningfully target reviews:
-  // per-task overrides, fleetDefaults.review.{agent,model}. We do NOT
-  // consult fleetDefaults.{agent,model} (the global default that
-  // applies to work tasks too) — those are not review-targeted.
-  const reviewAgent = task.agent ?? board.fleetDefaults.review?.agent;
-  const reviewModel = task.model ?? board.fleetDefaults.review?.model;
-  if (reviewAgent) {
+  // Kind-specific configured agent/model bumps to worker lane. For
+  // distill, fall through to fleetDefaults.review.{agent,model} to
+  // mirror resolveAgent/resolveModel's chain.
+  const kindAgent =
+    kind === "review"
+      ? fleet.review?.agent
+      : (fleet.distill?.agent ?? fleet.review?.agent);
+  const kindModel =
+    kind === "review"
+      ? fleet.review?.model
+      : (fleet.distill?.model ?? fleet.review?.model);
+  const cfgAgent = task.agent ?? kindAgent;
+  const cfgModel = task.model ?? kindModel;
+  if (cfgAgent) {
     return { lane: "worker", reason: "configured-agent" };
   }
-  if (reviewModel) {
+  if (cfgModel) {
     return { lane: "worker", reason: "configured-model" };
   }
-  return { lane: "orchestrator", reason: "default" };
+  return { lane: kind === "distill" ? "worker" : "orchestrator", reason: "default" };
+}
+
+// Thin wrapper preserved for existing callers; delegates to
+// resolveTaskLane with kind='review'.
+export function resolveReviewLane(
+  task: Task,
+  board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null; orchestratorModel?: string | null },
+): { lane: "orchestrator" | "worker"; reason: "explicit-task" | "explicit-fleet" | "configured-agent" | "configured-model" | "default" } {
+  return resolveTaskLane(task, board, "review");
 }
 
 // Project-level attachments supplied by the user at create/start
@@ -535,10 +564,15 @@ export function parseFleetDefaultsFromObject(raw: unknown): FleetDefaults {
   // materialize the bucket here when the user explicitly set it.
   if (r.distill && typeof r.distill === "object" && !Array.isArray(r.distill)) {
     const d = r.distill as Record<string, unknown>;
-    const bucket: { agent?: string; model?: string } = {};
+    const bucket: { agent?: string; model?: string; runOn?: "orchestrator" | "worker" } = {};
     if (typeof d.agent === "string") bucket.agent = d.agent;
     if (typeof d.model === "string") bucket.model = d.model;
-    if (bucket.agent !== undefined || bucket.model !== undefined) fd.distill = bucket;
+    if (typeof d.runOn === "string" && (d.runOn === "orchestrator" || d.runOn === "worker")) {
+      bucket.runOn = d.runOn;
+    }
+    if (bucket.agent !== undefined || bucket.model !== undefined || bucket.runOn !== undefined) {
+      fd.distill = bucket;
+    }
   }
   return fd;
 }

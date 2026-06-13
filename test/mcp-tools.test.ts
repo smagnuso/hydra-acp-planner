@@ -318,6 +318,26 @@ describe("set_plan", () => {
     assert.equal(result.structuredContent.projectId, board!.projectId);
   });
 
+  it("fleetDefaults schema accepts distill.runOn and persists it on the board", async () => {
+    dispatch(
+      mkInvoke(231, "set_plan", {
+        description: "distill runOn",
+        tasks: [{ id: "T1", title: "t", deps: [] }],
+        fleetDefaults: {
+          distill: { agent: "d", model: "m", runOn: "orchestrator" },
+        },
+      }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test");
+    assert.ok(board);
+    assert.deepEqual(board!.fleetDefaults.distill, {
+      agent: "d",
+      model: "m",
+      runOn: "orchestrator",
+    });
+  });
+
   it("seeds orchestratorAgent/Model from fetchSessionInfo at board-create time", async () => {
     const localClient = new FakeClient();
     const localBridge = new PlannerBridge({

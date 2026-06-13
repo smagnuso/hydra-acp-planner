@@ -11,7 +11,7 @@ import {
   clientAttachedSessions,
   type BridgeClient,
 } from "../src/bridge.ts";
-import { newBoard, saveBoard, pickEligible, type Board, type Task } from "../src/board.ts";
+import { newBoard, saveBoard, pickEligible, resolveTaskLane, type Board, type Task } from "../src/board.ts";
 import {
   setWorkerState,
   registerWorker,
@@ -456,5 +456,19 @@ describe("distill integration — max attempts", () => {
     assert.deepEqual(t1After.reviewFeedback, [expected]);
     assert.deepEqual(t2After.reviewFeedback, [expected]);
     assert.equal(distillAfter.status, "failed");
+  });
+});
+
+describe("distill integration — lane resolution at dispatch", () => {
+  it("distill with no agent/model and no runOn config resolves to worker default", () => {
+    const board = newBoard({ description: "lane defaults" });
+    const distill = distillTask("R1d", ["T1", "T2"], "R1", {
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+    });
+    const { lane, reason } = resolveTaskLane(distill, board, "distill");
+    assert.equal(lane, "worker");
+    assert.equal(reason, "default");
   });
 });
