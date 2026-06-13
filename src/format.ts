@@ -676,6 +676,98 @@ export function truncateNotes(s: string): string {
   return s.length > NOTES_MAX ? `${s.slice(0, NOTES_MAX)}…` : s;
 }
 
+// Render a single finding as the multi-line block used by both the
+// get_findings MCP drill-down (content[0].text) and the
+// /hydra planner findings <taskId> slash command. Shape is stable —
+// both surfaces depend on it.
+export function formatFindingBlock(f: Finding): string {
+  const statusSuffix = f.status === "failed" ? " (failed)" : "";
+  const lines = [
+    `=== ${f.taskId} [${f.category}] ${f.title}${statusSuffix}`,
+  ];
+  if (f.decision) {
+    lines.push(`decision: ${f.decision}`);
+  }
+  if (f.summary) {
+    lines.push(`summary: ${truncateNotes(f.summary)}`);
+  }
+  if (f.notes) {
+    const indented = truncateNotes(f.notes).split("\n").join("\n  ");
+    lines.push(`notes:\n  ${indented}`);
+  }
+  if (f.followUps.length > 0) {
+    const fuLines = f.followUps.map((fu) => `  - ${fu}`).join("\n");
+    lines.push(`follow_ups:\n${fuLines}`);
+  }
+  if (f.verifiedDiff) {
+    const vd = f.verifiedDiff;
+    const fileCount = vd.files.length;
+    const sampleFile = vd.files[0] ?? "n/a";
+    lines.push(
+      `verified_diff: ${fileCount} file(s), ${vd.hunkCount} hunk(s) (sample: ${sampleFile})`,
+    );
+  }
+  return lines.join("\n");
+}
+
+export interface FindingsListCounts {
+  total: number;
+  failed: number;
+  reviewIssues: number;
+  followUps: number;
+  distill: number;
+}
+
+export function countFindings(findings: Finding[]): FindingsListCounts {
+  const failed = findings.filter((f) => f.category === "failed").length;
+  const reviewIssues = findings.filter(
+    (f) =>
+      f.category === "review_reject" ||
+      f.category === "review_amend" ||
+      f.category === "review_fix",
+  ).length;
+  const followUps = findings.filter((f) => f.category === "follow_ups").length;
+  const distill = findings.filter((f) => f.category === "distill").length;
+  return { total: findings.length, failed, reviewIssues, followUps, distill };
+}
+
+// Build the headline used by both the get_findings MCP text and the
+// /hydra planner findings slash command. `forkNote` is appended after
+// the projectId for cross-session reads.
+export function formatFindingsHeadline(
+  board: Board,
+  findings: Finding[],
+  forkNote = "",
+): string {
+  const c = countFindings(findings);
+  if (findings.length === 0) {
+    return `No findings on project ${shortProjectId(board.projectId)}${forkNote}.`;
+  }
+  const parts = [
+    c.failed ? `${c.failed} failed` : null,
+    c.reviewIssues
+      ? `${c.reviewIssues} review issue${c.reviewIssues === 1 ? "" : "s"}`
+      : null,
+    c.followUps ? `${c.followUps} with follow-ups` : null,
+  ].filter(Boolean).join(", ");
+  return `${findings.length} finding${findings.length === 1 ? "" : "s"} on project ${shortProjectId(board.projectId)}${forkNote}: ${parts}.`;
+}
+
+// One-line bullet per finding for the list-all view. No footer —
+// callers append a context-specific drill-down hint.
+export function formatFindingsBullets(findings: Finding[]): string {
+  return findings
+    .map(
+      (f) =>
+        `  - ${f.taskId} [${f.category}] ${f.title}${
+          f.followUps.length > 0
+            ? ` (${f.followUps.length} follow-up${f.followUps.length === 1 ? "" : "s"})`
+            : ""
+        }`,
+    )
+    .join("\n");
+}
+
 export function formatCompletionFindings(board: Board): string {
   const findings = collectFindings(board);
   if (findings.length === 0) return "";

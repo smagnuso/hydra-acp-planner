@@ -966,6 +966,158 @@ describe("get_findings", () => {
   });
 });
 
+// ── /hydra planner findings (slash command) ────────────────
+
+function mkSlash(
+  id: number,
+  verb: string,
+  args = "",
+  sessionId = "hydra_session_test",
+) {
+  return {
+    jsonrpc: "2.0" as const,
+    id,
+    method: "hydra-acp/commands/invoke",
+    params: { sessionId, verb, args },
+  };
+}
+
+describe("/hydra planner findings", () => {
+  it("emits the clean-finish message when the board has no findings", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [{ id: "T1", title: "t", status: "done", artifacts: { summary: "ok" } }],
+    });
+    dispatch(mkSlash(200, "findings"));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { text: string }).text;
+    assert.match(text, /No findings on project/);
+    assert.match(text, /finished cleanly/);
+  });
+
+  it("emits the human-readable summary when findings exist", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        { id: "T1", title: "broke", status: "failed", artifacts: { summary: "compile error" } },
+        {
+          id: "T2",
+          title: "code review",
+          status: "done",
+          artifacts: { summary: "ok", follow_ups: ["fix:48", "fix:198"] },
+        },
+      ],
+    });
+    dispatch(mkSlash(201, "findings"));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { text: string }).text;
+    assert.match(text, /2 findings on project/);
+    assert.match(text, /- T1 \[failed\] broke/);
+    assert.match(text, /- T2 \[follow_ups\] code review \(2 follow-ups\)/);
+    assert.match(text, /\/hydra planner findings <taskId>/);
+    assert.doesNotMatch(text, /get_findings/);
+  });
+
+  it("renders the full per-task block when given a valid taskId", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "did stuff",
+            ...({
+              notes: "line one\nline two of notes",
+              follow_ups: ["fix:foo.ts:10", "investigate bar"],
+            } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkSlash(202, "findings", "T1"));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { text: string }).text;
+    assert.match(text, /=== T1 \[follow_ups\] work/);
+    assert.match(text, /line one/);
+    assert.match(text, /line two of notes/);
+    assert.match(text, /- fix:foo\.ts:10/);
+    assert.match(text, /- investigate bar/);
+  });
+
+  it("emits the no-finding error for an unknown taskId", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [{ id: "T1", title: "a", status: "done", artifacts: { summary: "ok" } }],
+    });
+    dispatch(mkSlash(203, "findings", "T99"));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { text: string }).text;
+    assert.match(text, /no finding for task T99/);
+    assert.match(text, /\/hydra planner status/);
+  });
+
+  it("emits the no-finding error for a known taskId that didn't surface", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        { id: "T1", title: "ok task", status: "done", artifacts: { summary: "ok" } },
+      ],
+    });
+    dispatch(mkSlash(204, "findings", "T1"));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { text: string }).text;
+    assert.match(text, /no finding for task T1/);
+  });
+
+  it("tells the user to start a project when no board exists", async () => {
+    dispatch(mkSlash(205, "findings"));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { text: string }).text;
+    assert.match(text, /No plan in this session/);
+  });
+});
+
+// ── get_findings text-shape regression guard ───────────────
+
+describe("get_findings text-shape (regression guard)", () => {
+  it("keeps the per-task drill-down block format stable", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        {
+          id: "T1",
+          title: "work",
+          status: "done",
+          artifacts: {
+            summary: "did stuff",
+            ...({
+              notes: "n1\nn2",
+              follow_ups: ["a", "b"],
+              verified_diff: { files: ["src/foo.ts"], hunkCount: 1, sample: "" },
+            } as object),
+          },
+        },
+      ],
+    });
+    dispatch(mkInvoke(300, "get_findings", { taskId: "T1" }));
+    await settle();
+    const r = client.lastReply();
+    const text = (r.result as { content: Array<{ text: string }> }).content[0]!.text;
+    assert.match(text, /=== T1 \[follow_ups\] work/);
+    assert.match(text, /notes:\n  n1\n  n2/);
+    assert.match(text, /follow_ups:\n  - a\n  - b/);
+    assert.match(text, /verified_diff: 1 file\(s\), 1 hunk\(s\) \(sample: src\/foo\.ts\)/);
+  });
+});
+
 // ── get_status ─────────────────────────────────────────────
 
 describe("get_status", () => {

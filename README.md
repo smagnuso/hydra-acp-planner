@@ -346,6 +346,7 @@ agent calls the equivalent MCP tools (next subsection).
 | `/hydra planner create [flags] <description>` | Form a plan from `<description>` and stop — no workers spawned. Iterate by re-running `create`; commit with `start`. |
 | `/hydra planner start [flags]` | Run the current ready plan. If no plan exists, decompose from conversation and run in one step. |
 | `/hydra planner status` | One-shot snapshot of the current session's board. |
+| `/hydra planner findings [<taskId>]` | Human-readable view of failures, review verdicts that asked for fixes, and worker-captured follow-ups. With no arg shows everything; with a taskId shows the full block for that task. |
 | `/hydra planner continue` | Open the live view on this session's running project. |
 | `/hydra planner add <description>` | Slot a new task into the current project. |
 | `/hydra planner retry [<taskId>]` | Reset a task to pending and resume work. No arg = retry all failed tasks. |

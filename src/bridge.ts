@@ -54,7 +54,7 @@ import {
   extractUsageUpdate,
   updateKind,
 } from "./util/text.js";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatStatus, totalUsage, truncateNotes } from "./format.js";
+import { collectFindings, countFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatFindingsBullets, formatFindingsHeadline, formatStatus, totalUsage } from "./format.js";
 import {
   buildAsciiPlanEnvelope,
   buildPlanUpdateEnvelope,
@@ -258,6 +258,11 @@ const COMMANDS = [
   {
     verb: "list",
     description: "List planner projects across all sessions. Shows projectId, state, task counts, age, and description — useful for finding a project to fork or attach to.",
+  },
+  {
+    verb: "findings",
+    argsHint: "[<taskId>]",
+    description: "Human-readable view of failures, review verdicts that asked for fixes, and worker-captured follow-ups. With no arg shows everything; with a taskId shows the full block for that task. Read-only; safe on running, done, failed, or stopped projects.",
   },
   {
     verb: "fork",
@@ -1111,6 +1116,17 @@ export class PlannerBridge {
     }
     if (verb === "list") {
       this.handleList(req.id);
+      return;
+    }
+    if (verb === "findings") {
+      void this.handleFindings(req.id, sessionId, args)
+        .catch((err) => {
+          log.error(`handleFindings threw: ${(err as Error).message}`);
+          this.client.reply(req.id, {
+            text: `Internal error: ${(err as Error).message}`,
+          });
+        })
+        .finally(() => this.clearPendingDispatch(messageId));
       return;
     }
     if (verb === "fork") {
@@ -2025,6 +2041,63 @@ export class PlannerBridge {
     this.client.reply(reqId, {
       text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
     });
+  }
+
+  // `/hydra planner findings [<taskId>]` — human-facing render of the
+  // same finding shape the get_findings MCP tool returns. Read-only;
+  // safe in any board state (running/done/failed/stopped). With no
+  // arg, renders headline + one bullet per finding. With a taskId,
+  // renders the full per-finding block (notes, follow-ups,
+  // verified_diff descriptor, review decision). Uses the same
+  // formatters as get_findings so the two surfaces stay aligned.
+  private async handleFindings(
+    reqId: number | string,
+    sessionId: string,
+    args: string,
+  ): Promise<void> {
+    const resolved = await this.resolveBoardForRead(sessionId);
+    if (!resolved) {
+      this.client.reply(reqId, {
+        text: "No plan in this session yet. Start one with `/hydra planner create <description>`.",
+      });
+      return;
+    }
+    const { board, ownerSessionId, viaFork } = resolved;
+    const taskId = args.length > 0 ? args.split(/\s+/)[0] : undefined;
+    if (taskId && !board.tasks.some((t) => t.id === taskId)) {
+      this.client.reply(reqId, {
+        text: `no finding for task ${taskId} (it may not have surfaced — check \`/hydra planner status\`).`,
+      });
+      return;
+    }
+    const findings = collectFindings(board, taskId ? { taskId } : {});
+    const forkNote = viaFork
+      ? ` (read-only: viewing parent session ${shortSessionId(ownerSessionId)})`
+      : "";
+    if (findings.length === 0) {
+      if (taskId) {
+        this.client.reply(reqId, {
+          text: `no finding for task ${taskId} (it may not have surfaced — check \`/hydra planner status\`).`,
+        });
+        return;
+      }
+      this.client.reply(reqId, {
+        text: `No findings on project ${shortProjectId(board.projectId)}${forkNote}. The project finished cleanly.`,
+      });
+      return;
+    }
+    const headline = formatFindingsHeadline(board, findings, forkNote);
+    let text: string;
+    if (taskId) {
+      const blocks = findings.map(formatFindingBlock);
+      text = `${headline}\n${blocks.join("\n\n")}`;
+    } else {
+      const bullets = formatFindingsBullets(findings);
+      const footer =
+        `\n\n(Run \`/hydra planner findings <taskId>\` to drill into one.)`;
+      text = `${headline}\n${bullets}${footer}`;
+    }
+    this.client.reply(reqId, { text });
   }
 
   // `/hydra planner list` — scan the projects dir and emit a compact
@@ -3792,7 +3865,7 @@ export class PlannerBridge {
       const statusDump = formatStatus(board, attachedSessions.has(orchestratorSessionId), orchestratorSessionId);
       const findings = formatCompletionFindings(board);
       const pointer = findings
-        ? `\n\n(Call \`get_findings\` for the structured list — taskId, category, follow-ups, notes, verified_diff.)`
+        ? `\n\n(Run \`/hydra planner findings\` for a human-readable summary, or \`/hydra planner findings <taskId>\` to drill into one.)`
         : "";
       const summary = findings
         ? `${headline}\n\n${statusDump}\n\n${findings}${pointer}`
@@ -6400,71 +6473,19 @@ export class PlannerBridge {
       );
     }
     const findings = collectFindings(board, { taskId, includeApproved });
-    const failed = findings.filter((f) => f.category === "failed").length;
-    const reviewIssues = findings.filter((f) =>
-      f.category === "review_reject" ||
-        f.category === "review_amend" ||
-        f.category === "review_fix",
-    ).length;
-    const followUps = findings.filter((f) => f.category === "follow_ups").length;
-    const distill = findings.filter((f) => f.category === "distill").length;
+    const counts = countFindings(findings);
     const forkNote = viaFork
       ? ` (read-only: viewing parent session ${shortSessionId(ownerSessionId)})`
       : "";
-    const headline =
-      findings.length === 0
-        ? `No findings on project ${shortProjectId(board.projectId)}${forkNote}.`
-        : `${findings.length} finding${findings.length === 1 ? "" : "s"} on project ${shortProjectId(board.projectId)}${forkNote}: ${[
-            failed ? `${failed} failed` : null,
-            reviewIssues ? `${reviewIssues} review issue${reviewIssues === 1 ? "" : "s"}` : null,
-            followUps ? `${followUps} with follow-ups` : null,
-          ].filter(Boolean).join(", ")}.`;
+    const headline = formatFindingsHeadline(board, findings, forkNote);
     let text: string;
     if (findings.length === 0) {
       text = headline;
     } else if (taskId) {
-      const blocks: string[] = [];
-      for (const f of findings) {
-        const statusSuffix = f.status === "failed" ? " (failed)" : "";
-        const lines = [
-          `=== ${f.taskId} [${f.category}] ${f.title}${statusSuffix}`,
-        ];
-        if (f.decision) {
-          lines.push(`decision: ${f.decision}`);
-        }
-        if (f.summary) {
-          lines.push(`summary: ${truncateNotes(f.summary)}`);
-        }
-        if (f.notes) {
-          const indented = truncateNotes(f.notes).split("\n").join("\n  ");
-          lines.push(`notes:\n  ${indented}`);
-        }
-        if (f.followUps.length > 0) {
-          const fuLines = f.followUps.map((fu) => `  - ${fu}`).join("\n");
-          lines.push(`follow_ups:\n${fuLines}`);
-        }
-        if (f.verifiedDiff) {
-          const vd = f.verifiedDiff;
-          const fileCount = vd.files.length;
-          const sampleFile = vd.files[0] ?? "n/a";
-          lines.push(
-            `verified_diff: ${fileCount} file(s), ${vd.hunkCount} hunk(s) (sample: ${sampleFile})`,
-          );
-        }
-        blocks.push(lines.join("\n"));
-      }
+      const blocks = findings.map(formatFindingBlock);
       text = `${headline}\n${blocks.join("\n\n")}`;
     } else {
-      const bullets = findings
-        .map(
-          (f) =>
-            `  - ${f.taskId} [${f.category}] ${f.title}${
-              f.followUps.length > 0
-                ? ` (${f.followUps.length} follow-up${f.followUps.length === 1 ? "" : "s"})`
-                : ""
-            }`,
-        )
-        .join("\n");
+      const bullets = formatFindingsBullets(findings);
       const footer =
         `\n\n(Call get_findings({taskId: "Tx"}) for the full notes, follow-ups, and verified_diff on any task above.)`;
       text = `${headline}\n${bullets}${footer}`;
@@ -6477,11 +6498,11 @@ export class PlannerBridge {
       viewedFromFork: viaFork,
       readOnly: viaFork,
       counts: {
-        total: findings.length,
-        failed,
-        reviewIssues,
-        followUps,
-        distill,
+        total: counts.total,
+        failed: counts.failed,
+        reviewIssues: counts.reviewIssues,
+        followUps: counts.followUps,
+        distill: counts.distill,
       },
       findings,
     });
