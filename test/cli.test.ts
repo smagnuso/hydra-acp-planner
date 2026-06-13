@@ -11,6 +11,7 @@ const bin = resolve(here, "..", "dist", "index.js");
 interface BoardOpts {
   state: "running" | "done" | "failed";
   withFinding?: boolean;
+  withRichFinding?: boolean;
 }
 
 function makeBoard(projId: string, opts: BoardOpts): Record<string, unknown> {
@@ -24,6 +25,26 @@ function makeBoard(projId: string, opts: BoardOpts): Record<string, unknown> {
       attemptCount: 1,
       kind: "work",
       artifacts: { summary: "it broke because of X" },
+    });
+  }
+  if (opts.withRichFinding) {
+    tasks.push({
+      id: "t2",
+      title: "rich task",
+      deps: [],
+      status: "failed",
+      attemptCount: 2,
+      kind: "work",
+      artifacts: {
+        summary: "rich summary line",
+        notes: "DETAILED_NOTE_TOKEN about failure",
+        follow_ups: ["FOLLOWUP_TOKEN_A", "FOLLOWUP_TOKEN_B"],
+        verified_diff: {
+          files: ["src/a.ts", "src/b.ts"],
+          hunkCount: 5,
+          sample: "diff --git a/src/a.ts b/src/a.ts\n+SAMPLE_DIFF_TEXT_SHOULD_NOT_APPEAR",
+        },
+      },
     });
   }
   return {
@@ -67,7 +88,23 @@ describe("hydra-acp-planner info: findings on terminal-state boards", () => {
     assert.ok(statusIdx >= 0, "status body present");
     assert.ok(findIdx > statusIdx, `findings block must appear after status body. stdout:\n${r.stdout}`);
     assert.match(r.stdout, /t1/);
-    assert.match(r.stdout, /\/hydra planner findings/);
+    assert.doesNotMatch(r.stdout, /\/hydra planner findings/);
+    assert.match(r.stdout, /## Findings/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("state=done with rich finding: inlines notes, follow-ups, verified_diff descriptor", () => {
+    const { home, projId } = setupBoard("rich", { state: "done", withRichFinding: true });
+    const r = runInfo(home, projId);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /## Findings/);
+    assert.match(r.stdout, /=== t2 \[failed\] rich task/);
+    assert.match(r.stdout, /DETAILED_NOTE_TOKEN/);
+    assert.match(r.stdout, /FOLLOWUP_TOKEN_A/);
+    assert.match(r.stdout, /FOLLOWUP_TOKEN_B/);
+    assert.match(r.stdout, /verified_diff: 2 file\(s\), 5 hunk\(s\)/);
+    assert.doesNotMatch(r.stdout, /SAMPLE_DIFF_TEXT_SHOULD_NOT_APPEAR/);
+    assert.doesNotMatch(r.stdout, /\/hydra planner findings/);
     rmSync(home, { recursive: true, force: true });
   });
 

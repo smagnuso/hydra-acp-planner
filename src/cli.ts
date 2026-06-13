@@ -17,8 +17,7 @@ import {
 } from "./board.js";
 import {
   collectFindings,
-  formatFindingsBullets,
-  formatFindingsHeadline,
+  formatFindingBlock,
   formatStatusBody,
 } from "./format.js";
 import { orchestratorPointerPath, projectDir } from "./paths.js";
@@ -197,11 +196,8 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
           : "No findings recorded — project failed without per-task feedback.";
       process.stdout.write(msg + "\n");
     } else {
-      const headline = formatFindingsHeadline(board, findings, "");
-      const bullets = formatFindingsBullets(findings);
-      const footer =
-        "\n\n(Run `/hydra planner findings <taskId>` to drill into one.)";
-      process.stdout.write(`${headline}\n${bullets}${footer}\n`);
+      const blocks = findings.map(formatFindingBlock).join("\n\n");
+      process.stdout.write(`\n## Findings\n\n${blocks}\n`);
     }
   }
 }
