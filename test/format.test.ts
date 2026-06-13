@@ -312,6 +312,101 @@ describe("formatStatus", () => {
     assert.doesNotMatch(out, /Distilled from/);
   });
 
+  it("renders a multi-reviewee review as a peer of its reviewees, after the last one", () => {
+    const out = formatStatus(
+      board({
+        tasks: [
+          task("T1", { status: "awaiting_review" }),
+          task("T2", { status: "awaiting_review" }),
+          task("T3", { status: "awaiting_review" }),
+          task("T4", { kind: "review", reviews: ["T1", "T2", "T3"], status: "pending" }),
+        ],
+      }),
+      true,
+    );
+    const lines = out.split("\n");
+    const idxT3 = lines.findIndex((l) => /\bT3\b\s+Task T3/.test(l));
+    const idxT4 = lines.findIndex((l) => /\bT4\b\s+Task T4/.test(l));
+    assert.ok(idxT3 >= 0 && idxT4 >= 0, "T3 and T4 should both render");
+    assert.ok(idxT4 > idxT3, `T4 (line ${idxT4}) must render after T3 (line ${idxT3})`);
+    // Peer indent: same leading whitespace as a work task line (3 spaces before glyph).
+    assert.match(lines[idxT4]!, /^   \[ \] T4\s+Task T4.*reviewees: \[T1, T2, T3\]$/);
+    assert.match(lines[idxT3]!, /^   \[\*\] T3\s+Task T3/);
+  });
+
+  it("renders a multi-source distill task at peer level with 'Distilled from' annotation", () => {
+    const out = formatStatus(
+      board({
+        tasks: [
+          task("T1", { status: "done" }),
+          task("T2", { status: "done" }),
+          task("T3", { status: "done" }),
+          task("T4", {
+            kind: "distill",
+            reviews: ["T1", "T2", "T3"],
+            distillOf: "T2",
+            status: "done",
+          }),
+        ],
+      }),
+      true,
+    );
+    const lines = out.split("\n");
+    const idxT3 = lines.findIndex((l) => /\bT3\b\s+Task T3/.test(l));
+    const idxT4 = lines.findIndex((l) => /\bT4\b\s+Task T4/.test(l));
+    assert.ok(idxT4 > idxT3, "distill must render after last reviewee");
+    assert.match(lines[idxT4]!, /^   \[x\] T4\s+Task T4.*Distilled from T1, T2, T3$/);
+  });
+
+  it("keeps single-reviewee synthesized reviews nested under their reviewee", () => {
+    const out = formatStatus(
+      board({
+        tasks: [
+          task("T1", { status: "awaiting_review" }),
+          task("review-T1", {
+            title: "Review T1",
+            kind: "review",
+            reviews: "T1",
+            status: "pending",
+          }),
+        ],
+      }),
+      true,
+    );
+    const lines = out.split("\n");
+    const idxT1 = lines.findIndex((l) => /\bT1\b\s+Task T1/.test(l));
+    const idxR = lines.findIndex((l) => /review-T1/.test(l));
+    assert.ok(idxR > idxT1, "review renders after its parent");
+    // Nested indent: 4 spaces before glyph.
+    assert.match(lines[idxR]!, /^    \[ \] review-T1\s+Review T1/);
+    assert.doesNotMatch(lines[idxR]!, /reviewees:/);
+  });
+
+  it("coexists: single-reviewee reviews nest while multi-reviewee referees render at peer level", () => {
+    const out = formatStatus(
+      board({
+        tasks: [
+          task("T1", { status: "awaiting_review" }),
+          task("review-T1", { kind: "review", reviews: "T1", status: "pending" }),
+          task("T2", { status: "awaiting_review" }),
+          task("T3", { status: "awaiting_review" }),
+          task("Tref", {
+            title: "Referee",
+            kind: "review",
+            reviews: ["T2", "T3"],
+            status: "pending",
+          }),
+        ],
+      }),
+      true,
+    );
+    const lines = out.split("\n");
+    const idxNested = lines.findIndex((l) => /review-T1/.test(l));
+    const idxPeer = lines.findIndex((l) => /Tref\b/.test(l));
+    assert.match(lines[idxNested]!, /^    \[ \] review-T1/);
+    assert.match(lines[idxPeer]!, /^   \[ \] Tref\s+Referee.*reviewees: \[T2, T3\]$/);
+  });
+
   it("places the Planner line before task list when no Sessions table", () => {
     const out = formatStatus(
       board({ tasks: [task("T1", { status: "pending" })] }),

@@ -2,7 +2,12 @@
 // no daemon calls — so they're directly unit-testable.
 
 import { resolveAgent, resolveModel, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
-import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
+import {
+  buildReviewsByParent,
+  isMultiRevieweeReview,
+  renderReviewTask,
+  reviewTargetsOf,
+} from "./render-reviews.js";
 
 // Format a cost amount with the worker's reported currency. Falls back
 // to a bare numeric when no currency is known; treats "USD" specially
@@ -443,14 +448,32 @@ export function formatStatusBody(
 
   const reviewsByParent = buildReviewsByParent(board.tasks);
   const renderedReviews = new Set<string>();
+  const renderedTaskIds = new Set<string>();
+  const pendingPeerReviews: Task[] = [];
+
+  const flushPendingPeers = () => {
+    for (let i = pendingPeerReviews.length - 1; i >= 0; i--) {
+      const t = pendingPeerReviews[i];
+      if (!t) continue;
+      const targets = reviewTargetsOf(t);
+      if (targets.every((id) => renderedTaskIds.has(id))) {
+        const line = renderReviewTask(t, renderedReviews, {
+          indent: "   ",
+          renderTaskTag: (x) => formatTaskTag(x, board),
+        });
+        if (line) lines.push(line);
+        pendingPeerReviews.splice(i, 1);
+      }
+    }
+  };
 
   for (const task of board.tasks) {
     if (task.kind === "review" || task.kind === "distill") {
-      const line = renderReviewTask(task, renderedReviews, {
-        indent: "    ",
-        renderTaskTag: (t) => formatTaskTag(t, board),
-      });
-      if (line) lines.push(line);
+      if (isMultiRevieweeReview(task)) {
+        pendingPeerReviews.push(task);
+        flushPendingPeers();
+      }
+      // single-reviewee reviews render nested under their parent (below)
       continue;
     }
     const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
@@ -463,6 +486,7 @@ export function formatStatusBody(
     const dur = formatTaskDuration(task);
     const durStr = dur ? `  (${dur})` : "";
     lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}${durStr}`);
+    renderedTaskIds.add(task.id);
     const childReviews = reviewsByParent.get(task.id);
     if (childReviews) {
       for (const r of childReviews) {
@@ -473,6 +497,16 @@ export function formatStatusBody(
         if (line) lines.push(line);
       }
     }
+    flushPendingPeers();
+  }
+  // Any peer reviews whose reviewees never rendered (missing targets) — emit
+  // at peer indent so they're not lost.
+  for (const t of pendingPeerReviews) {
+    const line = renderReviewTask(t, renderedReviews, {
+      indent: "   ",
+      renderTaskTag: (x) => formatTaskTag(x, board),
+    });
+    if (line) lines.push(line);
   }
 
   const sessionsTable = formatSessionsTable(board, orchestratorSessionId, {

@@ -23,7 +23,12 @@ import {
 } from "./util/text.js";
 import { shortProjectId } from "./board.js";
 import { formatTaskTag } from "./format.js";
-import { buildReviewsByParent, renderReviewTask } from "./render-reviews.js";
+import {
+  buildReviewsByParent,
+  isMultiRevieweeReview,
+  renderReviewTask,
+  reviewTargetsOf,
+} from "./render-reviews.js";
 
 // Maximum number of a worker's incomplete subtodos to surface in the
 // orchestrator's merged plan panel. Caps growth: 3 workers × this many
@@ -211,14 +216,31 @@ export function buildAsciiPlanText(board: Board): string {
   for (const [wid, w] of Object.entries(board.workers)) {
     if (w.currentTaskId) workerByTask.set(w.currentTaskId, wid);
   }
+  const renderedTaskIds = new Set<string>();
+  const pendingPeerReviews: Task[] = [];
+  const flushPendingPeers = () => {
+    for (let i = pendingPeerReviews.length - 1; i >= 0; i--) {
+      const pt = pendingPeerReviews[i];
+      if (!pt) continue;
+      const targets = reviewTargetsOf(pt);
+      if (targets.every((id) => renderedTaskIds.has(id))) {
+        const line = renderReviewTask(pt, renderedReviews, { indent: "  ", renderTaskTag: tagFor });
+        if (line) lines.push(line);
+        pendingPeerReviews.splice(i, 1);
+      }
+    }
+  };
   for (const t of board.tasks) {
     if (t.kind === "review" || t.kind === "distill") {
-      const line = renderReviewTask(t, renderedReviews, { indent: "    ", renderTaskTag: tagFor });
-      if (line) lines.push(line);
+      if (isMultiRevieweeReview(t)) {
+        pendingPeerReviews.push(t);
+        flushPendingPeers();
+      }
       continue;
     }
     const glyph = STATUS_GLYPH[t.status] ?? "?";
     lines.push(`  ${glyph} ${t.id}  ${t.title}${tagFor(t)}`);
+    renderedTaskIds.add(t.id);
     if (t.status === "assigned") {
       const wid = workerByTask.get(t.id);
       const subtodos = wid ? board.workers[wid]?.subtodos : undefined;
@@ -238,6 +260,11 @@ export function buildAsciiPlanText(board: Board): string {
         if (line) lines.push(line);
       }
     }
+    flushPendingPeers();
+  }
+  for (const pt of pendingPeerReviews) {
+    const line = renderReviewTask(pt, renderedReviews, { indent: "  ", renderTaskTag: tagFor });
+    if (line) lines.push(line);
   }
   return lines.join("\n");
 }

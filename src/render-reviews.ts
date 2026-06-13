@@ -87,7 +87,11 @@ function renderDistillTask(
   return applyStatusStyle(lines.join("\n"), task.status);
 }
 
-// Build a map from parent task id → array of review/distill tasks that target it.
+// Build a map from parent task id → array of single-reviewee review tasks that target it.
+// Only single-reviewee review/distill tasks (the synthesized per-work-task reviews) are
+// registered under a parent — these render NESTED under their reviewee. Multi-reviewee
+// tasks (competition referees, multi-source distills) are NOT children of any single
+// task; callers render them at peer level after all reviewees.
 export function buildReviewsByParent(tasks: Task[]): Map<string, Task[]> {
   const reviewsByParent = new Map<string, Task[]>();
   for (const t of tasks) {
@@ -98,13 +102,35 @@ export function buildReviewsByParent(tasks: Task[]): Map<string, Task[]> {
         : Array.isArray(t.reviews)
           ? t.reviews
           : [];
-    for (const targetId of reviewTargets) {
-      const arr = reviewsByParent.get(targetId) ?? [];
-      arr.push(t);
-      reviewsByParent.set(targetId, arr);
-    }
+    if (reviewTargets.length !== 1) continue;
+    const targetId = reviewTargets[0];
+    if (typeof targetId !== "string") continue;
+    const arr = reviewsByParent.get(targetId) ?? [];
+    arr.push(t);
+    reviewsByParent.set(targetId, arr);
   }
   return reviewsByParent;
+}
+
+// True if a task is a multi-reviewee review or distill (renders at peer level, not nested).
+export function isMultiRevieweeReview(t: Task): boolean {
+  if (t.kind !== "review" && t.kind !== "distill") return false;
+  const targets =
+    typeof t.reviews === "string"
+      ? [t.reviews]
+      : Array.isArray(t.reviews)
+        ? t.reviews
+        : [];
+  return targets.length > 1;
+}
+
+// Reviewee ids for a review/distill task (normalized to string[]).
+export function reviewTargetsOf(t: Task): string[] {
+  return typeof t.reviews === "string"
+    ? [t.reviews]
+    : Array.isArray(t.reviews)
+      ? t.reviews
+      : [];
 }
 
 // Glyph lookup — shared so both callers stay in sync.
