@@ -4106,11 +4106,18 @@ export class PlannerBridge {
     // already flipped to "assigned" at the top of this function;
     // assignedTo was held null until the childSessionId existed.
     task.assignedTo = childSessionId;
+    // effectiveAgent/Model can be null when no override is configured for
+    // this task and no fleet default exists. The spawned worker session
+    // inherits the orchestrator's agent/model in that case (hydra-acp
+    // child_session/spawn behavior), so persist that fallback here so the
+    // sessions table reflects what the worker is actually using.
+    const persistedAgent = effectiveAgent ?? board.orchestratorAgent ?? null;
+    const persistedModel = effectiveModel ?? board.orchestratorModel ?? null;
     board.workers[childSessionId] = {
       currentTaskId: task.id,
       tasksCompleted: [],
-      agent: effectiveAgent,
-      model: effectiveModel,
+      agent: persistedAgent,
+      model: persistedModel,
     };
     saveBoard(board, orchestratorSessionId);
 
