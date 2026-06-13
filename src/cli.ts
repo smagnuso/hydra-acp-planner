@@ -15,7 +15,12 @@ import {
   loadBoard,
   shortProjectId,
 } from "./board.js";
-import { formatStatusBody } from "./format.js";
+import {
+  collectFindings,
+  formatFindingsBullets,
+  formatFindingsHeadline,
+  formatStatusBody,
+} from "./format.js";
 import { orchestratorPointerPath, projectDir } from "./paths.js";
 
 function readVersion(): string {
@@ -177,6 +182,28 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   }
 
   process.stdout.write(formatStatusBody(board, orchestratorSessionId) + "\n");
+
+  // For terminal-state projects (done/failed), append the same findings
+  // block that `/hydra planner findings` emits so `planner info` works
+  // as the post-mortem entry point without re-attaching to the
+  // orchestrator session. Non-terminal states (running/paused/stopped/
+  // ready/decomposing) are unchanged.
+  if (board.state === "done" || board.state === "failed") {
+    const findings = collectFindings(board);
+    if (findings.length === 0) {
+      const msg =
+        board.state === "done"
+          ? "No findings — project finished cleanly."
+          : "No findings recorded — project failed without per-task feedback.";
+      process.stdout.write(msg + "\n");
+    } else {
+      const headline = formatFindingsHeadline(board, findings, "");
+      const bullets = formatFindingsBullets(findings);
+      const footer =
+        "\n\n(Run `/hydra planner findings <taskId>` to drill into one.)";
+      process.stdout.write(`${headline}\n${bullets}${footer}\n`);
+    }
+  }
 }
 
 function runRemove(projectId: string | undefined): void {
