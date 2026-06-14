@@ -197,7 +197,12 @@ export function resolveModel(
         : fleet.work?.model;
   if (kindModel) return kindModel;
   if (fleet.model) return fleet.model;
-  if (board.orchestratorModel) return board.orchestratorModel;
+  // Intentionally no fallback to board.orchestratorModel: a worker
+  // spawned under a different agent has no reason to inherit the
+  // host's model, and orchestrator-lane tasks are rendered with the
+  // {orchestrator} marker rather than a duplicated agent·model tag.
+  // The daemon's per-agent defaultModels (config.json) supplies the
+  // agent-appropriate default at spawn time when this returns null.
   return null;
 }
 

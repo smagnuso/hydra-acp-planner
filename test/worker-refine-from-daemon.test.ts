@@ -176,8 +176,11 @@ describe("worker refine from daemon session info", () => {
     const board = await spawnAndWait(childSessionId);
     const worker = board.workers[childSessionId];
     assert.ok(worker);
+    // Agent still falls back to orchestratorAgent (intentional — mirrors
+    // user's --agent launch flag the daemon doesn't know about).
     assert.equal(worker.agent, "orch-agent");
-    assert.equal(worker.model, "orch-model");
+    // Model does NOT fall back: cross-agent model inheritance is wrong.
+    assert.equal(worker.model, null);
   });
 
   it("treats empty-string agentId/currentModel as no-op", async () => {
@@ -195,7 +198,10 @@ describe("worker refine from daemon session info", () => {
     const worker = board.workers[childSessionId];
     assert.ok(worker);
     assert.equal(worker.agent, "orch-agent");
-    assert.equal(worker.model, "orch-model");
+    // Model: no orchestrator fallback; empty-string refine is a no-op,
+    // so the spawn-time persistedModel (null without a resolved chain)
+    // remains null.
+    assert.equal(worker.model, null);
   });
 
   it("no crash and no write when worker is gone before fetch resolves", async () => {

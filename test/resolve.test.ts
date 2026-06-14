@@ -273,26 +273,30 @@ describe("resolveModel", () => {
     });
   });
 
-  describe("orchestratorModel fallback", () => {
-    it("no task/fleet → falls through to orchestratorModel", () => {
+  // resolveModel deliberately does NOT fall back to orchestratorModel.
+  // Workers spawned under a different agent shouldn't inherit the host
+  // session's model — that's the bug the lane-aware tag rendering and
+  // daemon-side per-agent defaultModels[agentId] together replace.
+  describe("orchestratorModel is not a fallback", () => {
+    it("no task/fleet → null even when orchestratorModel is set", () => {
       const task = makeTask({ id: "O1" });
       const fleet = fd({ orchestratorModel: "orch-model" });
-      assert.equal(resolveModel(task, fleet), "orch-model");
+      assert.equal(resolveModel(task, fleet), null);
     });
 
-    it("fleet.model wins over orchestratorModel", () => {
+    it("fleet.model still wins (and is the only fallback)", () => {
       const task = makeTask({ id: "O2" });
       const fleet = fd({ model: "flat-model", orchestratorModel: "orch-model" });
       assert.equal(resolveModel(task, fleet), "flat-model");
     });
 
-    it("task.model wins over orchestratorModel", () => {
+    it("task.model wins as before", () => {
       const task = makeTask({ id: "O3", model: "task-model" });
       const fleet = fd({ orchestratorModel: "orch-model" });
       assert.equal(resolveModel(task, fleet), "task-model");
     });
 
-    it("no task/fleet/orchestrator → null", () => {
+    it("no task/fleet → null", () => {
       const task = makeTask({ id: "O4" });
       const fleet = fd({});
       assert.equal(resolveModel(task, fleet), null);

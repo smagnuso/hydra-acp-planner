@@ -152,7 +152,7 @@ async function spawnAndGetWorker(
 }
 
 describe("worker persist — orchestrator fallback for agent/model", () => {
-  it("task.agent set, only orchestratorModel for model → persists orchestratorModel", async () => {
+  it("task.agent set, only orchestratorModel for model → model stays null (no cross-agent inheritance)", async () => {
     const childSessionId = "hydra_session_worker_a";
     const { worker } = await spawnAndGetWorker(childSessionId, {
       task: { agent: "X" },
@@ -160,7 +160,10 @@ describe("worker persist — orchestrator fallback for agent/model", () => {
       orchestratorModel: "Y",
     });
     assert.equal(worker.agent, "X");
-    assert.equal(worker.model, "Y");
+    // No orchestratorModel fallback: workers on a different agent don't
+    // inherit the host's model. Daemon's per-agent defaultModels supplies
+    // the right model at spawn.
+    assert.equal(worker.model, null);
   });
 
   it("task.model set, only orchestratorAgent for agent → persists orchestratorAgent", async () => {
@@ -196,7 +199,7 @@ describe("worker persist — orchestrator fallback for agent/model", () => {
     assert.equal(worker.model, null);
   });
 
-  it("formatSessionsTable shows agent·model with orchestrator fallback for model", async () => {
+  it("formatSessionsTable shows agent only (no orch-model fallback) when task has no model", async () => {
     const childSessionId = "hydra_session_worker_e";
     const { board } = await spawnAndGetWorker(childSessionId, {
       task: { agent: "task-agent" },
@@ -205,8 +208,12 @@ describe("worker persist — orchestrator fallback for agent/model", () => {
     });
     const out = formatSessionsTable(board, "hydra_session_test");
     assert.ok(
-      out.includes("task-agent·orch-model"),
-      `expected 'task-agent·orch-model' in output, got:\n${out}`,
+      !out.includes("task-agent·orch-model"),
+      `did not expect orchestrator-model fallback in worker row, got:\n${out}`,
+    );
+    assert.ok(
+      out.includes("task-agent"),
+      `expected worker agent 'task-agent' in output, got:\n${out}`,
     );
   });
 });

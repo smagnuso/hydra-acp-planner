@@ -4285,7 +4285,12 @@ export class PlannerBridge {
     //      actually running on, even when the orchestrator's own
     //      identity was never seeded.
     const persistedAgent = effectiveAgent ?? board.orchestratorAgent ?? null;
-    const persistedModel = effectiveModel ?? seedModel ?? board.orchestratorModel ?? null;
+    // No orchestratorModel fallback: a worker spawned under a different
+    // agent shouldn't inherit the host's model. refineWorkerFromDaemon
+    // overwrites this with the daemon's authoritative session info
+    // once available — until then "unknown" is more honest than
+    // borrowing opus.
+    const persistedModel = effectiveModel ?? seedModel ?? null;
     board.workers[childSessionId] = {
       currentTaskId: task.id,
       tasksCompleted: [],

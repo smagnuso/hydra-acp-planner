@@ -1,7 +1,7 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { resolveAgent, resolveModel, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
+import { resolveAgent, resolveModel, resolveTaskLane, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
 import {
   buildReviewsByParent,
   isMultiRevieweeReview,
@@ -146,13 +146,27 @@ export function wallClockMs(board: Board, now: number = Date.now()): number {
   return Math.max(0, end - start);
 }
 
-// Inline agent/model tag for a task: " {agent}", " {agent·model}",
-// " {model}", or "" when neither can be determined. Resolves the
-// effective values through fleetDefaults so the rendered tag shows the
-// agent/model the task will actually execute with — not just the
-// per-task override. Same shape across the board-context preamble,
-// the /status view, and the plan panel.
+// Inline agent/model tag for a task. Renders one of:
+//   " {orchestrator}"   — task runs inline on the host session
+//                          (review/distill on orchestrator lane). The
+//                          actual agent/model is whatever the
+//                          orchestrator row reports — duplicating it
+//                          here would be noise and would shift if the
+//                          host swaps models mid-session.
+//   " {agent·model}"    — both resolved; worker spawn shape
+//   " {agent}"          — agent resolved, model defers to the agent's
+//                          own default (no orchestrator-model fallback,
+//                          which would falsely advertise opus on every
+//                          worker spawned under a different agent)
+//   " {model}"          — model only
+//   ""                  — nothing to say
 export function formatTaskTag(task: Task, board?: Board): string {
+  if (board && (task.kind === "review" || task.kind === "distill")) {
+    const { lane } = resolveTaskLane(task, board, task.kind);
+    if (lane === "orchestrator") {
+      return " {orchestrator}";
+    }
+  }
   const a = board ? resolveAgent(task, board) : (task.agent ?? null);
   const m = board ? resolveModel(task, board) : (task.model ?? null);
   if (!a && !m) return "";

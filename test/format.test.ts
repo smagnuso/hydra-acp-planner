@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionsTable, formatStatus, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionsTable, formatStatus, formatTaskTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
 import { setBoardState, type Board, type Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -897,5 +897,94 @@ describe("collectFindings", () => {
     );
     assert.equal(out[0].verifiedDiff?.files[0], "a.ts");
     assert.equal(out[0].verifiedDiff?.hunkCount, 2);
+  });
+});
+
+// Tag rendering covers two distinct concerns:
+//   1. Worker-lane tasks: agent/model resolution + the absence of a
+//      cross-agent orchestratorModel fallback (the bug that made every
+//      worker render as the orchestrator's opus).
+//   2. Orchestrator-lane review/distill tasks: the `{orchestrator}`
+//      marker so the user can tell at a glance that the task runs
+//      inline in the host session rather than spawning a fresh one.
+describe("formatTaskTag", () => {
+  it("renders {agent·model} when both resolved", () => {
+    const t = task("T1", { agent: "claude-acp", model: "claude-sonnet-4-5" });
+    assert.equal(formatTaskTag(t, board()), " {claude-acp·claude-sonnet-4-5}");
+  });
+
+  it("renders {agent} when only agent resolved (no orch-model fallback)", () => {
+    const t = task("T2", { agent: "opencode-local" });
+    const b = board({ orchestratorModel: "ncp-anthropic/claude-opus-4-7" });
+    const tag = formatTaskTag(t, b);
+    assert.equal(tag, " {opencode-local}");
+    assert.ok(!tag.includes("opus"), "orchestratorModel must not leak into worker tag");
+  });
+
+  it("renders {model} when only model resolved", () => {
+    const t = task("T3", { model: "claude-sonnet-4-5" });
+    assert.equal(formatTaskTag(t, board()), " {claude-sonnet-4-5}");
+  });
+
+  it("renders empty string when nothing resolves", () => {
+    const t = task("T4");
+    assert.equal(formatTaskTag(t, board()), "");
+  });
+
+  it("orchestrator-lane review renders as {orchestrator}", () => {
+    const t = task("T5", { kind: "review", reviews: "T1" });
+    // No task/fleet agent or model on the review task and no run-on
+    // override → review defaults to the orchestrator lane.
+    const b = board({
+      orchestratorAgent: "opencode-dev",
+      orchestratorModel: "ncp-anthropic/claude-opus-4-7",
+    });
+    assert.equal(formatTaskTag(t, b), " {orchestrator}");
+  });
+
+  it("orchestrator-marker hides the host's agent/model (no duplication)", () => {
+    const t = task("T6", { kind: "review", reviews: "T1" });
+    const b = board({
+      orchestratorAgent: "opencode-dev",
+      orchestratorModel: "ncp-anthropic/claude-opus-4-7",
+    });
+    const tag = formatTaskTag(t, b);
+    assert.ok(!tag.includes("opencode-dev"), "host agent must not appear in orchestrator tag");
+    assert.ok(!tag.includes("opus"), "host model must not appear in orchestrator tag");
+  });
+
+  it("review task with configured agent moves to worker lane and renders the agent", () => {
+    // Per resolveTaskLane: a kind-specific configured agent bumps the
+    // task onto the worker lane. Tag should follow.
+    const t = task("T7", { kind: "review", reviews: "T1", agent: "claude-acp" });
+    const b = board();
+    assert.equal(formatTaskTag(t, b), " {claude-acp}");
+  });
+
+  it("distill defaults to worker lane → renders agent·model, not {orchestrator}", () => {
+    const t = task("T8", { kind: "distill", reviews: ["T1", "T2"], agent: "opencode-dev", model: "x" });
+    const b = board();
+    assert.equal(formatTaskTag(t, b), " {opencode-dev·x}");
+  });
+
+  it("explicit task.runOn=orchestrator overrides worker-lane defaults", () => {
+    // Distill defaults to worker lane, but task.runOn pins it inline.
+    const t = task("T9", { kind: "distill", reviews: ["T1"], runOn: "orchestrator" });
+    const b = board();
+    assert.equal(formatTaskTag(t, b), " {orchestrator}");
+  });
+
+  it("kind='work' is never orchestrator-lane even with no agent/model", () => {
+    const t = task("T10");
+    const b = board({
+      orchestratorAgent: "opencode-dev",
+      orchestratorModel: "ncp-anthropic/claude-opus-4-7",
+    });
+    // Falls through to resolveAgent's orchestratorAgent fallback (still
+    // valid for agent — mirrors user's --agent flag), but no
+    // {orchestrator} marker since work tasks always spawn a worker.
+    const tag = formatTaskTag(t, b);
+    assert.ok(!tag.includes("orchestrator"), "work tasks never get the orchestrator marker");
+    assert.equal(tag, " {opencode-dev}");
   });
 });
