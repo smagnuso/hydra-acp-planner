@@ -157,7 +157,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
             review: {
               type: "object",
               description:
-                "Optional. Defaults applied only to kind='review' tasks. runOn pins the lane (orchestrator|worker); without it the bridge picks a lane from agent/model presence.",
+                "Optional. Defaults applied only to kind='review' tasks. Leave runOn UNSET unless you specifically need to override the inferred lane: when agent or model is set here, the bridge auto-routes the review to a worker so those values take effect; when neither is set, reviews default to the orchestrator lane (inline, fast). Setting runOn='orchestrator' alongside agent or model makes those values dead config — orchestrator-lane tasks run inline in the host session and ignore the configured agent/model. Only set runOn when the desired lane disagrees with the auto-routing.",
               properties: {
                 agent: { type: "string" },
                 model: { type: "string" },
@@ -167,7 +167,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
             distill: {
               type: "object",
               description:
-                "Optional. Defaults applied only to bridge-synthesized kind='distill' tasks. Falls through to fleetDefaults.review.{agent,model,runOn} per-field when unset. runOn pins the lane (orchestrator|worker); without it the bridge picks a lane from agent/model presence (defaulting to worker for distill).",
+                "Optional. Defaults applied only to bridge-synthesized kind='distill' tasks. Falls through to fleetDefaults.review.{agent,model,runOn} per-field when unset. Leave runOn UNSET unless you need to override: distill auto-routes to a worker when any agent/model is configured (here or in review), and defaults to worker even without one. Setting runOn='orchestrator' alongside agent or model strands those values — orchestrator-lane tasks ignore configured agent/model and run inline on the host session.",
               properties: {
                 agent: { type: "string" },
                 model: { type: "string" },
