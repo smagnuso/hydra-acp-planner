@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionsTable, formatStatus } from "../src/format.ts";
-import type { Board, Task } from "../src/board.ts";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionsTable, formatStatus, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
+import { setBoardState, type Board, type Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
   return {
@@ -416,6 +416,78 @@ describe("formatStatus", () => {
     const plannerIdx = lines.findIndex((l) => l.startsWith("   Planner:"));
     const taskLineIdx = lines.findIndex((l) => /\[ \] T1/.test(l));
     assert.ok(plannerIdx < taskLineIdx, `Planner line (line ${plannerIdx}) must appear before task list (line ${taskLineIdx})`);
+  });
+});
+
+describe("orchestratorUsageSincePlan", () => {
+  it("subtracts the plan-creation baseline from current cumulative", () => {
+    const b = board({
+      orchestratorUsage: { costAmount: 0.5, costCurrency: "USD", used: 10000 },
+      orchestratorUsageBaseline: { costAmount: 0.2, costCurrency: "USD", used: 3000 },
+    });
+    const u = orchestratorUsageSincePlan(b);
+    assert.equal(u?.costAmount, 0.3);
+    assert.equal(u?.used, 7000);
+  });
+
+  it("pins to the completion snapshot when terminal, ignoring later cumulative growth", () => {
+    const b = board({
+      state: "done",
+      orchestratorUsageBaseline: { costAmount: 0.2, costCurrency: "USD", used: 3000 },
+      orchestratorUsageAtCompletion: { costAmount: 0.5, costCurrency: "USD", used: 10000 },
+      orchestratorUsage: { costAmount: 0.9, costCurrency: "USD", used: 25000 },
+    });
+    const u = orchestratorUsageSincePlan(b);
+    assert.equal(u?.costAmount, 0.3, "terminal project should not include post-completion cost");
+    assert.equal(u?.used, 7000, "terminal project should not include post-completion tokens");
+  });
+
+  it("uses live cumulative when terminal but no completion snapshot exists (back-compat)", () => {
+    const b = board({
+      state: "done",
+      orchestratorUsageBaseline: { costAmount: 0.2, costCurrency: "USD" },
+      orchestratorUsage: { costAmount: 0.5, costCurrency: "USD" },
+    });
+    const u = orchestratorUsageSincePlan(b);
+    assert.equal(u?.costAmount, 0.3);
+  });
+
+  it("setBoardState snapshots completion usage on running -> done", () => {
+    const b = board({
+      state: "running",
+      orchestratorUsage: { costAmount: 0.4, costCurrency: "USD", used: 8000 },
+    });
+    setBoardState(b, "done");
+    assert.deepEqual(b.orchestratorUsageAtCompletion, { costAmount: 0.4, costCurrency: "USD", used: 8000 });
+
+    b.orchestratorUsage = { costAmount: 0.9, costCurrency: "USD", used: 25000 };
+    assert.equal(b.orchestratorUsageAtCompletion?.costAmount, 0.4, "snapshot must be a copy, not a reference");
+  });
+
+  it("setBoardState clears completion snapshot on terminal -> running (retry/restart)", () => {
+    const b = board({
+      state: "done",
+      orchestratorUsage: { costAmount: 0.4, costCurrency: "USD" },
+      orchestratorUsageAtCompletion: { costAmount: 0.4, costCurrency: "USD" },
+    });
+    setBoardState(b, "running");
+    assert.equal(b.orchestratorUsageAtCompletion, undefined);
+  });
+
+  it("totalUsage does not grow with post-completion orchestrator cost", () => {
+    const b = board({
+      state: "running",
+      orchestratorUsageBaseline: { costAmount: 0.1, costCurrency: "USD", used: 2000 },
+      orchestratorUsage: { costAmount: 0.3, costCurrency: "USD", used: 6000 },
+      workers: { w1: { agent: "x", model: "y", usage: { costAmount: 1.0, costCurrency: "USD", used: 50000 } } as never },
+    });
+    setBoardState(b, "done");
+    const before = totalUsage(b);
+
+    b.orchestratorUsage = { costAmount: 5.0, costCurrency: "USD", used: 200000 };
+    const after = totalUsage(b);
+    assert.equal(after.cost, before.cost, "totalUsage must not change after terminal");
+    assert.equal(after.tokensUsed, before.tokensUsed);
   });
 });
 

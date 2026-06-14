@@ -60,7 +60,10 @@ export function formatTokens(n: number | undefined): string {
 // spent on prior turns. Returns undefined if there's no orchestrator
 // usage to report.
 export function orchestratorUsageSincePlan(board: Board): WorkerUsage | undefined {
-  const u = board.orchestratorUsage;
+  const isTerminal = board.state === "done" || board.state === "failed";
+  const u = isTerminal && board.orchestratorUsageAtCompletion
+    ? board.orchestratorUsageAtCompletion
+    : board.orchestratorUsage;
   if (!u) return undefined;
   const b = board.orchestratorUsageBaseline;
   if (!b) return u;

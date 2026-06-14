@@ -368,6 +368,15 @@ export interface Board {
   // reflect spend accrued after plan creation — excluding whatever the
   // orchestrator session had already spent on prior turns.
   orchestratorUsageBaseline?: WorkerUsage;
+  // Snapshot of the orchestrator session's cumulative usage at the
+  // moment this board transitioned to a terminal state (done/failed).
+  // Used as the upper bound by orchestratorUsageSincePlan when the
+  // board is terminal so post-completion orchestrator activity
+  // (further conversation, subsequent projects in the same MCP
+  // session) doesn't inflate this project's reported cost. Cleared on
+  // transition out of terminal (retry/restart) so the next terminal
+  // entry re-snapshots. Mirrors executionMs / executionStartedAt.
+  orchestratorUsageAtCompletion?: WorkerUsage;
   // Last-observed agent/model on the orchestrator session, captured
   // from session_info_update (agentId under _meta["hydra-acp"]) and
   // current_model_update (currentModel).
@@ -401,6 +410,15 @@ export function setBoardState(board: Board, next: BoardState): void {
   }
   if (next === "running") {
     board.executionStartedAt = nowIso();
+  }
+  const wasTerminal = prev === "done" || prev === "failed";
+  const isTerminal = next === "done" || next === "failed";
+  if (isTerminal && !wasTerminal) {
+    if (board.orchestratorUsage) {
+      board.orchestratorUsageAtCompletion = { ...board.orchestratorUsage };
+    }
+  } else if (!isTerminal && wasTerminal) {
+    board.orchestratorUsageAtCompletion = undefined;
   }
   board.state = next;
 }
