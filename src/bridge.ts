@@ -291,6 +291,14 @@ export interface BridgeOptions {
   fetchSessionInfo?: (
     sessionId: string,
   ) => Promise<import("./util/session-info.js").SessionInfo | undefined>;
+  // Worker-lane floor: when a task resolves to no agent, use this id
+  // instead of letting the daemon inherit the orchestrator's agent.
+  // Orchestrator lane is never touched.
+  defaultAgent?: string;
+  // Per-agent floor model. Sent via _meta["hydra-acp"].model on
+  // child_session/spawn so the worker is born on the floor. The
+  // task's resolved model still wins via post-spawn set_model.
+  defaultModels?: Record<string, string>;
 }
 
 // Track active boards in memory so we don't reload from disk on every
@@ -442,6 +450,11 @@ export class PlannerBridge {
   private fetchSessionInfoOverride:
     | ((sessionId: string) => Promise<import("./util/session-info.js").SessionInfo | undefined>)
     | undefined;
+  // Worker-lane defaults from planner config. Applied in
+  // spawnTaskOnNewWorker as a last-mile floor after the per-task /
+  // fleet-default resolve chain. Never touch the orchestrator lane.
+  private defaultAgent: string | undefined;
+  private defaultModels: Record<string, string> | undefined;
   // Cached list of installed specialist agents, populated lazily on
   // first prompt-building call. Refreshed at startup. Decomposition and
   // add-task prompts splice this in so the planner agent only suggests
@@ -702,6 +715,8 @@ export class PlannerBridge {
     this.daemonToken = opts.token;
     this.fetchDiffOverride = opts.fetchSessionDiff;
     this.fetchSessionInfoOverride = opts.fetchSessionInfo;
+    this.defaultAgent = opts.defaultAgent;
+    this.defaultModels = opts.defaultModels;
     this.client =
       opts.client ??
       new TransformerClient({
@@ -4117,8 +4132,20 @@ export class PlannerBridge {
     // override → kind-specific fleet default → fleet default → null.
     // Declared at function scope so it remains in scope after the spawn
     // try-block, where it's recorded on board.workers below.
-    const effectiveAgent = resolveAgent(task, board);
+    const resolvedAgent = resolveAgent(task, board);
     const effectiveModel = resolveModel(task, board);
+    // Worker-lane floor: when no agent fell out of the resolve chain,
+    // use the planner's configured defaultAgent instead of letting the
+    // daemon inherit the orchestrator's agent. Orchestrator lane never
+    // reaches this path.
+    const effectiveAgent = resolvedAgent ?? this.defaultAgent ?? null;
+    // Seed model = configured floor for whichever agent we'll spawn.
+    // Sent at spawn so the worker is born on the floor; the per-task
+    // effectiveModel still wins via the post-spawn set_model below.
+    const seedModel: string | undefined =
+      effectiveAgent && this.defaultModels
+        ? this.defaultModels[effectiveAgent]
+        : undefined;
 
     // Claim the task SYNCHRONOUSLY before any await. Without this,
     // two concurrent invocations of scheduleEligibleTasks both
@@ -4152,7 +4179,10 @@ export class PlannerBridge {
         // would seed the title — unscannable. Daemon reads this under
         // _meta.hydra-acp.title (same shape as session/new).
         _meta: {
-          "hydra-acp": { title: `${task.id}: ${task.title}` },
+          "hydra-acp": {
+            title: `${task.id}: ${task.title}`,
+            ...(seedModel ? { model: seedModel } : {}),
+          },
         },
       };
       if (effectiveAgent) {
@@ -4255,7 +4285,7 @@ export class PlannerBridge {
     //      actually running on, even when the orchestrator's own
     //      identity was never seeded.
     const persistedAgent = effectiveAgent ?? board.orchestratorAgent ?? null;
-    const persistedModel = effectiveModel ?? board.orchestratorModel ?? null;
+    const persistedModel = effectiveModel ?? seedModel ?? board.orchestratorModel ?? null;
     board.workers[childSessionId] = {
       currentTaskId: task.id,
       tasksCompleted: [],

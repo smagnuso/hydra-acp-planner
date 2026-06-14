@@ -25,6 +25,8 @@ async function runTransformer(): Promise<void> {
   const bridge = new PlannerBridge({
     daemonWsUrl: config.hydraWsUrl,
     token: config.hydraToken,
+    defaultAgent: config.defaultAgent,
+    defaultModels: config.defaultModels,
   });
   bridge.start();
 
