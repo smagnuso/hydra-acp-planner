@@ -47,15 +47,6 @@ function printHelp(): void {
       "  hydra-acp planner --version",
       "  hydra-acp planner --help",
       "",
-      "To start a new project, from inside any hydra-acp session type:",
-      "  /hydra planner create <description>",
-      "",
-      "When invoked by the hydra-acp daemon as a transformer (env var",
-      "HYDRA_ACP_TRANSFORMER_NAME set), this binary runs in transformer",
-      "mode instead — it connects to the daemon over WSS, registers its",
-      "intercepts, and drives orchestration. The user-facing CLI verbs",
-      "are dispatched only when those env vars are absent.",
-      "",
     ].join("\n"),
   );
 }
