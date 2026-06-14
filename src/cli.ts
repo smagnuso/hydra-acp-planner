@@ -14,6 +14,7 @@ import {
   listProjects,
   loadBoard,
   shortProjectId,
+  shortSessionId,
 } from "./board.js";
 import {
   collectFindings,
@@ -104,16 +105,24 @@ function runList(argv: readonly string[]): void {
   // full id can be re-derived from the bare suffix in CLI args.
   const idW = Math.max(10, ...projects.map((p) => shortProjectId(p.projectId).length));
   const stateW = Math.max(8, ...projects.map((p) => p.state.length));
-  const header = `${"PROJECTID".padEnd(idW)}  ${"STATE".padEnd(stateW)}  TASKS  AGE   DESCRIPTION`;
+  // Owning session id (short form). "-" when the orchestrator pointer
+  // file is missing — happens for in-flight imports and very old
+  // projects that predate the pointer.
+  const sessW = Math.max(
+    7,
+    ...projects.map((p) => (p.orchestratorSessionId ? shortSessionId(p.orchestratorSessionId).length : 1)),
+  );
+  const header = `${"PROJECTID".padEnd(idW)}  ${"STATE".padEnd(stateW)}  TASKS  AGE   ${"SESSION".padEnd(sessW)}  DESCRIPTION`;
   process.stdout.write(header + "\n");
   for (const p of projects) {
     const tasks = `${p.tasksDone}/${p.tasksTotal}`.padEnd(5);
     const age = ageString(p.updatedAt).padEnd(5);
+    const sess = (p.orchestratorSessionId ? shortSessionId(p.orchestratorSessionId) : "-").padEnd(sessW);
     const desc = p.description.length > 60
       ? p.description.slice(0, 57) + "..."
       : p.description;
     process.stdout.write(
-      `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${desc}\n`,
+      `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${sess}  ${desc}\n`,
     );
   }
   if (hiddenCount > 0) {
