@@ -105,12 +105,18 @@ function runList(argv: readonly string[]): void {
   );
   const header = `${"PROJECTID".padEnd(idW)}  ${"STATE".padEnd(stateW)}  TASKS  AGE   ${"SESSION".padEnd(sessW)}  DESCRIPTION`;
   process.stdout.write(header + "\n");
+  // Fit description column to remaining terminal width. Fall back to 60
+  // when stdout isn't a TTY (piped output) so non-interactive consumers
+  // still get a stable column.
+  const termCols = process.stdout.isTTY ? (process.stdout.columns ?? 80) : 0;
+  const prefixW = idW + 2 + stateW + 2 + 5 + 2 + 5 + 2 + sessW + 2;
+  const descW = termCols > 0 ? Math.max(20, termCols - prefixW) : 0;
   for (const p of projects) {
     const tasks = `${p.tasksDone}/${p.tasksTotal}`.padEnd(5);
     const age = ageString(p.updatedAt).padEnd(5);
     const sess = (p.orchestratorSessionId ? shortSessionId(p.orchestratorSessionId) : "-").padEnd(sessW);
-    const desc = p.description.length > 60
-      ? p.description.slice(0, 57) + "..."
+    const desc = descW > 0 && p.description.length > descW
+      ? p.description.slice(0, descW - 3) + "..."
       : p.description;
     process.stdout.write(
       `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${sess}  ${desc}\n`,

@@ -207,7 +207,6 @@ export function formatSessionsTable(
   options: { indent?: string; titleMaxWidth?: number } = {},
 ): string {
   const indent = options.indent ?? "";
-  const titleMax = options.titleMaxWidth ?? 60;
 
   type Row = {
     role: string;
@@ -315,6 +314,23 @@ export function formatSessionsTable(
   const widths = Object.fromEntries(
     cols.map((c) => [c, Math.max(header[c].length, ...rows.map((r) => r[c].length))]),
   ) as Record<keyof Row, number>;
+
+  // Fit the trailing TITLE column to remaining terminal width. When
+  // stdout isn't a TTY (piped/captured), fall back to the historical
+  // 60-char cap so non-interactive consumers see stable output.
+  let titleMax: number;
+  if (options.titleMaxWidth !== undefined) {
+    titleMax = options.titleMaxWidth;
+  } else if (process.stdout.isTTY) {
+    const termCols = process.stdout.columns ?? 80;
+    const nonTitleCols = cols.filter((c) => c !== "title");
+    const prefix = indent.length
+      + nonTitleCols.reduce((sum, c) => sum + widths[c], 0)
+      + 2 * cols.length;
+    titleMax = Math.max(20, termCols - prefix);
+  } else {
+    titleMax = 60;
+  }
 
   const renderRow = (r: Row): string =>
     cols
