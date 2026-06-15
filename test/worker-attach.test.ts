@@ -73,8 +73,8 @@ function mkInvoke(
   };
 }
 
-async function settle() {
-  for (let i = 0; i < 5; i++) {
+async function settle(times = 20) {
+  for (let i = 0; i < times; i++) {
     await Promise.resolve();
   }
 }
@@ -96,6 +96,10 @@ beforeEach(() => {
     daemonWsUrl: "ws://unused",
     token: "unused",
     client,
+    fetchSessionInfo: async (sid: string) => ({
+      sessionId: sid,
+      interactive: true,
+    }),
   });
 });
 
@@ -164,7 +168,10 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       }));
 
       dispatch(mkInvoke(10, "start", {}));
-      await settle();
+      // Tick just enough for the guard fetch + scheduler + spawn to
+      // complete. settle(20) would let the FakeClient's instant
+      // responses run the task to completion and flip state to "done".
+      await settle(7);
 
       // The board should have transitioned to running.
       const board = boards.get("hydra_session_test")!;

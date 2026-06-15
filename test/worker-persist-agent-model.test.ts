@@ -64,8 +64,8 @@ function mkInvoke(
   };
 }
 
-async function settle() {
-  for (let i = 0; i < 5; i++) {
+async function settle(times = 20) {
+  for (let i = 0; i < times; i++) {
     await Promise.resolve();
   }
 }
@@ -87,6 +87,10 @@ beforeEach(() => {
     daemonWsUrl: "ws://unused",
     token: "unused",
     client,
+    fetchSessionInfo: async (sid: string) => ({
+      sessionId: sid,
+      interactive: true,
+    }),
   });
 });
 

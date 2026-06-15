@@ -155,6 +155,7 @@ describe("worker refine from daemon session info", () => {
       sessionId: sid,
       agentId: "X",
       currentModel: "Y",
+      interactive: true,
     }));
     const childSessionId = "hydra_session_child_a";
     const board = await spawnAndWait(childSessionId);
@@ -169,7 +170,13 @@ describe("worker refine from daemon session info", () => {
       orchestratorAgent: "orch-agent",
       orchestratorModel: "orch-model",
     });
-    makeBridge(async () => {
+    makeBridge(async (sid) => {
+      // Orchestrator lookup must pass the interactive guard so the
+      // `start` mutator dispatches; the test's intent is for the
+      // worker-refinement fetch (child session) to reject.
+      if (sid === "hydra_session_test") {
+        return { sessionId: sid, interactive: true };
+      }
       throw new Error("boom");
     });
     const childSessionId = "hydra_session_child_b";
@@ -192,6 +199,7 @@ describe("worker refine from daemon session info", () => {
       sessionId: sid,
       agentId: "",
       currentModel: "",
+      interactive: true,
     }));
     const childSessionId = "hydra_session_child_c";
     const board = await spawnAndWait(childSessionId);
@@ -213,7 +221,15 @@ describe("worker refine from daemon session info", () => {
     const fetchPromise = new Promise<SessionInfo>((res) => {
       resolveFetch = res;
     });
-    makeBridge(() => fetchPromise);
+    makeBridge(async (sid) => {
+      // Orchestrator interactive lookup must resolve synchronously so
+      // the `start` mutator passes the guard; only the child-session
+      // refinement fetch is the one we want to defer for this test.
+      if (sid === "hydra_session_test") {
+        return { sessionId: sid, interactive: true };
+      }
+      return fetchPromise;
+    });
     const childSessionId = "hydra_session_child_d";
     const board = await spawnAndWait(childSessionId);
     // Simulate worker being unregistered before fetch resolves.
@@ -236,6 +252,7 @@ describe("worker refine from daemon session info", () => {
       sessionId: sid,
       agentId: "X",
       currentModel: "Y",
+      interactive: true,
     }));
     const childSessionId = "hydra_session_child_e";
     await spawnAndWait(childSessionId);

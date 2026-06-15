@@ -476,6 +476,15 @@ export class PlannerBridge {
   // Purged when a project is removed (see toolRemove).
   private forkOwnerCache = new Map<string, string | null>();
 
+  // Cache for requireInteractive(): maps sessionId -> { interactive,
+  // expiresAt }. Populated lazily by requireInteractive via
+  // fetchSessionInfo. Invalidated on session_info_update for the
+  // sessionId. Used to gate mutating MCP tools (set_plan et al.) so
+  // /btw forks, workers, and cat sessions cannot author plans.
+  private interactiveCache = new Map<string, { interactive: boolean | undefined; expiresAt: number }>();
+  // Pending fetch promises for deduplicating concurrent requireInteractive calls.
+  private _pendingInteractive?: Map<string, Promise<boolean>>;
+
   // Walk up the fork ancestry of `sessionId` until we find an
   // ancestor that owns a board (boards map or on-disk). Returns the
   // owning session id, or undefined if none up the chain has a
@@ -512,6 +521,60 @@ export class PlannerBridge {
     const upstream = await this.resolveForkOwner(parent, depth + 1);
     this.forkOwnerCache.set(sessionId, upstream ?? null);
     return upstream;
+  }
+
+  // Resolve whether `sessionId` is an interactive session per the
+  // daemon's effective tristate. Returns true ONLY if interactive
+  // === true. Anything else — undefined, false, lookup failure —
+  // returns false (fail closed). 60s TTL cache; invalidate via
+  // invalidateInteractiveCache on session_info_update.
+  private async requireInteractive(sessionId: string): Promise<boolean> {
+    const now = Date.now();
+    const cached = this.interactiveCache.get(sessionId);
+    if (cached && cached.expiresAt > now) {
+      return cached.interactive === true;
+    }
+    // Deduplicate concurrent fetches: if a fetch is already in-flight
+    // for this sessionId, await it instead of starting another one.
+    const pending = this._pendingInteractive?.get(sessionId);
+    if (pending) {
+      return pending;
+    }
+    const fetchPromise = (async () => {
+      const fetcher = this.fetchSessionInfoOverride
+        ?? ((sid: string) =>
+          fetchSessionInfo(sid, {
+            daemonHttpBase: this.daemonHttpBase,
+            token: this.daemonToken,
+          }));
+      let info: import("./util/session-info.js").SessionInfo | undefined;
+      try {
+        info = await fetcher(sessionId);
+      } catch {
+        info = undefined;
+      }
+      const value = info?.interactive;
+      this.interactiveCache.set(sessionId, { interactive: value, expiresAt: now + 60_000 });
+      return value === true;
+    })();
+    if (!this._pendingInteractive) this._pendingInteractive = new Map();
+    this._pendingInteractive.set(sessionId, fetchPromise);
+    const result = await fetchPromise;
+    this._pendingInteractive?.delete(sessionId);
+    return result;
+  }
+
+  // Must be called on every session_info_update for the affected sessionId,
+  // because the daemon's interactive flag can change at any time. Three
+  // branches in this file handle that notification and call this method:
+  //   • worker session-update handler          (~line 3639)
+  //   • orchestrator-lane handler (board exists) (~line 3836)
+  //   • orchestrator-lane handler (no board, via fork chain) (~line 3863)
+  // current_model_update does NOT invalidate this cache — it cannot change
+  // the session's interactive flag.
+  private invalidateInteractiveCache(sessionId: string): void {
+    this.interactiveCache.delete(sessionId);
+    this._pendingInteractive?.delete(sessionId);
   }
 
   // Locate the board to render for a *read* tool (get_plan,
@@ -3581,6 +3644,7 @@ export class PlannerBridge {
             w.agent = agentId;
             changed = true;
           }
+          this.invalidateInteractiveCache(sessionId);
         } else if (kind === "current_model_update") {
           const model = extractCurrentModelUpdate(envelope);
           if (model && model !== w.model) {
@@ -3777,6 +3841,7 @@ export class PlannerBridge {
             board.orchestratorAgent = agentId;
             saveBoard(board, sessionId);
           }
+          this.invalidateInteractiveCache(sessionId);
         } else if (kind === "current_model_update") {
           const model = extractCurrentModelUpdate(envelope);
           if (model && model !== board.orchestratorModel) {
@@ -3803,6 +3868,7 @@ export class PlannerBridge {
               worker.agent = agentId;
               changed = true;
             }
+            this.invalidateInteractiveCache(sessionId);
           } else {
             const model = extractCurrentModelUpdate(envelope);
             if (model && model !== worker.model) {
@@ -6291,6 +6357,16 @@ export class PlannerBridge {
       return this.replyMcpTextError(
         req.id,
         "internal: missing sessionId on mcp_tools/invoke (daemon-side bug)",
+      );
+    }
+    const MUTATING_TOOLS = new Set([
+      'set_plan', 'start', 'add_task', 'update_task', 'restart',
+      'stop', 'pause', 'resume', 'skip', 'retry', 'remove',
+    ]);
+    if (MUTATING_TOOLS.has(tool) && !(await this.requireInteractive(sessionId))) {
+      return this.replyMcpTextError(
+        req.id,
+        `${tool} refused on non-interactive session ${sessionId}: plan mutations must come from an interactive session`,
       );
     }
     log.info(`mcp tool ${tool} on session …${sessionId.slice(-8)}`);

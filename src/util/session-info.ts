@@ -21,6 +21,12 @@ export interface SessionInfo {
   forkedFromSessionId?: string;
   // Set iff this session was spawned as a transformer child.
   parentSessionId?: string;
+  // Effective interactive tristate from the daemon's GET
+  // /v1/sessions/:id (computed via effectiveInteractive). undefined
+  // means the session has not been promoted (no non-ancillary prompt
+  // yet) or the value is unknown. Consumers MUST fail-closed on
+  // undefined when using this to gate mutations.
+  interactive?: boolean;
 }
 
 export interface FetchSessionInfoOpts {
@@ -62,6 +68,9 @@ export async function fetchSessionInfo(
     }
     if (typeof body.parentSessionId === "string") {
       out.parentSessionId = body.parentSessionId;
+    }
+    if (typeof body.interactive === "boolean") {
+      out.interactive = body.interactive;
     }
     return out;
   } catch (err) {

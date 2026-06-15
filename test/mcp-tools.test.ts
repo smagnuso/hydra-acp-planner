@@ -94,7 +94,7 @@ let client: FakeClient;
 // requests) that may not have settled yet. Waiting a couple of
 // macrotask boundaries is enough — no internal timers are armed.
 async function settle() {
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 20; i++) {
     await Promise.resolve();
   }
 }
@@ -111,7 +111,7 @@ beforeEach(() => {
     daemonWsUrl: "ws://unused",
     token: "unused",
     client,
-    fetchSessionInfo: async () => undefined,
+    fetchSessionInfo: async () => ({ interactive: true }),
   });
 });
 
@@ -392,6 +392,7 @@ describe("set_plan", () => {
         sessionId: sid,
         agentId: "seeded-agent",
         currentModel: "seeded-model",
+        interactive: true,
       }),
     });
     (localBridge as unknown as { handleRequest: (r: unknown) => void }).handleRequest(
@@ -1320,7 +1321,8 @@ describe("add_task", () => {
   it("acks immediately with a 'Asking the agent' message on an active board", async () => {
     seedBoard("hydra_session_test", { state: "running" });
     dispatch(mkInvoke(63, "add_task", { description: "add tests" }));
-    await settle();
+    // Extra settle for add_task's void handleAdd fire-and-forget.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
     const r = client.lastReply();
     const result = r.result as { content: Array<{ text: string }>; structuredContent: { dispatched: boolean } };
     assert.equal(result.structuredContent.dispatched, true);
@@ -1636,5 +1638,387 @@ describe("case-insensitive taskId lookup", () => {
     assert.equal(lower.structuredContent.findings.length, 1);
     assert.equal(lower.structuredContent.findings.length, upper.structuredContent.findings.length);
     assert.equal(lower.structuredContent.findings[0]!.taskId, "T1");
+  });
+});
+
+// ── requireInteractive guard on mutating tools ──────────────
+
+describe("requireInteractive guard", () => {
+  it("set_plan is refused on non-interactive session (interactive=false)", async () => {
+    const sid = `guard_test_ni_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const nonInteractiveClient = new FakeClient();
+    const nonInteractiveBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: nonInteractiveClient,
+      fetchSessionInfo: async () => ({ interactive: false }),
+    });
+
+    dispatchTo(nonInteractiveBridge, mkInvoke(200, "set_plan", { description: "x", tasks: [{ id: "T1", title: "t" }] }, sid));
+    await settle();
+
+    const r = nonInteractiveClient.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.equal(
+      result.content[0]!.text,
+      `set_plan refused on non-interactive session ${sid}: plan mutations must come from an interactive session`,
+    );
+  });
+
+  it("set_plan proceeds when interactive=true", async () => {
+    const sid = `guard_test_i_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const interactiveClient = new FakeClient();
+    const interactiveBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: interactiveClient,
+      fetchSessionInfo: async () => ({ interactive: true }),
+    });
+
+    seedBoard(sid, { state: "ready" });
+    dispatchTo(interactiveBridge, mkInvoke(201, "set_plan", { description: "new plan", tasks: [{ id: "T1", title: "task one" }] }, sid));
+    await settle();
+
+    const r = interactiveClient.lastReply();
+    const result = r.result as { isError?: boolean };
+    assert.notEqual(result.isError, true, "expected no error for interactive session");
+  });
+
+  it("set_plan is refused when interactive is undefined (fail-closed)", async () => {
+    const sid = `guard_test_uc_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const undefinedClient = new FakeClient();
+    const undefinedBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: undefinedClient,
+      fetchSessionInfo: async () => ({ interactive: undefined }),
+    });
+
+    dispatchTo(undefinedBridge, mkInvoke(202, "set_plan", { description: "x", tasks: [{ id: "T1", title: "t" }] }, sid));
+    await settle();
+
+    const r = undefinedClient.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.equal(
+      result.content[0]!.text,
+      `set_plan refused on non-interactive session ${sid}: plan mutations must come from an interactive session`,
+    );
+  });
+
+  it("cache hit: second set_plan call uses cached value", async () => {
+    const sid = `guard_cache_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    let fetchCount = 0;
+    const cachingClient = new FakeClient();
+    const cachingBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: cachingClient,
+      fetchSessionInfo: async (s: string) => {
+        fetchCount++;
+        return s === sid ? { interactive: true } : undefined;
+      },
+    });
+
+    seedBoard(sid, { state: "ready" });
+    dispatchTo(cachingBridge, mkInvoke(210, "set_plan", { description: "first", tasks: [{ id: "T1", title: "t" }] }, sid));
+    await settle();
+
+    const firstFetchCount = fetchCount;
+    // First call triggers requireInteractive + seedOrchestratorIdentity (2 fetches).
+    assert.ok(firstFetchCount >= 1, `expected at least one fetch, got ${firstFetchCount}`);
+
+    dispatchTo(cachingBridge, mkInvoke(211, "set_plan", { description: "second", tasks: [{ id: "T2", title: "t2" }] }, sid));
+    await settle();
+
+    // Second call should reuse cached interactive value; total fetch count
+    // should not increase by more than what seedOrchestratorIdentity adds.
+    const secondFetchCount = fetchCount;
+    assert.ok(
+      secondFetchCount < firstFetchCount + 2,
+      `expected cache hit (fetches: ${firstFetchCount} → ${secondFetchCount})`,
+    );
+  });
+
+  it("start is refused on non-interactive session", async () => {
+    const sid = `guard_test_start_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const client = new FakeClient();
+    const br = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client,
+      fetchSessionInfo: async () => ({ interactive: false }),
+    });
+
+    seedBoard(sid, { state: "ready" });
+    dispatchTo(br, mkInvoke(220, "start", {}, sid));
+    await settle();
+
+    const r = client.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.equal(
+      result.content[0]!.text,
+      `start refused on non-interactive session ${sid}: plan mutations must come from an interactive session`,
+    );
+  });
+
+  it("read tools are not guarded (get_plan proceeds without interactive check)", async () => {
+    const sid = `guard_test_rp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    let fetchCount = 0;
+    const client = new FakeClient();
+    const br = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client,
+      fetchSessionInfo: async () => {
+        fetchCount++;
+        return undefined;
+      },
+    });
+
+    seedBoard(sid, { state: "ready" });
+    dispatchTo(br, mkInvoke(230, "get_plan", {}, sid));
+    await settle();
+
+    // get_plan should NOT trigger a session info fetch (no requireInteractive guard)
+    assert.equal(fetchCount, 0, "read tool should not call fetchSessionInfo");
+    const r = client.lastReply();
+    const result = r.result as { isError?: boolean };
+    assert.notEqual(result.isError, true, "get_plan should succeed without interactive check");
+  });
+
+  it("all mutating tools produce correct error message", async () => {
+    const mutatingTools = ["set_plan", "start", "add_task", "update_task", "restart", "stop", "pause", "resume", "skip", "retry", "remove"];
+    const sid = `guard_test_all_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    for (const tool of mutatingTools) {
+      const client = new FakeClient();
+      const br = new PlannerBridge({
+        daemonWsUrl: "ws://unused",
+        token: "unused",
+        client,
+        fetchSessionInfo: async () => ({ interactive: false }),
+      });
+
+      // Seed board for tools that require one
+      if (tool !== "set_plan" && tool !== "remove") {
+        seedBoard(sid, { state: "ready" });
+      }
+
+      const args = (tool === "skip" || tool === "retry" || tool === "update_task") ? { taskId: "T1" } : {};
+      if (tool === "set_plan") {
+        Object.assign(args, { description: "x", tasks: [{ id: "T1", title: "t" }] });
+      }
+
+      dispatchTo(br, mkInvoke(300, tool, args, sid), sid);
+      await settle();
+
+      const r = client.lastReply();
+      const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+      assert.equal(result.isError, true, `${tool}: expected error reply`);
+      assert.equal(
+        result.content[0]!.text,
+        `${tool} refused on non-interactive session ${sid}: plan mutations must come from an interactive session`,
+        `${tool}: wrong error message`,
+      );
+
+      boards.clear();
+      client.replies = [];
+    }
+  });
+
+  it("rejects set_plan from a /btw fork (non-interactive with forkedFromSessionId)", async () => {
+    const sid = `guard_test_btw_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const btwClient = new FakeClient();
+    const btwBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: btwClient,
+      fetchSessionInfo: async (s: string) => {
+        if (s === sid) return { interactive: false, forkedFromSessionId: "sess_parent" };
+        return undefined;
+      },
+    });
+
+    dispatchTo(btwBridge, mkInvoke(901, "set_plan", { description: "nope", tasks: [{ id: "T1", title: "x" }] }, sid));
+    await settle();
+
+    const r = btwClient.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.match(
+      result.content[0]!.text,
+      /set_plan refused on non-interactive session .*: plan mutations must come from an interactive session/,
+    );
+  });
+
+  it("get_plan resolves via fork ancestry even when child is non-interactive", async () => {
+    const parentSid = `btw_parent_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const childSid = `btw_child_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    seedBoard(parentSid, {
+      state: "ready",
+      tasks: [{ id: "T1", title: "parent task", deps: [], status: "pending" }],
+    });
+
+    const forkClient = new FakeClient();
+    const forkBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: forkClient,
+      fetchSessionInfo: async (s: string) => {
+        if (s === parentSid) return { interactive: true };
+        if (s === childSid) return { interactive: false, forkedFromSessionId: parentSid };
+        return undefined;
+      },
+    });
+
+    dispatchTo(forkBridge, mkInvoke(902, "get_plan", {}, childSid));
+    await settle();
+
+    const r = forkClient.lastReply();
+    const result = r.result as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+      structuredContent: { hasPlan: boolean; readOnly: boolean; viewedFromFork: boolean; ownerSessionId: string };
+    };
+    assert.notEqual(result.isError, true, "get_plan from fork should not error");
+    assert.equal(result.structuredContent.hasPlan, true);
+    assert.equal(result.structuredContent.readOnly, true);
+    assert.equal(result.structuredContent.viewedFromFork, true);
+    assert.equal(result.structuredContent.ownerSessionId, parentSid);
+    assert.match(result.content[0]!.text, /read-only: viewing parent session/);
+  });
+});
+
+// ── requireInteractive cache invalidation ───────────────────
+
+describe("requireInteractive cache invalidation", () => {
+  it("invalidateInteractiveCache clears cached entry so next call re-fetches", async () => {
+    const sid = `inv_test_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    let fetchCount = 0;
+    const client = new FakeClient();
+    const br = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client,
+      fetchSessionInfo: async (s: string) => {
+        fetchCount++;
+        // First call returns interactive=true, subsequent calls return false
+        return fetchCount === 1 ? { interactive: true } : { interactive: false };
+      },
+    });
+
+    seedBoard(sid, { state: "ready" });
+
+    // First set_plan — requireInteractive fetches and caches interactive=true.
+    dispatchTo(br, mkInvoke(400, "set_plan", { description: "first", tasks: [{ id: "T1", title: "t" }] }, sid));
+    await settle();
+    const afterFirst = fetchCount;
+    assert.ok(afterFirst >= 1, `expected at least one fetch after first set_plan, got ${afterFirst}`);
+
+    // Directly invalidate the cache (simulating what session_info_update does).
+    (br as unknown as { invalidateInteractiveCache: (sessionId: string) => void }).invalidateInteractiveCache(sid);
+
+    // Second set_plan — requireInteractive should re-fetch because cache was cleared.
+    dispatchTo(br, mkInvoke(401, "set_plan", { description: "second", tasks: [{ id: "T2", title: "t2" }] }, sid));
+    await settle();
+
+    // After invalidation, requireInteractive must fetch again (count increases).
+    assert.ok(
+      fetchCount > afterFirst,
+      `expected re-fetch after cache invalidation (fetched ${afterFirst} → ${fetchCount})`,
+    );
+    const r = client.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true, "expected error after cache invalidation returns interactive=false");
+    assert.match(result.content[0]!.text, /set_plan refused/);
+  });
+});
+
+// Helper to dispatch to a specific bridge (not the shared one).
+function dispatchTo(bridge: PlannerBridge, req: ReturnType<typeof mkInvoke>, sessionId?: string): void {
+  const params = sessionId ? { ...req.params, sessionId } : req.params;
+  (bridge as unknown as { handleRequest: (r: unknown) => void }).handleRequest({
+    ...req,
+    params,
+  });
+}
+
+// ── Worker session interactive guard ────────────────────────────────
+
+describe("interactive guard", () => {
+  it("rejects set_plan from a non-interactive worker session", async () => {
+    const sid = "sess_worker_abc";
+    const wClient = new FakeClient();
+    const wBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: wClient,
+      fetchSessionInfo: async (s) => ({ sessionId: s, interactive: false }),
+    });
+
+    dispatchTo(wBridge, mkInvoke(900, "set_plan", {
+      description: "should be rejected",
+      tasks: [{ id: "T1", title: "x" }],
+    }, sid));
+    await settle();
+
+    const r = wClient.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.match(
+      result.content[0]!.text,
+      /set_plan refused on non-interactive session sess_worker_abc/,
+    );
+  });
+
+  it('allows set_plan from an interactive session', async () => {
+    // Mirrors the synchronous interactive promotion in
+    // cli/src/core/session.ts:1248 — by the time the agent calls
+    // set_plan, the daemon already reports interactive:true.
+    const sid = `sess_main_${Date.now()}`;
+    const iClient = new FakeClient();
+    const iBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: iClient,
+      fetchSessionInfo: async (s) => ({ sessionId: s, interactive: true }),
+    });
+
+    dispatchTo(iBridge, mkInvoke(910, 'set_plan', {
+      description: 'ok',
+      tasks: [{ id: 'T1', title: 'x' }],
+    }, sid));
+    await settle();
+
+    const r = iClient.lastReply();
+    assert.notEqual(r.result?.isError, true);
+  });
+
+  it('running-board guard still fires when interactive=true', async () => {
+    // Regression: the new interactive guard must NOT shadow the existing
+    // running-board guard at bridge.ts:6414-6425.
+    const sid = `sess_running_${Date.now()}`;
+    const rClient = new FakeClient();
+    const rBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: rClient,
+      fetchSessionInfo: async (s) => ({ sessionId: s, interactive: true }),
+    });
+
+    seedBoard(sid, { state: 'running' });
+    dispatchTo(rBridge, mkInvoke(911, 'set_plan', {
+      description: 'x',
+      tasks: [{ id: 'T1', title: 't' }],
+    }, sid));
+    await settle();
+
+    const r = rClient.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /already running/);
   });
 });
