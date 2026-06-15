@@ -1,6 +1,6 @@
 {
   "name": "@hydra-acp/planner",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "description": "Multi-agent project orchestrator for hydra-acp — decomposes a goal into a task DAG, spawns worker sessions, coordinates via prompts.",
   "license": "MIT",
   "type": "module",
