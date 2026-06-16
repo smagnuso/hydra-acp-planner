@@ -6,6 +6,34 @@ import type { Task } from "./board.js";
 export interface ReviewTaskRenderOptions {
   indent: string;
   renderTaskTag?: (task: Task) => string;
+  // When present, used to derive `awaiting_rework` display state for
+  // review tasks whose reviewee has accumulated reviewFeedback from a
+  // prior rejection.
+  allTasks?: Task[];
+}
+
+// Derived display status for a review/distill task. Returns
+// "awaiting_rework" when the review is pending again because it
+// previously rejected its reviewee and the rework is in flight (or
+// queued). Falls back to the stored status otherwise.
+//
+// Detection rule: review is `pending` AND at least one reviewee has
+// non-empty reviewFeedback (the signal of a prior rejection that
+// finishReview pushed onto the reviewee). reviewFeedback is only ever
+// populated by handleReviewReject, so it's an unambiguous marker.
+export function reviewDisplayStatus(task: Task, allTasks: Task[]): string {
+  if (task.kind !== "review" && task.kind !== "distill") return task.status;
+  if (task.status !== "pending") return task.status;
+  const targets = reviewTargetsOf(task);
+  if (targets.length === 0) return task.status;
+  const byId = new Map(allTasks.map((t) => [t.id, t]));
+  for (const id of targets) {
+    const target = byId.get(id);
+    if (target?.reviewFeedback && target.reviewFeedback.length > 0) {
+      return "awaiting_rework";
+    }
+  }
+  return task.status;
 }
 
 // Render a single review or distill task (standalone, not under a parent).
@@ -26,7 +54,10 @@ export function renderReviewTask(
   renderedReviews.add(task.id);
 
   const tag = options.renderTaskTag?.(task) ?? "";
-  const glyph = TASK_GLYPH[task.status] ?? "?";
+  const displayStatus = options.allTasks
+    ? reviewDisplayStatus(task, options.allTasks)
+    : task.status;
+  const glyph = TASK_GLYPH[displayStatus] ?? "?";
 
   if (task.kind === "distill") {
     return renderDistillTask(task, reviewTargets, glyph, tag, options.indent);
@@ -141,6 +172,7 @@ const TASK_GLYPH: Record<string, string> = {
   blocked: "[-]",
   pending: "[ ]",
   awaiting_review: "[*]",
+  awaiting_rework: "[+]",
   superseded: "(~)",
 };
 

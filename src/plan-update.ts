@@ -186,6 +186,7 @@ const STATUS_GLYPH: Record<string, string> = {
   blocked: "[-]",
   pending: "[ ]",
   awaiting_review: "[*]",
+  awaiting_rework: "[+]",
   superseded: "(~)",
 };
 
@@ -224,7 +225,7 @@ export function buildAsciiPlanText(board: Board): string {
       if (!pt) continue;
       const targets = reviewTargetsOf(pt);
       if (targets.every((id) => renderedTaskIds.has(id))) {
-        const line = renderReviewTask(pt, renderedReviews, { indent: "  ", renderTaskTag: tagFor });
+        const line = renderReviewTask(pt, renderedReviews, { indent: "  ", renderTaskTag: tagFor, allTasks: board.tasks });
         if (line) lines.push(line);
         pendingPeerReviews.splice(i, 1);
       }
@@ -256,14 +257,14 @@ export function buildAsciiPlanText(board: Board): string {
     const childReviews = reviewsByParent.get(t.id);
     if (childReviews) {
       for (const r of childReviews) {
-        const line = renderReviewTask(r, renderedReviews, { indent: "    ", renderTaskTag: tagFor });
+        const line = renderReviewTask(r, renderedReviews, { indent: "    ", renderTaskTag: tagFor, allTasks: board.tasks });
         if (line) lines.push(line);
       }
     }
     flushPendingPeers();
   }
   for (const pt of pendingPeerReviews) {
-    const line = renderReviewTask(pt, renderedReviews, { indent: "  ", renderTaskTag: tagFor });
+    const line = renderReviewTask(pt, renderedReviews, { indent: "  ", renderTaskTag: tagFor, allTasks: board.tasks });
     if (line) lines.push(line);
   }
   return lines.join("\n");

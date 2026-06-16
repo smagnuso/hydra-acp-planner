@@ -6,6 +6,7 @@ import {
   buildReviewsByParent,
   isMultiRevieweeReview,
   renderReviewTask,
+  reviewDisplayStatus,
   reviewTargetsOf,
 } from "./render-reviews.js";
 
@@ -354,6 +355,7 @@ export const TASK_STATUS_GLYPH: Record<string, string> = {
   blocked: "[-]",
   pending: "[ ]",
   awaiting_review: "[*]",
+  awaiting_rework: "[+]",
   superseded: "(~)",
 };
 
@@ -382,7 +384,8 @@ export function formatBoardContext(board: Board): string {
     const total = board.tasks.length;
     lines.push(`Tasks (${done}/${total} done):`);
     for (const task of board.tasks) {
-      const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
+      const displayStatus = reviewDisplayStatus(task, board.tasks);
+      const glyph = TASK_STATUS_GLYPH[displayStatus] ?? "?";
       const deps = task.deps.length === 0 ? "" : `, deps: ${task.deps.join(", ")}`;
       const worker =
         task.status === "assigned" && task.assignedTo
@@ -391,7 +394,7 @@ export function formatBoardContext(board: Board): string {
       const tag = formatTaskTag(task, board);
       const dur = formatTaskDuration(task);
       const durTag = dur ? `, duration: ${dur}` : "";
-      lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${task.status}${deps}${worker}${durTag}]`);
+      lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${displayStatus}${deps}${worker}${durTag}]`);
       if (task.what) lines.push(`     what: ${task.what}`);
       if (task.constraints) lines.push(`     constraints: ${task.constraints}`);
       if (task.artifacts?.summary) lines.push(`     result: ${task.artifacts.summary}`);
@@ -493,6 +496,7 @@ export function formatStatusBody(
         const line = renderReviewTask(t, renderedReviews, {
           indent: "   ",
           renderTaskTag: (x) => formatTaskTag(x, board),
+          allTasks: board.tasks,
         });
         if (line) lines.push(line);
         pendingPeerReviews.splice(i, 1);
@@ -526,6 +530,7 @@ export function formatStatusBody(
         const line = renderReviewTask(r, renderedReviews, {
           indent: "    ",
           renderTaskTag: (t) => formatTaskTag(t, board),
+          allTasks: board.tasks,
         });
         if (line) lines.push(line);
       }
@@ -538,6 +543,7 @@ export function formatStatusBody(
     const line = renderReviewTask(t, renderedReviews, {
       indent: "   ",
       renderTaskTag: (x) => formatTaskTag(x, board),
+      allTasks: board.tasks,
     });
     if (line) lines.push(line);
   }
