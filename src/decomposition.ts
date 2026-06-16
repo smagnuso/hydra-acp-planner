@@ -58,6 +58,8 @@ Two coding agents handed the same task should be able to produce legitimately di
 
 Keep the DAG minimal. Prefer fewer larger tasks over many tiny ones. Aim for 3 to 12 tasks for most projects; only exceed that when the project genuinely requires it. Dependencies should be the truth of what blocks what, not a vague ordering preference.
 
+Be especially careful with dep-less roots. A task with deps: [] claims it could legitimately start right now, in parallel with every other root, with no information it needs from any sibling. If two "root" tasks share an implicit design decision (data shape, interface, scaffolding, naming convention, foundational config), one of them should depend on whichever establishes that decision — otherwise reviewers can't catch a flawed decision in T1 before T2 commits to the same mistake, and parallel workers waste compute building on an approach the reviewer would have rejected. When in doubt about whether to parallelize or serialize independent-looking tasks, prefer the dep edge.
+
 Reply with ONLY a fenced JSON block matching this schema, and no other prose:
 
 \`\`\`json
