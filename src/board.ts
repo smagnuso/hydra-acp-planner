@@ -155,8 +155,16 @@ export interface FleetDefaults {
 
 // Resolution chain:
 //   task.agent  >  fleet.{work|review}.agent  >  fleet.agent (--agent)
+//                                            >  board.plannerDefaultAgent
 //                                            >  board.orchestratorAgent
 //                                            >  null (→ daemon default)
+//
+// plannerDefaultAgent comes from ~/.hydra-acp/planner.json (or the
+// HYDRA_ACP_PLANNER_DEFAULT_AGENT env var) and is stamped onto every
+// in-memory board by the Bridge. It outranks orchestratorAgent so the
+// user can keep a chatty/expensive agent on the orchestrator session
+// (e.g. opus) while routing worker tasks to a cheaper default (e.g.
+// opencode-local) without having to set fleetDefaults on every plan.
 //
 // The orchestratorAgent fallback exists because the daemon's own
 // `defaultAgent` (set in its config) may not match what the user
@@ -165,7 +173,11 @@ export interface FleetDefaults {
 // session's agent onto workers when nothing more specific applies.
 export function resolveAgent(
   task: Task,
-  board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null },
+  board: {
+    fleetDefaults: FleetDefaults;
+    plannerDefaultAgent?: string | null;
+    orchestratorAgent?: string | null;
+  },
 ): string | null {
   if (task.agent) return task.agent;
   const kind = task.kind ?? "work";
@@ -178,6 +190,7 @@ export function resolveAgent(
         : fleet.work?.agent;
   if (kindAgent) return kindAgent;
   if (fleet.agent) return fleet.agent;
+  if (board.plannerDefaultAgent) return board.plannerDefaultAgent;
   if (board.orchestratorAgent) return board.orchestratorAgent;
   return null;
 }
@@ -387,6 +400,15 @@ export interface Board {
   // current_model_update (currentModel).
   orchestratorAgent?: string | null;
   orchestratorModel?: string | null;
+  // Worker-lane agent floor sourced from the planner's own config
+  // (~/.hydra-acp/planner.json → defaultAgent, or the
+  // HYDRA_ACP_PLANNER_DEFAULT_AGENT env var). Stamped onto every
+  // in-memory board by the Bridge after load/create/fork; not
+  // authoritative on disk — re-stamped on every load so removing the
+  // config clears it. resolveAgent consults this between fleetDefaults
+  // and orchestratorAgent so a user-configured floor outranks the
+  // host session's agent.
+  plannerDefaultAgent?: string | null;
   // Accumulated wall-clock time the project has spent in the `running`
   // state across all start/retry cycles. Excludes time spent in
   // `ready`, `decomposing` (initial plan + amends), `paused`, and

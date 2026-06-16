@@ -367,10 +367,15 @@ const ACTIVATION_POLL_INTERVAL_MS = 3000;
 // Cheap fallback for `/hydra planner status` queries on done/failed
 // projects that rehydrateFromDisk leaves out of the in-memory boards map.
 // O(N) over the number of projects on disk; not on the intercept hot path.
-function findBoardOnDisk(orchestratorSessionId: string): Board | undefined {
+function findBoardOnDisk(
+  orchestratorSessionId: string,
+  plannerDefaultAgent?: string,
+): Board | undefined {
   for (const entry of listProjects()) {
     if (entry.orchestratorSessionId === orchestratorSessionId) {
-      return loadBoard(entry.projectId);
+      const board = loadBoard(entry.projectId);
+      if (board) board.plannerDefaultAgent = plannerDefaultAgent ?? null;
+      return board;
     }
   }
   return undefined;
@@ -514,7 +519,7 @@ export class PlannerBridge {
       this.forkOwnerCache.set(sessionId, null);
       return undefined;
     }
-    if (boards.has(parent) || findBoardOnDisk(parent)) {
+    if (boards.has(parent) || findBoardOnDisk(parent, this.defaultAgent)) {
       this.forkOwnerCache.set(sessionId, parent);
       return parent;
     }
@@ -588,13 +593,13 @@ export class PlannerBridge {
   ): Promise<
     { board: Board; ownerSessionId: string; viaFork: boolean } | undefined
   > {
-    const direct = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    const direct = boards.get(sessionId) ?? findBoardOnDisk(sessionId, this.defaultAgent);
     if (direct) {
       return { board: direct, ownerSessionId: sessionId, viaFork: false };
     }
     const owner = await this.resolveForkOwner(sessionId);
     if (!owner) return undefined;
-    const board = boards.get(owner) ?? findBoardOnDisk(owner);
+    const board = boards.get(owner) ?? findBoardOnDisk(owner, this.defaultAgent);
     if (!board) return undefined;
     return { board, ownerSessionId: owner, viaFork: true };
   }
@@ -800,6 +805,16 @@ export class PlannerBridge {
     this.client.on("notification", (note) => this.handleNotification(note));
   }
 
+  // Stamp the planner-config worker-lane floor onto an in-memory
+  // board so resolveAgent / formatTaskTag honor it. Called wherever a
+  // board enters memory (newBoard, forkBoard, loadBoard). Not
+  // persisted authoritatively — re-stamped on every load so clearing
+  // ~/.hydra-acp/planner.json takes effect on next read.
+  private stampPlannerDefaults<B extends Board | undefined>(board: B): B {
+    if (board) board.plannerDefaultAgent = this.defaultAgent ?? null;
+    return board;
+  }
+
   start(): void {
     this.client.start();
   }
@@ -909,7 +924,7 @@ export class PlannerBridge {
     const byOrchestrator = new Map<string, Board[]>();
     for (const entry of entries) {
       if (entry.state === "done" || entry.state === "failed") continue;
-      const board = loadBoard(entry.projectId);
+      const board = this.stampPlannerDefaults(loadBoard(entry.projectId));
       if (!board) continue;
       const orchestratorId = entry.orchestratorSessionId;
       if (!orchestratorId) {
@@ -1352,10 +1367,10 @@ export class PlannerBridge {
         board = boards.get(orchestratorSessionId);
       }
       if (!board) {
-        board = loadBoard(canonical);
+        board = this.stampPlannerDefaults(loadBoard(canonical));
       }
     } else {
-      board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+      board = boards.get(sessionId) ?? findBoardOnDisk(sessionId, this.defaultAgent);
       orchestratorSessionId = sessionId;
     }
     if (!board || !orchestratorSessionId) {
@@ -2075,7 +2090,7 @@ export class PlannerBridge {
         board = boards.get(orchestratorSessionId);
       }
       if (!board) {
-        board = loadBoard(canonical);
+        board = this.stampPlannerDefaults(loadBoard(canonical));
       }
       if (!board) {
         this.client.reply(reqId, {
@@ -2084,7 +2099,7 @@ export class PlannerBridge {
         return;
       }
     } else {
-      board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+      board = boards.get(sessionId) ?? findBoardOnDisk(sessionId, this.defaultAgent);
       if (!board) {
         this.client.reply(reqId, {
           text: "No plan in this session to remove. Use `/hydra planner remove <projectId>` for a different project.",
@@ -2212,7 +2227,7 @@ export class PlannerBridge {
     reqId: number | string,
     sessionId: string,
   ): Promise<void> {
-    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId, this.defaultAgent);
     if (!board) {
       const attached = attachedSessions.has(sessionId);
       const tail = attached
@@ -2397,10 +2412,10 @@ export class PlannerBridge {
       }
     }
 
-    const board = forkBoard({
+    const board = this.stampPlannerDefaults(forkBoard({
       source,
       description: newDescription.length > 0 ? newDescription : undefined,
-    });
+    }));
     const baseline0 = getLatestOrchestratorUsage(sessionId);
     if (baseline0) board.orchestratorUsageBaseline = { ...baseline0 };
     await this.seedOrchestratorIdentity(board, sessionId);
@@ -2691,6 +2706,7 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       attachments: attachResult.attachments,
     });
+    this.stampPlannerDefaults(board);
     const baseline0 = getLatestOrchestratorUsage(sessionId);
     if (baseline0) board.orchestratorUsageBaseline = { ...baseline0 };
     await this.seedOrchestratorIdentity(board, sessionId);
@@ -3087,6 +3103,7 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       attachments: attachResult.attachments,
     });
+    this.stampPlannerDefaults(board);
     const baselineStart = getLatestOrchestratorUsage(sessionId);
     if (baselineStart) board.orchestratorUsageBaseline = { ...baselineStart };
     await this.seedOrchestratorIdentity(board, sessionId);
@@ -6555,6 +6572,7 @@ export class PlannerBridge {
       fleetDefaults: boardFleetDefaults,
       contractBrief,
     });
+    this.stampPlannerDefaults(board);
     const baselineSetPlan = getLatestOrchestratorUsage(sessionId);
     if (baselineSetPlan) board.orchestratorUsageBaseline = { ...baselineSetPlan };
     await this.seedOrchestratorIdentity(board, sessionId);
@@ -7209,7 +7227,7 @@ export class PlannerBridge {
   }
 
   private toolRemove(reqId: number | string, sessionId: string): void {
-    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId);
+    const board = boards.get(sessionId) ?? findBoardOnDisk(sessionId, this.defaultAgent);
     if (!board) {
       return this.replyMcpTextError(reqId, "remove: no project on this session");
     }
