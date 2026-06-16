@@ -739,18 +739,26 @@ export interface ProjectIndexEntry {
 // nothing about archived projects — those live under archive/ and have
 // their own walk routine when needed.
 // Pick the next task that's ready to be assigned: status === "pending"
-// AND every dep is "done". Returns undefined when nothing is eligible
-// (could be because everything's done, blocked, or in flight). Walks in
-// declaration order — first eligible wins, which is deterministic.
+// AND every dep is "done" (with a carve-out below for a review's own
+// target). Returns undefined when nothing is eligible.
+//
+// Priority: review and distill tasks outrank plain work tasks. A
+// pending review carries information the planner needs before
+// committing more compute to siblings that could be invalidated by
+// the reviewer's verdict — without this preference, fan-out work
+// tasks pile up in `awaiting_review` while their reviews queue
+// behind freshly-eligible siblings, defeating the purpose of gating.
+// Within each priority class, declaration order is the tiebreaker
+// (deterministic).
 export function pickEligible(board: Board): Task | undefined {
   const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
-  for (const task of board.tasks) {
-    if (task.status !== "pending") continue;
-    // A review task whose `reviews` target is parked in awaiting_review
-    // is eligible — that holding state exists precisely so the review
-    // can run. Non-review dependents wait for the dep to reach a
-    // terminal state (done / superseded) so they don't race ahead of
-    // any reviewer-requested fixes.
+  // A review task whose `reviews` target is parked in awaiting_review
+  // is eligible — that holding state exists precisely so the review
+  // can run. Non-review dependents wait for the dep to reach a
+  // terminal state (done / superseded) so they don't race ahead of
+  // any reviewer-requested fixes.
+  const isEligible = (task: Task): boolean => {
+    if (task.status !== "pending") return false;
     const reviewsSet =
       task.kind === "review"
         ? new Set(
@@ -761,14 +769,20 @@ export function pickEligible(board: Board): Task | undefined {
                 : [],
           )
         : null;
-    const blocked = task.deps.some((d) => {
+    return !task.deps.some((d) => {
       const s = byId.get(d)?.status;
       if (s === "done" || s === "superseded") return false;
       if (s === "awaiting_review" && reviewsSet?.has(d)) return false;
       return true;
     });
-    if (blocked) continue;
-    return task;
+  };
+  for (const task of board.tasks) {
+    if (task.kind !== "review" && task.kind !== "distill") continue;
+    if (isEligible(task)) return task;
+  }
+  for (const task of board.tasks) {
+    if (task.kind === "review" || task.kind === "distill") continue;
+    if (isEligible(task)) return task;
   }
   return undefined;
 }

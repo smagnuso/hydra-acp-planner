@@ -333,6 +333,67 @@ describe("pickEligible", () => {
     ]);
     assert.equal(pickEligible(b), undefined);
   });
+
+  it("prefers an eligible review over an eligible work task declared earlier", () => {
+    // T1 is done and parked review-T1 is now eligible. T2/T3 are
+    // dep-less pending work tasks declared BEFORE review-T1. Without
+    // the priority pass review-T1 would queue behind them; with it,
+    // review-T1 wins.
+    const b = makeBoard([
+      makeTask("T1", { status: "awaiting_review" }),
+      makeTask("T2"),
+      makeTask("T3"),
+      makeTask("review-T1", {
+        deps: ["T1"],
+        kind: "review",
+        reviews: "T1",
+      }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "review-T1");
+  });
+
+  it("prefers an eligible distill over an eligible work task", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "done" }),
+      makeTask("T2"),
+      makeTask("distill-T1", {
+        deps: ["T1"],
+        kind: "distill",
+        reviews: "T1",
+      }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "distill-T1");
+  });
+
+  it("falls back to work tasks when no review is eligible", () => {
+    const b = makeBoard([
+      makeTask("T1"),
+      makeTask("review-T1", {
+        deps: ["T1"],
+        kind: "review",
+        reviews: "T1",
+      }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "T1");
+  });
+
+  it("orders reviews by declaration within the review priority class", () => {
+    const b = makeBoard([
+      makeTask("T1", { status: "awaiting_review" }),
+      makeTask("T2", { status: "awaiting_review" }),
+      makeTask("review-T2", {
+        deps: ["T2"],
+        kind: "review",
+        reviews: "T2",
+      }),
+      makeTask("review-T1", {
+        deps: ["T1"],
+        kind: "review",
+        reviews: "T1",
+      }),
+    ]);
+    assert.equal(pickEligible(b)?.id, "review-T2");
+  });
 });
 
 describe("inFlightCount", () => {
