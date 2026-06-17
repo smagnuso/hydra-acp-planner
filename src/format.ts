@@ -284,7 +284,7 @@ export function formatSessionsTable(
       role: "worker",
       session: shortSessionId(workerId),
       task: t?.id ?? "-",
-      state: t?.status ?? "-",
+      state: t ? reviewDisplayStatus(t, board.tasks) : "-",
       agent: agentCell.length > 0 ? agentCell : "-",
       done: totalTasks > 0 ? `${w.tasksCompleted.length}/${totalTasks}` : "-",
       cost: formatCost(w.usage?.costAmount, w.usage?.costCurrency),
