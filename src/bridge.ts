@@ -4122,9 +4122,32 @@ export class PlannerBridge {
         reason: failed > 0 ? "failed" : "complete",
         text: summary,
       });
+      // For execute_plan callers, ship the same structured findings
+      // shape get_findings would return — agent gets prose summary
+      // + machine-readable data in one shot, no follow-up call
+      // needed unless they want drill-down on a specific taskId.
+      const structuredFindings = collectFindings(board, { includeApproved: false });
+      const findingsCounts = countFindings(structuredFindings);
       const mcpResolved = this.resolveDeferredMcpExecute(
         orchestratorSessionId,
         summary,
+        {
+          structuredContent: {
+            projectId: board.projectId,
+            state: "done",
+            taskCount: board.tasks.length,
+            doneCount: done,
+            failedCount: failed,
+            counts: {
+              total: findingsCounts.total,
+              failed: findingsCounts.failed,
+              reviewIssues: findingsCounts.reviewIssues,
+              followUps: findingsCounts.followUps,
+              distill: findingsCounts.distill,
+            },
+            findings: structuredFindings,
+          },
+        },
       );
       if (!heldResolved && !mcpResolved) {
         // Neither a slash-command held turn nor an execute_plan MCP
@@ -6489,14 +6512,14 @@ export class PlannerBridge {
   private resolveDeferredMcpExecute(
     sessionId: string,
     text: string,
-    opts: { isError?: boolean } = {},
+    opts: { isError?: boolean; structuredContent?: Record<string, unknown> } = {},
   ): boolean {
     const entry = takeDeferredMcpReply(sessionId);
     if (!entry) return false;
     if (opts.isError) {
       this.replyMcpTextError(entry.reqId, text);
     } else {
-      this.replyMcpResult(entry.reqId, text);
+      this.replyMcpResult(entry.reqId, text, opts.structuredContent);
     }
     return true;
   }
