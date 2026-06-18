@@ -69,6 +69,12 @@ import {
   type HeldTurnReason,
   type HeldTurnVerb,
 } from "./held-turn.js";
+import {
+  clearDeferredMcpReply,
+  getDeferredMcpReply,
+  setDeferredMcpReply,
+  takeDeferredMcpReply,
+} from "./deferred-mcp.js";
 import { WorkerForwarder } from "./worker-forward.js";
 import { PLANNER_MCP_INSTRUCTIONS, PLANNER_MCP_TOOLS } from "./mcp-tools.js";
 import { readFileSync, rmSync } from "node:fs";
@@ -2136,10 +2142,12 @@ export class PlannerBridge {
       clearOrchestratorState(orchestratorSessionId);
       // Release any held turn so the orchestrator's commands/invoke
       // reply lands instead of hanging forever.
+      const removedText = `Removed project ${shortProjectId(canonical)}.`;
       resolveHeldTurn(orchestratorSessionId, {
         reason: "removed",
-        text: `Removed project ${shortProjectId(canonical)}.`,
+        text: removedText,
       });
+      this.resolveDeferredMcpExecute(orchestratorSessionId, removedText);
     }
     // And worker state.
     for (const workerId of workerIds) {
@@ -3315,10 +3323,12 @@ export class PlannerBridge {
       inFlightWorkerIds.length > 0
         ? `; ${inFlightWorkerIds.length} in-flight task${inFlightWorkerIds.length === 1 ? "" : "s"} reverted to pending`
         : "";
+    const stoppedText = `Project ${shortProjectId(board.projectId)} stopped${tail}. Use /hydra planner start (or the start tool) to resume.`;
     resolveHeldTurn(orchestratorSessionId, {
       reason: "cancelled",
-      text: `Project ${shortProjectId(board.projectId)} stopped${tail}. Use /hydra planner start (or the start tool) to resume.`,
+      text: stoppedText,
     });
+    this.resolveDeferredMcpExecute(orchestratorSessionId, stoppedText);
    }
 
   // Surface "project stuck behind failed dependencies" by ending the
@@ -3355,7 +3365,9 @@ export class PlannerBridge {
     // the turn cleanly. If there's no held turn (rehydrated project
     // in degraded mode), fall back to a synthetic message so the
     // transcript still carries the notice.
-    if (!resolveHeldTurn(orchestratorSessionId, { reason: "failed", text: msg })) {
+    const heldResolved = resolveHeldTurn(orchestratorSessionId, { reason: "failed", text: msg });
+    const mcpResolved = this.resolveDeferredMcpExecute(orchestratorSessionId, msg);
+    if (!heldResolved && !mcpResolved) {
       void this.emitSyntheticMessage(orchestratorSessionId, msg, {
         event: "project-blocked-by-failure",
       });
@@ -4106,13 +4118,19 @@ export class PlannerBridge {
       const summary = findings
         ? `${headline}\n\n${statusDump}\n\n${findings}${pointer}`
         : `${headline}\n\n${statusDump}`;
-      if (!resolveHeldTurn(orchestratorSessionId, {
+      const heldResolved = resolveHeldTurn(orchestratorSessionId, {
         reason: failed > 0 ? "failed" : "complete",
         text: summary,
-      })) {
-        // No held turn (e.g. rehydrated project running in degraded
-        // mode) — fall back to a synthetic chunk so the user still
-        // sees the celebration.
+      });
+      const mcpResolved = this.resolveDeferredMcpExecute(
+        orchestratorSessionId,
+        summary,
+      );
+      if (!heldResolved && !mcpResolved) {
+        // Neither a slash-command held turn nor an execute_plan MCP
+        // call is in flight (e.g. rehydrated project running in
+        // degraded mode) — fall back to a synthetic chunk so the user
+        // still sees the celebration.
         void this.emitSyntheticMessage(orchestratorSessionId, summary);
       }
       return;
@@ -6129,16 +6147,20 @@ export class PlannerBridge {
       return;
     }
     if (normalizedReason === "abandoned") {
+      const abandonedText = `Session closing — ${shortProjectId(board.projectId)} state preserved on disk.`;
       resolveHeldTurn(sessionId, {
         reason: "cancelled",
-        text: `Session closing — ${shortProjectId(board.projectId)} state preserved on disk.`,
+        text: abandonedText,
       });
+      this.resolveDeferredMcpExecute(sessionId, abandonedText);
       return;
     }
+    const yieldedText = `Pausing live view of ${shortProjectId(board.projectId)} for your prompt — will resume after.`;
     resolveHeldTurn(sessionId, {
       reason: "yielded",
-      text: `Pausing live view of ${shortProjectId(board.projectId)} for your prompt — will resume after.`,
+      text: yieldedText,
     });
+    this.resolveDeferredMcpExecute(sessionId, yieldedText);
     // After the amended prompt's turn completes, inject `/hydra
     // planner continue` at the queue head so the live view resumes —
     // keeps the session's busy indicator on continuously through the
@@ -6377,7 +6399,7 @@ export class PlannerBridge {
       );
     }
     const MUTATING_TOOLS = new Set([
-      'set_plan', 'start', 'add_task', 'update_task', 'restart',
+      'set_plan', 'start', 'execute_plan', 'add_task', 'update_task', 'restart',
       'stop', 'pause', 'resume', 'skip', 'retry', 'remove',
     ]);
     if (MUTATING_TOOLS.has(tool) && !(await this.requireInteractive(sessionId))) {
@@ -6395,6 +6417,8 @@ export class PlannerBridge {
           return await this.toolSetPlan(req.id, sessionId, args);
         case "start":
           return await this.toolExecute(req.id, sessionId);
+        case "execute_plan":
+          return await this.toolExecutePlan(req.id, sessionId);
         case "get_plan":
           return await this.toolGetPlan(req.id, sessionId);
         case "get_findings":
@@ -6454,6 +6478,27 @@ export class PlannerBridge {
       payload.structuredContent = structuredContent;
     }
     this.client.reply(reqId, payload);
+  }
+
+  // Resolve a pending execute_plan MCP reply on this session, if one
+  // is registered. Tee'd alongside resolveHeldTurn at every terminal
+  // site (project done / failed / stopped / cancelled / removed) so
+  // that execute_plan callers see the same final summary the slash
+  // command's held turn would emit. Idempotent — second resolve is a
+  // no-op. Returns true if a deferred reply was resolved.
+  private resolveDeferredMcpExecute(
+    sessionId: string,
+    text: string,
+    opts: { isError?: boolean } = {},
+  ): boolean {
+    const entry = takeDeferredMcpReply(sessionId);
+    if (!entry) return false;
+    if (opts.isError) {
+      this.replyMcpTextError(entry.reqId, text);
+    } else {
+      this.replyMcpResult(entry.reqId, text);
+    }
+    return true;
   }
 
   // ── Individual tool handlers ───────────────────────────────────────
@@ -6687,6 +6732,75 @@ export class PlannerBridge {
         state: "running",
       },
     );
+  }
+
+  // Blocking variant of toolExecute: starts the project, then holds
+  // the MCP reply open until the project hits a terminal state. The
+  // agent's tool call IS the held turn — plan-panel updates render
+  // inside it, and the reply lands with the same completion summary
+  // a slash-command held turn would emit. Resolution is wired in
+  // resolveDeferredMcpExecute, tee'd alongside resolveHeldTurn at
+  // every project terminal site.
+  private async toolExecutePlan(
+    reqId: number | string,
+    sessionId: string,
+  ): Promise<void> {
+    const board = boards.get(sessionId);
+    if (!board) {
+      return this.replyMcpTextError(
+        reqId,
+        "execute_plan: no plan on this session. Call set_plan first.",
+      );
+    }
+    if (getDeferredMcpReply(sessionId)) {
+      return this.replyMcpTextError(
+        reqId,
+        `execute_plan: another execute_plan call is already in flight on this session. Wait for it to terminate, or call get_status to inspect progress.`,
+      );
+    }
+    if (board.state === "running") {
+      return this.replyMcpTextError(
+        reqId,
+        `execute_plan: project ${shortProjectId(board.projectId)} is already running. Use get_status to inspect, or stop to halt.`,
+      );
+    }
+    if (board.state === "done" || board.state === "failed") {
+      return this.replyMcpTextError(
+        reqId,
+        `execute_plan: project ${shortProjectId(board.projectId)} is ${board.state}. Call set_plan to start a new project.`,
+      );
+    }
+    if (board.state !== "ready" && board.state !== "stopped" && board.state !== "paused") {
+      return this.replyMcpTextError(
+        reqId,
+        `execute_plan: project ${shortProjectId(board.projectId)} is ${board.state}; not ready to start.`,
+      );
+    }
+    // Register the deferred reply BEFORE kicking the scheduler.
+    // resumeBoardToRunning is async but may synchronously schedule
+    // the first task transitions, and an extremely fast project
+    // (every task already done? all skipped?) could in principle
+    // reach the terminal site before we return from resume; having
+    // the deferred entry in place first guarantees the resolver
+    // finds it.
+    setDeferredMcpReply(sessionId, reqId, board.projectId);
+    const result = await this.resumeBoardToRunning(sessionId, board);
+    if (!result) {
+      clearDeferredMcpReply(sessionId);
+      return this.replyMcpTextError(
+        reqId,
+        `execute_plan: project ${shortProjectId(board.projectId)} could not be resumed (unexpected state).`,
+      );
+    }
+    // Initial plan snapshot — same first-render moment slash-command
+    // held turns get from holdAndReply. Subsequent updates emit
+    // automatically as the scheduler progresses.
+    this.emitPlanUpdate(sessionId, board);
+    log.info(
+      `execute_plan holding MCP reply for ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)}`,
+    );
+    // No reply here — the call stays open until a terminal site
+    // calls resolveDeferredMcpExecute.
   }
 
   private async toolGetPlan(
@@ -7245,10 +7359,12 @@ export class PlannerBridge {
     if (boards.get(sessionId)?.projectId === canonical) {
       boards.delete(sessionId);
       clearOrchestratorState(sessionId);
+      const removedText = `Removed project ${shortProjectId(canonical)}.`;
       resolveHeldTurn(sessionId, {
         reason: "removed",
-        text: `Removed project ${shortProjectId(canonical)}.`,
+        text: removedText,
       });
+      this.resolveDeferredMcpExecute(sessionId, removedText);
     }
     this.purgeForkOwnerCacheFor(sessionId);
     for (const workerId of workerIds) {

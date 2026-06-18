@@ -42,7 +42,15 @@ Workflow:
      stop → set_plan → start when structural changes are too \
      sweeping for update_task / add_task / skip / retry to express.
 
-  5. When the user agrees, call start to kick off workers.
+  5. When the user agrees, call execute_plan to kick off workers \
+     AND keep the live view anchored to your own turn for the \
+     duration of the project (the call blocks until the project \
+     terminates, returning the completion summary). Use start \
+     instead only when the user explicitly wants to start-and-go \
+     ('start it and let me do something else'); start returns \
+     immediately and the live view appears in a separately-injected \
+     follow-up turn. Never ask the user to type \`/hydra planner \
+     start\` themselves once they've already approved.
 
   6. While running, call get_status when the user asks about \
      progress, add_task to slot in mid-flight additions, \
@@ -66,7 +74,16 @@ worker count, fleetDefaults for session-wide preferences, per-task \
 agent/model for specific overrides. Never silently override what \
 the user requested.
 
-Never call start without the user's explicit go-ahead.\
+Never call start without the user's explicit go-ahead.
+
+Do NOT maintain your own TodoWrite / todo list for planner work. \
+The plan IS the todo list: set_plan stores it, the live plan panel \
+renders it with ticking checkboxes as tasks progress, and \
+get_status / get_plan / get_findings expose it on demand. A \
+parallel TodoWrite duplicates the same information in the \
+transcript, drifts out of sync with the board, and adds noise. \
+Use set_plan to materialize the plan for user review and \
+execute_plan / start to run it — that's the whole tracking story.\
 `;
 
 export interface PlannerMcpTool {
@@ -255,7 +272,16 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "start",
     description:
-      "Kick off the ready plan on this session. If no ready plan exists, fails with a hint to call set_plan first. Returns when the worker scheduler is started — progress is observable via subsequent get_status calls or via the live plan rendering in the orchestrator's turn.",
+      "Kick off the ready plan on this session and return immediately once the worker scheduler is started. Use this when the user wants to start the work but continue chatting (the live view appears in a separately-injected `/hydra planner continue` turn after your turn ends). For the more common case where the user has just approved kickoff and wants to watch it run, prefer execute_plan — it blocks until the project finishes and keeps the live view inside your own turn.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "execute_plan",
+    description:
+      "Kick off the ready plan AND block until the project terminates (done / failed / stopped). The live plan view renders inside your own turn for its entire duration, so the user sees ticking checkboxes without any extra slash command. Use this whenever the user has approved kickoff in the current turn ('go for it', 'run it', 'looks good'). On termination the tool returns the same completion summary the slash command would emit (including findings, if any). If the user halts via `/hydra planner stop`, this returns with a stopped summary; if they amend / yield mid-flight, this returns with a 'paused live view' note while the project keeps running in the background.",
     inputSchema: {
       type: "object",
       properties: {},
