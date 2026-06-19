@@ -410,7 +410,7 @@ The CLI inspects the planner's on-disk state without needing the
 daemon to be up:
 
 ```text
-hydra-acp planner                       # list active projects
+hydra-acp planner                       # list projects (live + recent terminal)
 hydra-acp planner list [--all] [--json]
 hydra-acp planner info <projectId> [--json]
 hydra-acp planner remove <projectId>

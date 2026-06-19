@@ -41,7 +41,7 @@ function printHelp(): void {
       "hydra-acp-planner — multi-agent project orchestrator for hydra-acp",
       "",
       "Usage:",
-      "  hydra-acp planner [list]              List active projects (--all includes done/failed)",
+      "  hydra-acp planner [list]              List projects (live + recent terminal; --all for everything)",
       "  hydra-acp planner info [projectId]    Show one project's board (defaults to the sole active project)",
       "  hydra-acp planner remove <projectId>  Delete a project (closes worker sessions; orchestrator session untouched)",
       "  hydra-acp planner --version",
@@ -64,32 +64,35 @@ function ageString(iso: string): string {
   return `${d}d`;
 }
 
+const TERMINAL_PROJECT_LIMIT = 20;
+
 function runList(argv: readonly string[]): void {
   const json = argv.includes("--json");
   const all = argv.includes("--all");
   const everything = listProjects();
-  // Default view: hide terminal projects (done / failed). Same idea as
-  // `hydra-acp session` filtering to live + recent. --all to include.
-  const projects = all
-    ? everything
-    : everything.filter((p) => p.state !== "done" && p.state !== "failed");
-  const hiddenCount = everything.length - projects.length;
 
   if (json) {
-    process.stdout.write(JSON.stringify(projects, null, 2) + "\n");
+    process.stdout.write(JSON.stringify(everything, null, 2) + "\n");
     return;
   }
-  if (projects.length === 0) {
-    if (hiddenCount > 0) {
-      process.stdout.write(
-        `No active planner projects. (${hiddenCount} terminal — re-run with --all to see them.)\n`,
-      );
-      return;
-    }
+  if (everything.length === 0) {
     process.stdout.write(
       "No planner projects yet. Start one with:\n  /hydra planner create <description>\nin any hydra-acp session.\n",
     );
     return;
+  }
+  // Mirror `hydra-acp session list`: always show live (non-terminal)
+  // rows; cap terminal (done/failed) rows to the N most recent unless
+  // --all is passed. listProjects() is already sorted most-recent-first.
+  const isTerminal = (s: string) => s === "done" || s === "failed";
+  let projects = everything;
+  let truncated = 0;
+  if (!all) {
+    const live = everything.filter((p) => !isTerminal(p.state));
+    const terminal = everything.filter((p) => isTerminal(p.state));
+    const terminalShown = terminal.slice(0, TERMINAL_PROJECT_LIMIT);
+    truncated = terminal.length - terminalShown.length;
+    projects = [...live, ...terminalShown];
   }
   // Compact, scannable. Columns: short projectId, state, tasks-done/total,
   // age, description (truncated). Prefix is stripped for display; the
@@ -122,9 +125,9 @@ function runList(argv: readonly string[]): void {
       `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${sess}  ${desc}\n`,
     );
   }
-  if (hiddenCount > 0) {
+  if (truncated > 0) {
     process.stdout.write(
-      `\n(${hiddenCount} terminal project${hiddenCount === 1 ? "" : "s"} hidden — re-run with --all to include.)\n`,
+      `\n... ${truncated} more terminal project${truncated === 1 ? "" : "s"} hidden. Use --all to show.\n`,
     );
   }
 }
