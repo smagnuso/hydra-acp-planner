@@ -4378,7 +4378,7 @@ export class PlannerBridge {
 
     // Per-task model override (M6.2). The child_session/spawn protocol
     // doesn't take a model param — the model is applied via
-    // session/set_model on the live session. Fire-and-forget: if the
+    // session/set_model on the warm session. Fire-and-forget: if the
     // worker's agent doesn't accept the model, log a warning and let
     // the task run on the agent's default model.
     const setModelPromise: Promise<unknown> | null = effectiveModel
