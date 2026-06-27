@@ -86,8 +86,11 @@ import {
   findTaskById,
   forkBoard,
   inFlightCount,
+  INFRA_FAILURE_CAP,
+  isInfrastructureFailure,
   isInFlight,
   listProjects,
+  STALE_TRAFFIC_TIMEOUT_MS,
   loadBoard,
   newBoard,
   nowIso,
@@ -369,6 +372,11 @@ interface PendingDispatch {
 const pendingDispatches = new Map<string, PendingDispatch>(); // by messageId
 
 const ACTIVATION_POLL_INTERVAL_MS = 3000;
+
+// How often the stale-traffic watchdog scans in-flight tasks. The
+// per-task threshold (STALE_TRAFFIC_TIMEOUT_MS) is the real signal;
+// this just caps the worst-case detection lag.
+const STALE_WATCHDOG_INTERVAL_MS = 30 * 1000;
 
 // Walk projects on disk and find the board owned by `orchestratorSessionId`.
 // Cheap fallback for `/hydra planner status` queries on done/failed
@@ -824,6 +832,54 @@ export class PlannerBridge {
 
   start(): void {
     this.client.start();
+    this.ensureStaleWatchdog();
+  }
+
+  private ensureStaleWatchdog(): void {
+    if (this.staleWatchdogTimer) return;
+    this.staleWatchdogTimer = setInterval(() => {
+      this.runStaleWatchdog();
+    }, STALE_WATCHDOG_INTERVAL_MS);
+    if (typeof this.staleWatchdogTimer.unref === "function") {
+      this.staleWatchdogTimer.unref();
+    }
+  }
+
+  // Scan every in-memory board for in-flight tasks whose worker
+  // hasn't emitted a session/update in STALE_TRAFFIC_TIMEOUT_MS.
+  // Treat each match as an infrastructure failure — auto-requeue
+  // through handleTaskFailure with a "stalled" reason, which
+  // isInfrastructureFailure recognises and routes to the no-bump
+  // retry path. Bounded by INFRA_FAILURE_CAP so a genuinely-stuck
+  // task eventually fails for real instead of looping.
+  private runStaleWatchdog(): void {
+    if (this.shuttingDown) return;
+    const now = Date.now();
+    for (const [orchestratorId, board] of boards.entries()) {
+      if (board.state !== "running") continue;
+      for (const task of board.tasks) {
+        if (task.status !== "running") continue;
+        const workerId = task.assignedTo;
+        if (!workerId || workerId === "orchestrator") continue;
+        const w = board.workers[workerId];
+        if (!w) continue;
+        const last = w.lastActivityAt;
+        if (typeof last !== "number") continue;
+        const idleMs = now - last;
+        if (idleMs < STALE_TRAFFIC_TIMEOUT_MS) continue;
+        const idleMin = Math.round(idleMs / 60000);
+        log.warn(
+          `stale watchdog: ${task.id} on worker …${workerId.slice(-8)} idle ${idleMin}m — treating as infrastructure failure`,
+        );
+        this.handleTaskFailure(
+          orchestratorId,
+          workerId,
+          board,
+          task,
+          `stalled: no worker activity in ${idleMin}m`,
+        );
+      }
+    }
   }
 
   stop(): void {
@@ -836,10 +892,15 @@ export class PlannerBridge {
       clearInterval(this.activationTimer);
       this.activationTimer = null;
     }
+    if (this.staleWatchdogTimer) {
+      clearInterval(this.staleWatchdogTimer);
+      this.staleWatchdogTimer = null;
+    }
     this.client.stop();
   }
 
   private activationTimer: NodeJS.Timeout | null = null;
+  private staleWatchdogTimer: NodeJS.Timeout | null = null;
   private activationTickInFlight: Promise<void> | null = null;
 
   // True between PlannerBridge.stop() and process exit. Used to
@@ -3628,6 +3689,20 @@ export class PlannerBridge {
     const workerState = getWorkerState(sessionId);
     if (!workerState) return;
 
+    // Watchdog heartbeat — every session/update from this worker
+    // counts as liveness, regardless of kind. Read by the stale-
+    // traffic watchdog (runStaleWatchdog) to detect wedged turns.
+    const orchestratorIdForActivity = orchestratorOfWorker(sessionId);
+    const boardForActivity = orchestratorIdForActivity
+      ? boards.get(orchestratorIdForActivity)
+      : undefined;
+    const workerEntryForActivity = boardForActivity
+      ? boardForActivity.workers[sessionId]
+      : undefined;
+    if (workerEntryForActivity) {
+      workerEntryForActivity.lastActivityAt = Date.now();
+    }
+
     const kind = updateKind(envelope);
     const forwarder = workerForwarders.get(sessionId);
     if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
@@ -4426,6 +4501,7 @@ export class PlannerBridge {
       tasksCompleted: [],
       agent: persistedAgent,
       model: persistedModel,
+      lastActivityAt: Date.now(),
     };
     saveBoard(board, orchestratorSessionId);
 
@@ -5848,6 +5924,51 @@ export class PlannerBridge {
       void this.closeWorker(workerSessionId);
       return;
     }
+    // Infrastructure-class failures (connection closed mid-turn,
+    // stall-watchdog timeout, ws drops) are not the agent's fault —
+    // they're transport-layer noise. Treat them as auto-retry without
+    // bumping attemptCount (which is reserved for review-rejection
+    // budgeting), bounded by INFRA_FAILURE_CAP so a genuinely stuck
+    // task eventually escalates to a real failure that surfaces in
+    // findings rather than looping silently.
+    const infra = isInfrastructureFailure(reason);
+    if (infra) {
+      const infraSoFar = (task.infraFailureCount ?? 0) + 1;
+      task.infraFailureCount = infraSoFar;
+      if (infraSoFar <= INFRA_FAILURE_CAP) {
+        log.warn(
+          `task ${task.id} infrastructure failure (#${infraSoFar}/${INFRA_FAILURE_CAP}) on worker …${workerSessionId.slice(-8)}: ${reason} — auto-requeueing without bumping attemptCount`,
+        );
+        // Revert the spawn-time attemptCount bump so this attempt
+        // doesn't count toward the review-rejection retry budget.
+        if (task.attemptCount > 0) task.attemptCount -= 1;
+        task.status = "pending";
+        task.assignedTo = null;
+        task.startedAt = null;
+        const workerEntry = board.workers[workerSessionId];
+        if (workerEntry) {
+          workerEntry.currentTaskId = null;
+        }
+        saveBoard(board, orchestratorSessionId);
+        this.emitPlanUpdate(orchestratorSessionId, board);
+        void this.emitSyntheticMessage(
+          orchestratorSessionId,
+          `${task.id} on worker ${shortSessionId(workerSessionId)} hit an infrastructure failure (${reason}); auto-retrying (${infraSoFar}/${INFRA_FAILURE_CAP})`,
+          { event: "task-infra-failure", taskId: task.id },
+        );
+        this.endWorkerForward(workerSessionId, { flush: true });
+        clearWorkerState(workerSessionId);
+        unregisterWorker(workerSessionId);
+        void this.closeWorker(workerSessionId);
+        void this.scheduleEligibleTasks(orchestratorSessionId, board);
+        return;
+      }
+      log.warn(
+        `task ${task.id} infrastructure failure cap (${INFRA_FAILURE_CAP}) exceeded — escalating to real failure`,
+      );
+      // Fall through to the normal failure path below.
+    }
+
     log.warn(`task ${task.id} failed on worker …${workerSessionId.slice(-8)}: ${reason}`);
     task.status = "failed";
     task.assignedTo = null;

@@ -10,6 +10,7 @@ import {
   findTaskById,
   forkBoard,
   inFlightCount,
+  isInfrastructureFailure,
   listProjects,
   loadBoard,
   newBoard,
@@ -1662,9 +1663,25 @@ describe("findTaskById", () => {
     const t1: Task = { id: "T1", title: "T1", deps: [], status: "done", attemptCount: 0 };
     const t2: Task = { id: "T2", title: "T2", deps: ["t1"], status: "pending", attemptCount: 0 };
     const b = mkBoard([t1, t2]);
-    // pickEligible builds an id->task Map keyed on the literal stored id.
-    // deps:['t1'] does not equal 'T1' under === so T2 should be blocked
-    // (no silent case-insensitive match for internal references).
     assert.equal(pickEligible(b), undefined);
+  });
+});
+
+describe("isInfrastructureFailure", () => {
+  it("matches connection-closed strings the daemon actually emits", () => {
+    assert.equal(isInfrastructureFailure("task turn failed: -32603: connection closed"), true);
+    assert.equal(isInfrastructureFailure("connection is closed"), true);
+    assert.equal(isInfrastructureFailure("websocket disconnected"), true);
+    assert.equal(isInfrastructureFailure("ws closed before reply"), true);
+  });
+
+  it("matches stall-watchdog reasons emitted by runStaleWatchdog", () => {
+    assert.equal(isInfrastructureFailure("stalled: no worker activity in 11m"), true);
+  });
+
+  it("does not match real agent failures", () => {
+    assert.equal(isInfrastructureFailure("worker reply missing or malformed hydra-result block after 3 attempts"), false);
+    assert.equal(isInfrastructureFailure("review rejected after max attempts"), false);
+    assert.equal(isInfrastructureFailure("agent threw: tool 'bash' denied"), false);
   });
 });

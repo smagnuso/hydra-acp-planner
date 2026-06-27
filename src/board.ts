@@ -30,6 +30,42 @@ export type TaskStatus =
 export function isInFlight(status: TaskStatus): boolean {
   return status === "assigned" || status === "running";
 }
+
+// Recognise reasons returned to handleTaskFailure that are really
+// about the transport/worker lifecycle dying out from under us
+// rather than the agent producing a bad result. These are auto-
+// retried without bumping the work task's attemptCount (which is
+// reserved for review-rejection budgeting). See INFRA_FAILURE_CAP
+// for the ceiling on auto-retry before escalation.
+//
+// Conservative matcher: only obviously-transport phrases. We'd
+// rather under-classify (treat a borderline failure as a real one
+// and let the user retry) than over-classify and silently retry
+// genuine bugs.
+export function isInfrastructureFailure(reason: string): boolean {
+  const s = reason.toLowerCase();
+  if (s.includes("connection closed")) return true;
+  if (s.includes("connection is closed")) return true;
+  if (s.includes("websocket")) return true;
+  if (s.includes("ws closed")) return true;
+  if (s.includes("stalled: no worker activity")) return true;
+  return false;
+}
+
+// Hard ceiling on auto-retried infrastructure failures per task.
+// Past this the task fails for real instead of looping silently.
+export const INFRA_FAILURE_CAP = Number(
+  process.env.PLANNER_INFRA_FAILURE_CAP ?? "5",
+);
+
+// Watchdog threshold: a `running` task whose worker has not emitted
+// any session/update for this many ms is treated as wedged. Tuned
+// to ride out legitimate slow tool calls / cold local-model loads
+// while still escaping the 60-minute daemon idle-timeout wedge
+// observed when opencode `task` subagents fail to return.
+export const STALE_TRAFFIC_TIMEOUT_MS = Number(
+  process.env.PLANNER_STALL_TIMEOUT_MS ?? `${10 * 60 * 1000}`,
+);
 // Board state machine:
 //
 //   decomposing → ready → running → done
@@ -117,6 +153,12 @@ export interface Task {
   distillOf?: string;
   runOn?: "orchestrator" | "worker";
   reviewFeedback?: string[];
+  // Count of times this task was failed by an infrastructure error
+  // (connection closed mid-turn, stale-traffic timeout, etc.) and
+  // auto-requeued without bumping attemptCount. Bounded by
+  // INFRA_FAILURE_CAP — past that, infra failures escalate to a
+  // normal `failed` so the user notices instead of looping silently.
+  infraFailureCount?: number;
   riskLevel?: "low" | "medium" | "high";
   reviewHint?: "skip" | "optional" | "recommended" | "required";
   onReject?: {
@@ -365,6 +407,14 @@ export interface Board {
     // worker order — see plan-update.ts). Ephemeral: not persisted
     // across daemon restarts; the next worker emit rebuilds them.
     subtodos?: WorkerSubtodo[];
+    // Wall-clock ms of the last session/update we saw from this
+    // worker. Updated on every notification in handleWorkerSessionUpdate.
+    // Used by the stale-traffic watchdog to detect workers whose
+    // turn never ends (e.g. an opencode `task` subagent invocation
+    // that wedged in_progress forever — see investigation notes).
+    // Optional / not persisted across crashes; lost workers refresh
+    // on the next update.
+    lastActivityAt?: number;
   }>;
   concurrencyCap: number;
   // When true, decomposition won't recompute concurrencyCap from the
