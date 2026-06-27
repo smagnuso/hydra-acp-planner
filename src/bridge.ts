@@ -5909,14 +5909,29 @@ export class PlannerBridge {
     // followed by a redundant "Tn failed — task turn failed: -32603"
     // line for each in-flight worker. Quiet cleanup is the right
     // behavior — the cancel summary already accounts for these.
+    //
+    // Also bail when the task has been reassigned to a *different*
+    // worker since this failure was raised. Concretely: the stale-
+    // watchdog can flip a stalled task to `pending`, kick the
+    // scheduler synchronously, and have a fresh worker claim the
+    // task (status="assigned"/"running") before the original worker's
+    // emit-await promise — which is already in-flight with the dead
+    // connection — finally rejects and lands here. Without the
+    // assignedTo guard, the late rejection runs the infra-retry path
+    // a second time and the scheduler spawns *yet another* worker
+    // for the same task. Concretely observed on T10:
+    //   21:04:17 watchdog → handleTaskFailure → pending → respawn (worker diZ63wgI assigned)
+    //   21:04:17 stale emit-await rejection → handleTaskFailure (worker 8lINBX9T) → another respawn (Sf3vl1KY assigned)
+    // → two live workers fighting over T10.
     if (
       task.status === "failed" ||
       task.status === "pending" ||
+      task.assignedTo !== workerSessionId ||
       board.state === "failed" ||
       board.state === "stopped"
     ) {
       log.debug(
-        `task ${task.id}: ignoring late failure (${reason}) — already accounted for by stop/cancel`,
+        `task ${task.id}: ignoring late failure (${reason}) on worker …${workerSessionId.slice(-8)} — task status=${task.status} assignedTo=${task.assignedTo ? "…" + task.assignedTo.slice(-8) : "null"}`,
       );
       this.endWorkerForward(workerSessionId);
       clearWorkerState(workerSessionId);
