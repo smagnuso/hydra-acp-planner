@@ -589,8 +589,8 @@ describe("listProjects", () => {
 });
 
 describe("BOARD_SCHEMA_VERSION", () => {
-  it("is 2 after phase 1 schema additions", () => {
-    assert.equal(BOARD_SCHEMA_VERSION, 2);
+  it("is 3 after running-status split", () => {
+    assert.equal(BOARD_SCHEMA_VERSION, 3);
   });
 });
 
@@ -617,7 +617,7 @@ describe("schema migration v1 → v2", () => {
     saveBoard(b, "s_mig");
     const loaded = loadBoard(b.projectId);
     assert.ok(loaded);
-    assert.equal(loaded!.version, 2);
+    assert.equal(loaded!.version, BOARD_SCHEMA_VERSION);
   });
 
   it("sets kind='work' on tasks that lack it during migration", () => {
@@ -637,19 +637,16 @@ describe("schema migration v1 → v2", () => {
     assert.equal(loaded!.tasks[0]!.kind, "review");
   });
 
-  it("does not re-migrate a board already at version 2", () => {
-    const b = newBoard({ description: "v2" });
-    b.version = 2;
-    saveBoard(b, "s_mig_v2");
-    // Load multiple times — version should stay 2.
+  it("does not re-migrate a board already at current version", () => {
+    const b = newBoard({ description: "vN" });
+    saveBoard(b, "s_mig_vN");
     let loaded = loadBoard(b.projectId);
     assert.ok(loaded);
-    assert.equal(loaded!.version, 2);
-    const t = loaded!.tasks[0];
-    saveBoard(loaded, "s_mig_v2");
+    assert.equal(loaded!.version, BOARD_SCHEMA_VERSION);
+    saveBoard(loaded, "s_mig_vN");
     loaded = loadBoard(b.projectId);
     assert.ok(loaded);
-    assert.equal(loaded!.version, 2);
+    assert.equal(loaded!.version, BOARD_SCHEMA_VERSION);
   });
 });
 
@@ -829,17 +826,15 @@ describe("superseded status semantics", () => {
   });
 });
 
-describe("newBoard creates version 2 boards", () => {
+describe("newBoard creates current-version boards", () => {
   it("has BOARD_SCHEMA_VERSION as its version", () => {
     const b = newBoard({ description: "x" });
-    assert.equal(b.version, 2);
+    assert.equal(b.version, BOARD_SCHEMA_VERSION);
   });
 
   it("tasks created via newBoard default to work kind", () => {
-    // newBoard doesn't create tasks, but a decomposer-emitted task
-    // with the migrated board should get kind="work".
     const b = newBoard({ description: "x" });
-    assert.equal(b.version, 2);
+    assert.equal(b.version, BOARD_SCHEMA_VERSION);
   });
 });
 

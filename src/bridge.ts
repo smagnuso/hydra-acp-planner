@@ -86,6 +86,7 @@ import {
   findTaskById,
   forkBoard,
   inFlightCount,
+  isInFlight,
   listProjects,
   loadBoard,
   newBoard,
@@ -828,8 +829,8 @@ export class PlannerBridge {
   stop(): void {
     // Mark shutdown so in-flight emit catches don't mark tasks failed.
     // The work continues on the daemon's side; we want it to stay
-    // "assigned" on disk so the next planner startup resumes it via
-    // rehydrate.
+    // in-flight (assigned/running) on disk so the next planner startup
+    // resumes it via rehydrate.
     this.shuttingDown = true;
     if (this.activationTimer) {
       clearInterval(this.activationTimer);
@@ -845,8 +846,8 @@ export class PlannerBridge {
   // distinguish "ws closed because we're shutting down" from "ws
   // closed because of some other failure" in task-turn catch
   // handlers. When true, do not call handleTaskFailure — let the
-  // on-disk task state stay "assigned" so the next process startup
-  // picks it up.
+  // on-disk task state stay in-flight (assigned/running) so the next
+  // process startup picks it up.
   private shuttingDown = false;
 
   // Recognise errors that are really about our connection going down
@@ -976,7 +977,7 @@ export class PlannerBridge {
        });
 
       for (const task of board.tasks) {
-        if (task.status !== "assigned" || !task.assignedTo) continue;
+        if (!isInFlight(task.status) || !task.assignedTo) continue;
         const workerId = task.assignedTo;
         setWorkerState(workerId, {
           orchestratorSessionId: orchestratorId,
@@ -1000,7 +1001,7 @@ export class PlannerBridge {
       // pending so the scheduler can reschedule them. The previous
       // process crashed mid-review; the host session is free again.
       for (const task of board.tasks) {
-        if (task.kind === "review" && task.status === "assigned" && task.assignedTo === "orchestrator") {
+        if (task.kind === "review" && isInFlight(task.status) && task.assignedTo === "orchestrator") {
           task.status = "pending";
           task.assignedTo = null;
           task.startedAt = null;
@@ -1100,7 +1101,7 @@ export class PlannerBridge {
     }
 
     for (const task of board.tasks) {
-      if (task.status !== "assigned" || !task.assignedTo) continue;
+      if (!isInFlight(task.status) || !task.assignedTo) continue;
       const workerId = task.assignedTo;
       const ok = await this.wakeAndAttachWorker(workerId, task.id, board.projectId);
       if (ok) {
@@ -1400,7 +1401,7 @@ export class PlannerBridge {
       return;
     }
     const inFlight = board.tasks.filter(
-      (t) => t.status === "assigned" && t.assignedTo,
+      (t) => isInFlight(t.status) && t.assignedTo,
     ).length;
     // Shared cleanup path. Resolves the held turn if one exists,
     // which makes the orchestrator's held commands/invoke reply with
@@ -1643,7 +1644,7 @@ export class PlannerBridge {
 
     // If a worker is currently on this task, free it up.
     const workerId = task.assignedTo;
-    if (task.status === "assigned" && workerId) {
+    if (isInFlight(task.status) && workerId) {
       this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
@@ -1674,7 +1675,7 @@ export class PlannerBridge {
   // flow) after one or more invocations.
   private retryOne(board: Board, orchestratorSessionId: string, task: Task): void {
     const workerId = task.assignedTo;
-    if (task.status === "assigned" && workerId) {
+    if (isInFlight(task.status) && workerId) {
       this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
@@ -1718,7 +1719,7 @@ export class PlannerBridge {
         if (other.status === "pending") continue;
         const prevStatus = other.status;
         const orchAssigned =
-          other.status === "assigned" && other.assignedTo === "orchestrator";
+          isInFlight(other.status) && other.assignedTo === "orchestrator";
         other.status = "pending";
         other.assignedTo = null;
         other.startedAt = null;
@@ -1939,7 +1940,7 @@ export class PlannerBridge {
     const closedWorkers: string[] = [];
     for (const task of board.tasks) {
       const workerId = task.assignedTo;
-      if (task.status === "assigned" && workerId && workerId !== "orchestrator") {
+      if (isInFlight(task.status) && workerId && workerId !== "orchestrator") {
         this.endWorkerForward(workerId);
         clearWorkerState(workerId);
         unregisterWorker(workerId);
@@ -2035,7 +2036,7 @@ export class PlannerBridge {
 
     // Find the task this worker is on (if any).
     const task = board.tasks.find(
-      (t) => t.status === "assigned" && t.assignedTo === workerId,
+      (t) => isInFlight(t.status) && t.assignedTo === workerId,
     );
 
     // Close + clean up regardless of whether we found a task.
@@ -4395,8 +4396,13 @@ export class PlannerBridge {
       : null;
 
     // Fill in the real worker id now that we have it. Status was
-    // already flipped to "assigned" at the top of this function;
+    // flipped to "assigned" at the top of this function as a
+    // synchronous claim before spawn; promote to "running" now that
+    // the worker session exists. The two states distinguish
+    // phase 1 (claimed, no worker yet — brief window during spawn)
+    // from phase 2/3 (worker session created, prompt dispatched).
     // assignedTo was held null until the childSessionId existed.
+    task.status = "running";
     task.assignedTo = childSessionId;
     // Worker agent/model resolution is layered:
     //   1) pre-spawn resolve chain (task override → fleet default → board)
@@ -5168,7 +5174,7 @@ export class PlannerBridge {
 
     // Default: retask the reviewed task with reviewFeedback.
     const workerId = reviewedTask.assignedTo;
-    if (reviewedTask.status === "assigned" && workerId) {
+    if (isInFlight(reviewedTask.status) && workerId) {
       this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
@@ -5758,7 +5764,7 @@ export class PlannerBridge {
     // or pending, otherwise the first in the list.
     for (const id of reviews) {
       const t = byId.get(id);
-      if (t && (t.status === "awaiting_review" || t.status === "pending" || t.status === "assigned")) {
+      if (t && (t.status === "awaiting_review" || t.status === "pending" || isInFlight(t.status))) {
         return t;
       }
     }
@@ -5913,8 +5919,10 @@ export class PlannerBridge {
 
     // Assign the task to the "orchestrator" sentinel so the plan view
     // shows what's happening. Orchestrator-lane reviews don't count
-    // against inFlightCount or concurrencyCap.
-    reviewTask.status = "assigned";
+    // against inFlightCount or concurrencyCap. No spawn step here, so
+    // we jump straight to "running" — phase 1 ("assigned" pre-spawn)
+    // doesn't apply to inline orchestrator-lane work.
+    reviewTask.status = "running";
     reviewTask.assignedTo = "orchestrator";
     reviewTask.startedAt = nowIso();
     saveBoard(board, orchestratorSessionId);
@@ -6967,7 +6975,7 @@ export class PlannerBridge {
     const inFlight = inFlightCount(board);
     const pending = board.tasks.filter((t) => t.status === "pending").length;
     const reviewsPending = board.tasks.filter(
-      (t) => t.kind === "review" && (t.status === "pending" || t.status === "assigned"),
+      (t) => t.kind === "review" && (t.status === "pending" || isInFlight(t.status)),
     ).length;
     const awaitingReview = board.tasks.filter(
       (t) => t.status === "awaiting_review",
@@ -6989,7 +6997,7 @@ export class PlannerBridge {
         awaitingReview,
       },
       inFlightWorkers: board.tasks
-        .filter((t) => t.status === "assigned" && t.assignedTo)
+        .filter((t) => isInFlight(t.status) && t.assignedTo)
         .map((t) => ({
           taskId: t.id,
           taskTitle: t.title,
@@ -7063,7 +7071,7 @@ export class PlannerBridge {
         `Project ${shortProjectId(board.projectId)} is already ${board.state}.`,
       );
     }
-    const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
+    const inFlight = board.tasks.filter((t) => isInFlight(t.status)).length;
     void this.runProjectStop(sessionId, board, "slash");
     this.replyMcpResult(
       reqId,
@@ -7230,7 +7238,7 @@ export class PlannerBridge {
       return this.replyMcpResult(reqId, `${taskId} is already done.`);
     }
     const workerId = task.assignedTo;
-    if (task.status === "assigned" && workerId) {
+    if (isInFlight(task.status) && workerId) {
       this.endWorkerForward(workerId);
       clearWorkerState(workerId);
       unregisterWorker(workerId);
@@ -7321,7 +7329,7 @@ export class PlannerBridge {
     const closedWorkers: string[] = [];
     for (const task of board.tasks) {
       const workerId = task.assignedTo;
-      if (task.status === "assigned" && workerId && workerId !== "orchestrator") {
+      if (isInFlight(task.status) && workerId && workerId !== "orchestrator") {
         this.endWorkerForward(workerId);
         clearWorkerState(workerId);
         unregisterWorker(workerId);

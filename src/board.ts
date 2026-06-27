@@ -8,16 +8,28 @@ import {
   projectsDir,
 } from "./paths.js";
 
-export const BOARD_SCHEMA_VERSION = 2;
+export const BOARD_SCHEMA_VERSION = 3;
 
 export type TaskStatus =
   | "pending"
   | "assigned"
+  | "running"
   | "awaiting_review"
   | "done"
   | "superseded"
   | "failed"
   | "blocked";
+
+// In-flight = a worker (or the orchestrator lane) is on this task.
+// "assigned" = claimed by the scheduler but the worker session hasn't
+// been spawned yet (very brief window). "running" = worker session
+// exists and the task prompt has been dispatched. Most call sites
+// don't care which sub-phase the task is in — they want to know if
+// the task is consuming a concurrency slot, in need of stop/restart
+// cleanup, or surfacing a current worker in the UI.
+export function isInFlight(status: TaskStatus): boolean {
+  return status === "assigned" || status === "running";
+}
 // Board state machine:
 //
 //   decomposing → ready → running → done
@@ -668,12 +680,24 @@ export function newBoard(opts: {
 }
 
 function migrateBoard(b: Board): void {
-  // Schema v1 → v2: add new optional fields that don't have defaults.
   if (b.version < 2) {
     for (const t of b.tasks) {
       t.kind ??= "work";
     }
     b.version = 2;
+  }
+  // v2 → v3: split the old `assigned` status into `assigned`
+  // (pre-spawn claim, assignedTo === null) and `running` (worker
+  // session exists). Existing boards persisted under v2 used
+  // `assigned` for both phases; if assignedTo is set, the worker
+  // session existed, so promote to `running`.
+  if (b.version < 3) {
+    for (const t of b.tasks) {
+      if (t.status === "assigned" && t.assignedTo) {
+        t.status = "running";
+      }
+    }
+    b.version = 3;
   }
 }
 
@@ -821,15 +845,16 @@ export function allTerminal(board: Board): boolean {
   );
 }
 
-// Number of tasks currently in `assigned` state — i.e. workers
-// actively running. The scheduler uses this against board.concurrencyCap
-// to decide whether to spawn another worker. `awaiting_review` is
-// deliberately NOT counted: the worker has exited and the task is
-// parked waiting for a reviewer; it doesn't consume a concurrency slot.
+// Number of tasks currently in-flight (assigned OR running) — i.e.
+// workers actively running. The scheduler uses this against
+// board.concurrencyCap to decide whether to spawn another worker.
+// `awaiting_review` is deliberately NOT counted: the worker has exited
+// and the task is parked waiting for a reviewer; it doesn't consume a
+// concurrency slot.
 export function inFlightCount(board: Board): number {
   let n = 0;
   for (const t of board.tasks) {
-    if (t.status === "assigned") n += 1;
+    if (isInFlight(t.status)) n += 1;
   }
   return n;
 }
@@ -840,7 +865,7 @@ export function inFlightCount(board: Board): number {
 // and it clears stale currentTaskId pointers on workers (the root cause of
 // the orphan "task=- state=-" rows the user originally reported after ^C).
 //
-// Only tasks with status === 'assigned' AND assignedTo set are reverted.
+// Only in-flight tasks (assigned/running) AND assignedTo set are reverted.
 // Tasks in awaiting_review are deliberately NOT touched: those represent
 // completed worker output parked for a reviewer; a user stop is "I'll come
 // back to this" rather than "something broke", so the review pipeline must
@@ -852,10 +877,10 @@ export function inFlightCount(board: Board): number {
 export function stopBoardBookkeeping(board: Board): { inFlightWorkerIds: string[] } {
   const ids = new Set<string>();
 
-  // Primary: tasks currently in `assigned` state. Revert to pending and
-  // collect the worker each references via task.assignedTo.
+  // Primary: tasks currently in-flight (assigned or running). Revert
+  // to pending and collect the worker each references via task.assignedTo.
   for (const task of board.tasks) {
-    if (task.status !== "assigned") continue;
+    if (!isInFlight(task.status)) continue;
     if (task.assignedTo) ids.add(task.assignedTo);
     task.status = "pending";
     task.assignedTo = null;

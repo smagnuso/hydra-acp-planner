@@ -168,6 +168,7 @@ export function reviewTargetsOf(t: Task): string[] {
 const TASK_GLYPH: Record<string, string> = {
   done: "[x]",
   assigned: "[~]",
+  running: "[>]",
   failed: "[!]",
   blocked: "[-]",
   pending: "[ ]",

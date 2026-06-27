@@ -183,7 +183,7 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
         "expected worker entry for spawned session",
       );
       const task1 = board.tasks.find((t) => t.id === "T1")!;
-      assert.equal(task1.status, "assigned");
+      assert.equal(task1.status, "running");
       assert.equal(task1.assignedTo, childSessionId);
 
       // Assert (b): zero hydra-acp/transformer/attach calls for the worker.

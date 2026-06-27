@@ -21,7 +21,7 @@ import {
   buildAgentMessageChunkEnvelope,
   type UpdateEnvelope,
 } from "./util/text.js";
-import { shortProjectId } from "./board.js";
+import { isInFlight, shortProjectId } from "./board.js";
 import { formatTaskTag } from "./format.js";
 import {
   buildReviewsByParent,
@@ -101,7 +101,7 @@ export function getPlanRenderMode(): PlanRenderMode {
 // → "pending". (ACP plan has no "failed" status; we surface failure
 // in the entry's content text via a "[FAILED] " prefix.)
 function mapStatus(task: Task): "pending" | "in_progress" | "completed" {
-  if (task.status === "assigned" || task.status === "awaiting_review") return "in_progress";
+  if (isInFlight(task.status) || task.status === "awaiting_review") return "in_progress";
   if (task.status === "done" || task.status === "failed" || task.status === "superseded") return "completed";
   return "pending";
 }
@@ -150,7 +150,7 @@ export function buildPlanUpdateEnvelope(opts: {
       priority: taskPriority(t, blockedByCount),
       status: mapStatus(t),
     });
-    if (t.status !== "assigned") continue;
+    if (!isInFlight(t.status)) continue;
     const wid = workerByTask.get(t.id);
     if (!wid) continue;
     const subtodos = board.workers[wid]?.subtodos;
@@ -182,6 +182,7 @@ export function buildPlanUpdateEnvelope(opts: {
 const STATUS_GLYPH: Record<string, string> = {
   done: "[x]",
   assigned: "[~]",
+  running: "[>]",
   failed: "[!]",
   blocked: "[-]",
   pending: "[ ]",
@@ -200,7 +201,7 @@ export function buildAsciiPlanText(board: Board): string {
   const lines: string[] = [];
   const done = board.tasks.filter((t) => t.status === "done").length;
   const failed = board.tasks.filter((t) => t.status === "failed").length;
-  const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
+  const inFlight = board.tasks.filter((t) => isInFlight(t.status)).length;
   const counts: string[] = [
     `${done}/${board.tasks.length} done`,
   ];
@@ -242,7 +243,7 @@ export function buildAsciiPlanText(board: Board): string {
     const glyph = STATUS_GLYPH[t.status] ?? "?";
     lines.push(`  ${glyph} ${t.id}  ${t.title}${tagFor(t)}`);
     renderedTaskIds.add(t.id);
-    if (t.status === "assigned") {
+    if (isInFlight(t.status)) {
       const wid = workerByTask.get(t.id);
       const subtodos = wid ? board.workers[wid]?.subtodos : undefined;
       const { visible, hiddenCount } = pickVisibleSubtodos(subtodos, cap);

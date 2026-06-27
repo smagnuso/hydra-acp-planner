@@ -1,7 +1,7 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { resolveAgent, resolveModel, resolveTaskLane, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
+import { isInFlight, resolveAgent, resolveModel, resolveTaskLane, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
 import {
   buildReviewsByParent,
   isMultiRevieweeReview,
@@ -242,7 +242,7 @@ export function formatSessionsTable(
     const orchReviewTotal = board.tasks.filter(
       (t) => t.kind === "review",
     ).length;
-    const inFlight = orchLaneReviews.find((t) => t.status === "assigned");
+    const inFlight = orchLaneReviews.find((t) => isInFlight(t.status));
     rows.push({
       role: "orchestrator",
       session: shortSessionId(orchestratorSessionId),
@@ -351,6 +351,7 @@ export function formatSessionsTable(
 export const TASK_STATUS_GLYPH: Record<string, string> = {
   done: "[x]",
   assigned: "[~]",
+  running: "[>]",
   failed: "[!]",
   blocked: "[-]",
   pending: "[ ]",
@@ -388,7 +389,7 @@ export function formatBoardContext(board: Board): string {
       const glyph = TASK_STATUS_GLYPH[displayStatus] ?? "?";
       const deps = task.deps.length === 0 ? "" : `, deps: ${task.deps.join(", ")}`;
       const worker =
-        task.status === "assigned" && task.assignedTo
+        isInFlight(task.status) && task.assignedTo
           ? `, worker: ${shortSessionId(task.assignedTo)}`
           : "";
       const tag = formatTaskTag(task, board);
@@ -435,7 +436,7 @@ export function formatStatusBody(
 ): string {
   const lines: string[] = [];
   const done = board.tasks.filter((t) => t.status === "done").length;
-  const inFlight = board.tasks.filter((t) => t.status === "assigned").length;
+  const inFlight = board.tasks.filter((t) => isInFlight(t.status)).length;
   const failed = board.tasks.filter((t) => t.status === "failed").length;
   lines.push(`${shortProjectId(board.projectId)}  (${board.state})`);
   lines.push(`   ${board.description}`);
@@ -446,7 +447,7 @@ export function formatStatusBody(
   lines.push(`   Tasks: ${counts.join(", ")}`);
   lines.push(`   Concurrency cap: ${board.concurrencyCap}`);
   const reviewsPending = board.tasks.filter(
-    (t) => t.kind === "review" && (t.status === "pending" || t.status === "assigned"),
+    (t) => t.kind === "review" && (t.status === "pending" || isInFlight(t.status)),
   ).length;
   const awaitingReview = board.tasks.filter((t) => t.status === "awaiting_review").length;
   if (reviewsPending > 0 || awaitingReview > 0) {
@@ -516,7 +517,7 @@ export function formatStatusBody(
     const glyph = TASK_STATUS_GLYPH[task.status] ?? "?";
     const deps = task.deps.length === 0 ? "" : `  ← ${task.deps.join(", ")}`;
     const worker =
-      task.status === "assigned" && task.assignedTo
+      isInFlight(task.status) && task.assignedTo
         ? `  → ${shortSessionId(task.assignedTo)}`
         : "";
     const tag = formatTaskTag(task, board);
