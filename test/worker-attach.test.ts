@@ -219,7 +219,7 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
         "expected hydra-acp/message/emit for the spawned worker",
       );
       const emitParams = workerEmit!.params as { route?: string };
-      assert.equal(emitParams.route, "chain");
+      assert.equal(emitParams.route, "queue");
     },
   );
 

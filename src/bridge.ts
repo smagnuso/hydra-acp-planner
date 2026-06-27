@@ -1576,7 +1576,7 @@ export class PlannerBridge {
           sessionId: orchestratorSessionId,
           text: buildAddTaskPrompt(description, board, await this.ensureAgentChoices()),
         }),
-        route: "chain",
+        route: "queue",
       });
     } catch (err) {
       state.awaitingAdd = false;
@@ -2885,7 +2885,7 @@ export class PlannerBridge {
           sessionId,
           text: buildDecompositionPrompt(descRemaining, await this.ensureAgentChoices(), compete),
         }),
-        route: "chain",
+        route: "queue",
       });
     } catch (err) {
       if (this.isShutdownError(err)) {
@@ -3249,7 +3249,7 @@ export class PlannerBridge {
           sessionId,
           text: buildExecuteDecompositionPrompt(await this.ensureAgentChoices(), compete),
         }),
-        route: "chain",
+        route: "queue",
       });
     } catch (err) {
       if (this.isShutdownError(err)) {
@@ -4558,7 +4558,7 @@ export class PlannerBridge {
             text: promptsFor(task.kind ?? 'work').buildPrompt(task, board),
             ancillary: true,
           }),
-          route: "chain",
+          route: "queue",
         });
       } catch (err) {
         if (this.isShutdownError(err)) {
@@ -4613,7 +4613,7 @@ export class PlannerBridge {
             text: promptsFor(task.kind ?? 'work').buildResumePrompt(task),
             ancillary: true,
           }),
-          route: "chain",
+          route: "queue",
         });
       } catch (err) {
         if (this.isShutdownError(err)) {
@@ -4666,7 +4666,7 @@ export class PlannerBridge {
             sessionId: orchestratorSessionId,
             text: buildResumeDecompositionPrompt(board.description, board.compete),
           }),
-          route: "chain",
+          route: "queue",
         });
       } catch (err) {
         if (this.isShutdownError(err)) {
@@ -4725,7 +4725,7 @@ export class PlannerBridge {
             text: promptsFor(task.kind ?? 'work').buildRepromptPrompt(task),
             ancillary: true,
           }),
-          route: "chain",
+          route: "queue",
         });
       } catch (err) {
         if (this.isShutdownError(err)) {
@@ -5226,7 +5226,7 @@ export class PlannerBridge {
                 text: promptsFor(reviewedTask.kind ?? 'work').buildPrompt(reviewedTask, board),
                 ancillary: true,
               }),
-              route: "chain",
+              route: "queue",
             });
           } catch (err) {
             log.error(
@@ -6104,7 +6104,7 @@ export class PlannerBridge {
             text,
             ancillary: attempt > 0,
           }),
-          route: "chain",
+          route: "queue",
         });
       } catch (err) {
         state.awaitingOrchestratorReview = false;
