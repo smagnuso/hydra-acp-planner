@@ -6782,10 +6782,17 @@ export class PlannerBridge {
       );
     }
     if (board.state === "running") {
-      return this.replyMcpTextError(
-        reqId,
-        `execute_plan: project ${shortProjectId(board.projectId)} is already running. Use get_status to inspect, or stop to halt.`,
+      // No deferred reply in flight (checked above) but the scheduler
+      // is running — the most common cause is a prior execute_plan
+      // whose held turn was abandoned (e.g. user ^C'd the agent
+      // while workers kept progressing). Re-attach: hold this reply
+      // open until the project terminates, same as a fresh start.
+      setDeferredMcpReply(sessionId, reqId, board.projectId);
+      this.emitPlanUpdate(sessionId, board);
+      log.info(
+        `execute_plan re-attaching to in-flight ${shortProjectId(board.projectId)} on session …${sessionId.slice(-8)}`,
       );
+      return;
     }
     if (board.state === "done" || board.state === "failed") {
       return this.replyMcpTextError(
