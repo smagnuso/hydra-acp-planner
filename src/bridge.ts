@@ -3943,6 +3943,16 @@ export class PlannerBridge {
         if (usage) {
           recordOrchestratorUsage(sessionId, usage);
           if (board) {
+            // Lazy baseline capture: if the plan was created without a
+            // baseline (typically because the daemon restarted between
+            // earlier orchestrator turns and set_plan, so the in-memory
+            // latestOrchestratorUsageBySession was empty), treat the
+            // first usage_update we observe as the baseline. Otherwise
+            // the cumulative cost reported by the agent would include
+            // all pre-plan orchestrator spend.
+            if (!board.orchestratorUsageBaseline) {
+              board.orchestratorUsageBaseline = { ...usage };
+            }
             board.orchestratorUsage = { ...(board.orchestratorUsage ?? {}), ...usage };
             saveBoard(board, sessionId);
           }
