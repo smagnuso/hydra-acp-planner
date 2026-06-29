@@ -1094,6 +1094,84 @@ describe("distill kind (T1 schema groundwork)", () => {
     );
   });
 
+  it("resolveTaskLane: hostBlocked override forces orchestrator→worker (default reason)", () => {
+    const board = newBoard({ description: "x" });
+    const review: Task = {
+      id: "R1",
+      title: "review T1",
+      deps: ["T1"],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "review",
+    };
+    assert.deepEqual(
+      resolveTaskLane(review, board, "review"),
+      { lane: "orchestrator", reason: "default" },
+    );
+    assert.deepEqual(
+      resolveTaskLane(review, board, "review", true),
+      { lane: "worker", reason: "host-blocked" },
+    );
+    assert.deepEqual(
+      resolveReviewLane(review, board, true),
+      { lane: "worker", reason: "host-blocked" },
+    );
+  });
+
+  it("resolveTaskLane: hostBlocked override forces explicit-task orchestrator→worker", () => {
+    const board = newBoard({ description: "x" });
+    const review: Task = {
+      id: "R1",
+      title: "review T1",
+      deps: ["T1"],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "review",
+      runOn: "orchestrator",
+    };
+    assert.deepEqual(
+      resolveTaskLane(review, board, "review", true),
+      { lane: "worker", reason: "host-blocked" },
+    );
+  });
+
+  it("resolveTaskLane: hostBlocked is a no-op when lane already worker", () => {
+    const board = newBoard({
+      description: "x",
+      fleetDefaults: { agent: null, model: null, review: { agent: "rev-agent" } },
+    });
+    const review: Task = {
+      id: "R1",
+      title: "review T1",
+      deps: ["T1"],
+      agent: null,
+      model: null,
+      status: "pending",
+      assignedTo: null,
+      attemptCount: 0,
+      artifacts: null,
+      startedAt: null,
+      finishedAt: null,
+      kind: "review",
+    };
+    assert.deepEqual(
+      resolveTaskLane(review, board, "review", true),
+      { lane: "worker", reason: "configured-agent" },
+    );
+  });
+
   it("parseFleetDefaultsFromObject reads distill.runOn", () => {
     const fd = parseFleetDefaultsFromObject({
       distill: { runOn: "orchestrator" },

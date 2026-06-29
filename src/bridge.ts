@@ -4270,10 +4270,26 @@ export class PlannerBridge {
         // configured values are actually honored). Explicit runOn always
         // wins.
         if (task.kind === "review" || task.kind === "distill") {
-          const { lane, reason } = resolveTaskLane(task, board, task.kind);
+          // execute_plan holds the host agent's MCP tool call mid-turn,
+          // so orchestrator-lane reviews can't run (they queue a
+          // session/prompt the host agent can't process while blocked
+          // on the tool result). Force them to the worker lane in that
+          // case — see board.ts:LaneReason `host-blocked`.
+          const hostBlocked = getDeferredMcpReply(orchestratorSessionId) != null;
+          const { lane, reason } = resolveTaskLane(task, board, task.kind, hostBlocked);
           if (reason === "configured-agent" || reason === "configured-model") {
             log.info(
               `${task.kind} ${task.id}: routing to worker lane (${reason}) — configured ${reason === "configured-agent" ? "agent" : "model"} only takes effect on worker lane`,
+            );
+          }
+          if (reason === "host-blocked") {
+            log.info(
+              `${task.kind} ${task.id}: routing to worker lane (host-blocked) — execute_plan is holding the host session, so orchestrator-lane dispatch would stall`,
+            );
+            void this.emitSyntheticMessage(
+              orchestratorSessionId,
+              `Routing ${task.id} to worker lane: execute_plan is holding the host session, so an orchestrator-lane ${task.kind} would stall. Configure fleetDefaults.${task.kind === "review" ? "review" : "distill"}.{agent,model} to silence this and pick your own reviewer.`,
+              { event: "task-lane-host-blocked", taskId: task.id },
             );
           }
           const runOn = lane;
@@ -5322,10 +5338,11 @@ export class PlannerBridge {
     // fix would only land in the worker's ephemeral session). Synthesized
     // reviews leave canApplyFixes unset on purpose so this derivation
     // runs against whatever lane resolveReviewLane picks at dispatch time.
+    const hostBlocked = getDeferredMcpReply(orchestratorSessionId) != null;
     const fixAllowed =
       reviewTask.canApplyFixes !== undefined
         ? reviewTask.canApplyFixes
-        : resolveReviewLane(reviewTask, board).lane === "orchestrator";
+        : resolveReviewLane(reviewTask, board, hostBlocked).lane === "orchestrator";
     if (!fixAllowed) {
       log.info(
         `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=${reviewTask.canApplyFixes ?? "derived:false"}), treating as reject`,

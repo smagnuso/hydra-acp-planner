@@ -304,11 +304,39 @@ export function resolveRunOn(task: Task, fleetDefaults: FleetDefaults): "orchest
 //      the host already has context.
 //
 // Returns: { lane, reason } so callers can log/explain the routing.
+export type LaneReason =
+  | "explicit-task"
+  | "explicit-fleet"
+  | "configured-agent"
+  | "configured-model"
+  | "default"
+  // The resolved lane was orchestrator but the host session can't run
+  // a new agent turn right now (most commonly because an `execute_plan`
+  // MCP tool call is holding the orchestrator turn open). Overridden
+  // to worker so the task actually progresses instead of stranding
+  // pending on a session that physically can't process it. See
+  // resolveTaskLane's `hostBlocked` parameter and the deferred-mcp
+  // wiring in bridge.ts.
+  | "host-blocked";
+
 export function resolveTaskLane(
   task: Task,
   board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null; orchestratorModel?: string | null },
   kind: "review" | "distill",
-): { lane: "orchestrator" | "worker"; reason: "explicit-task" | "explicit-fleet" | "configured-agent" | "configured-model" | "default" } {
+  hostBlocked = false,
+): { lane: "orchestrator" | "worker"; reason: LaneReason } {
+  const result = resolveTaskLaneInner(task, board, kind);
+  if (hostBlocked && result.lane === "orchestrator") {
+    return { lane: "worker", reason: "host-blocked" };
+  }
+  return result;
+}
+
+function resolveTaskLaneInner(
+  task: Task,
+  board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null; orchestratorModel?: string | null },
+  kind: "review" | "distill",
+): { lane: "orchestrator" | "worker"; reason: LaneReason } {
   if (task.runOn) {
     return { lane: task.runOn, reason: "explicit-task" };
   }
@@ -320,9 +348,6 @@ export function resolveTaskLane(
   if (fleetRunOn) {
     return { lane: fleetRunOn, reason: "explicit-fleet" };
   }
-  // Kind-specific configured agent/model bumps to worker lane. For
-  // distill, fall through to fleetDefaults.review.{agent,model} to
-  // mirror resolveAgent/resolveModel's chain.
   const kindAgent =
     kind === "review"
       ? fleet.review?.agent
@@ -347,8 +372,9 @@ export function resolveTaskLane(
 export function resolveReviewLane(
   task: Task,
   board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null; orchestratorModel?: string | null },
-): { lane: "orchestrator" | "worker"; reason: "explicit-task" | "explicit-fleet" | "configured-agent" | "configured-model" | "default" } {
-  return resolveTaskLane(task, board, "review");
+  hostBlocked = false,
+): { lane: "orchestrator" | "worker"; reason: LaneReason } {
+  return resolveTaskLane(task, board, "review", hostBlocked);
 }
 
 // Project-level attachments supplied by the user at create/start
