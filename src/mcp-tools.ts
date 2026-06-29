@@ -23,7 +23,12 @@ Workflow:
   1. When the user describes work, decompose into a task DAG \
      (id like T1, T2, …; title; why; what; constraints; deps; \
      optional per-task agent / model). Identify what can run in \
-     parallel via task dependencies.
+     parallel via task dependencies. Tag each task with riskLevel \
+     and reviewHint so the planner knows which tasks need reviews \
+     (the default policy is 'hints': everything gets a synthesized \
+     review unless reviewHint='skip'). High-risk tasks should be \
+     reviewHint='required' and usually want a reviewAgent / \
+     reviewModel stronger than the default.
 
   2. Call set_plan with the DAG to materialize it as a \
      ready plan. Use list_agents first if you want to know \
@@ -105,7 +110,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "set_plan",
     description:
-      "Persist a task DAG as a ready plan for this session. Replaces any existing ready plan. Use this when the user has settled on what they want built, or wants to revise a draft. Returns a summary the user-facing turn can narrate. Does NOT start execution — call start separately when the user agrees.",
+      "Persist a task DAG as a ready plan for this session. Replaces any existing ready plan. Use this when the user has settled on what they want built, or wants to revise a draft. Returns a summary the user-facing turn can narrate. Does NOT start execution — call start separately when the user agrees. By default the planner synthesizes a review task for every work task (reviewPolicy.mode='hints'); tag trivial tasks with reviewHint='skip' to opt out, and high-risk tasks with reviewHint='required' (optionally pairing reviewAgent / reviewModel with a stronger reviewer). Use reviewPolicy.mode='off' only when the user explicitly doesn't want reviews.",
     inputSchema: {
       type: "object",
       required: ["description", "tasks"],
@@ -263,6 +268,18 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
                   { type: "array", items: { type: "string" } },
                 ],
               },
+              riskLevel: {
+                type: "string",
+                enum: ["low", "medium", "high"],
+                description:
+                  "How risky is this task? Rubric: schema changes, security-sensitive code, or public-API surface changes → 'high'; integration with new services, complex business logic, or cross-module refactors → 'medium'; mechanical refactors (naming, formatting, dead-code removal) → 'low'. Defaults to 'medium'. Drives reviewPolicy.mode='high-only' and may influence reviewAgent/reviewModel choice.",
+              },
+              reviewHint: {
+                type: "string",
+                enum: ["skip", "optional", "recommended", "required"],
+                description:
+                  "How strongly should a human-style review be applied after this task completes? Rubric pairs with riskLevel: high → 'required', medium → 'recommended', low → 'skip', uncertain → 'optional'. Defaults to 'optional' (which synthesizes a review under the default 'hints' policy). Set 'skip' to opt this task out of review synthesis under 'hints' mode. Tasks marked 'required' should usually also carry a reviewAgent/reviewModel for stronger reasoning.",
+              },
             },
           },
         },
@@ -380,6 +397,18 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         constraints: {
           type: "string",
           description: "Revised hard constraints.",
+        },
+        riskLevel: {
+          type: "string",
+          enum: ["low", "medium", "high"],
+          description:
+            "Revised risk classification. Empty string clears back to the implicit default ('medium').",
+        },
+        reviewHint: {
+          type: "string",
+          enum: ["skip", "optional", "recommended", "required"],
+          description:
+            "Revised review intent. Changing from 'skip' to anything else under the default 'hints' policy will cause a review-task to be synthesized for this task if one doesn't already exist. Empty string clears back to the implicit default ('optional').",
         },
       },
     },

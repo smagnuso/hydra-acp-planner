@@ -293,7 +293,17 @@ describe("set_plan", () => {
     const board = boards.get("hydra_session_test");
     assert.ok(board);
     assert.equal(board!.state, "ready");
-    assert.equal(board!.tasks.length, 2);
+    // Two work tasks + two auto-synthesized reviews (default policy
+    // is now 'hints' even when the caller omits reviewPolicy).
+    assert.equal(board!.tasks.length, 4);
+    const workTasks = board!.tasks.filter((t) => t.kind === undefined || t.kind === "work");
+    const reviewTasks = board!.tasks.filter((t) => t.kind === "review");
+    assert.equal(workTasks.length, 2);
+    assert.equal(reviewTasks.length, 2);
+    assert.deepEqual(
+      reviewTasks.map((t) => t.id).sort(),
+      ["review-T1", "review-T2"],
+    );
     assert.equal(board!.concurrencyCap, 3);
     assert.equal(board!.fleetDefaults.agent, "code-claude");
     assert.equal(board!.fleetDefaults.model, "opus");
@@ -306,12 +316,14 @@ describe("set_plan", () => {
     assert.equal(attachCalls.length, 1);
     assert.deepEqual(attachCalls[0]!.params, { sessionId: "hydra_session_test" });
 
-    // CallToolResult surface.
+    // CallToolResult surface. Count reflects the post-synthesis tasks.
     const r = client.lastReply();
     const result = r.result as {
       content: Array<{ text: string }>;
       structuredContent: { taskCount: number; concurrencyCap: number; projectId: string };
     };
+    // Summary counts the agent-authored work tasks (pre-synthesis); the
+    // board itself has 4 once reviews are appended.
     assert.match(result.content[0]!.text, /Saved 2 tasks .* Call start when ready/);
     assert.equal(result.structuredContent.taskCount, 2);
     assert.equal(result.structuredContent.concurrencyCap, 3);
@@ -380,6 +392,41 @@ describe("set_plan", () => {
     const result = r.result as { isError: boolean; content: Array<{ text: string }> };
     assert.equal(result.isError, true);
     assert.match(result.content[0]!.text, /reviews/i);
+  });
+
+  it("synthesizes reviews by default when reviewPolicy is omitted (hints fallback)", async () => {
+    dispatch(
+      mkInvoke(2399, "set_plan", {
+        description: "default reviews",
+        tasks: [
+          { id: "T1", title: "first", deps: [] },
+          { id: "T2", title: "second", deps: [], reviewHint: "skip" },
+          { id: "T3", title: "third", deps: [], reviewHint: "required" },
+        ],
+      }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    const reviewIds = board.tasks
+      .filter((t) => t.kind === "review")
+      .map((t) => t.id)
+      .sort();
+    // T2 opts out with reviewHint='skip'; T1 (default 'optional') and T3
+    // ('required') both get reviews under the default hints policy.
+    assert.deepEqual(reviewIds, ["review-T1", "review-T3"]);
+  });
+
+  it("respects reviewPolicy.mode='off' to suppress synthesis", async () => {
+    dispatch(
+      mkInvoke(2398, "set_plan", {
+        description: "no reviews",
+        tasks: [{ id: "T1", title: "t", deps: [] }],
+        reviewPolicy: { mode: "off" },
+      }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.equal(board.tasks.filter((t) => t.kind === "review").length, 0);
   });
 
   it("seeds orchestratorAgent/Model from fetchSessionInfo at board-create time", async () => {
@@ -488,6 +535,109 @@ describe("set_plan", () => {
     const r = client.lastReply();
     const result = r.result as { structuredContent: { replacedReadyProjectId?: string } };
     assert.equal(result.structuredContent.replacedReadyProjectId, old.projectId);
+  });
+});
+
+// ── update_task: riskLevel / reviewHint ────────────────────
+
+describe("update_task riskLevel/reviewHint", () => {
+  it("sets reviewHint and synthesizes a missing review", async () => {
+    // Seed a board where T1 was originally skipped — no review-T1 yet.
+    const b = newBoard({ description: "x" });
+    b.state = "ready";
+    b.tasks = [
+      {
+        id: "T1",
+        title: "first",
+        deps: [],
+        status: "pending",
+        attemptCount: 0,
+        reviewHint: "skip",
+      },
+    ];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+
+    dispatch(
+      mkInvoke(900, "update_task", { taskId: "T1", reviewHint: "required" }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    const review = board.tasks.find((t) => t.id === "review-T1");
+    assert.ok(review, "review-T1 should have been synthesized");
+    assert.equal(review!.kind, "review");
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /synthesized review-T1/);
+  });
+
+  it("clearing reviewHint reverts to implicit default ('optional')", async () => {
+    const b = newBoard({ description: "x" });
+    b.state = "ready";
+    b.tasks = [
+      {
+        id: "T1",
+        title: "first",
+        deps: [],
+        status: "pending",
+        attemptCount: 0,
+        reviewHint: "required",
+      },
+    ];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+
+    dispatch(
+      mkInvoke(901, "update_task", { taskId: "T1", reviewHint: "" }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.equal(board.tasks.find((t) => t.id === "T1")!.reviewHint, undefined);
+  });
+
+  it("rejects an invalid reviewHint value", async () => {
+    const b = newBoard({ description: "x" });
+    b.state = "ready";
+    b.tasks = [
+      { id: "T1", title: "first", deps: [], status: "pending", attemptCount: 0 },
+    ];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+
+    dispatch(
+      mkInvoke(902, "update_task", { taskId: "T1", reviewHint: "maybe" }),
+    );
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { isError: boolean; content: Array<{ text: string }> };
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /invalid reviewHint 'maybe'/);
+  });
+
+  it("updates riskLevel without forcing review synthesis", async () => {
+    const b = newBoard({ description: "x" });
+    b.state = "ready";
+    b.tasks = [
+      {
+        id: "T1",
+        title: "first",
+        deps: [],
+        status: "pending",
+        attemptCount: 0,
+        reviewHint: "skip",
+      },
+    ];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+
+    dispatch(
+      mkInvoke(903, "update_task", { taskId: "T1", riskLevel: "high" }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.equal(board.tasks.find((t) => t.id === "T1")!.riskLevel, "high");
+    // reviewHint='skip' is unchanged → no synthesis
+    assert.equal(board.tasks.find((t) => t.id === "review-T1"), undefined);
   });
 });
 

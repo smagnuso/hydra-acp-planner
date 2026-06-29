@@ -1633,19 +1633,25 @@ export class PlannerBridge {
     // scheduling so an immediate restart picks up the new tasks.
     board.tasks.push(...result.tasks);
     board.concurrencyCap = sweepLineConcurrencyCap(board.tasks);
-    // Synthesize review tasks for the newly added tasks.
-    // Only applies when reviewPolicy is explicitly set on the board.
-    if (board.reviewPolicy) {
+    // Synthesize review tasks for the newly added tasks. Mirrors the
+    // setPlan path: always run, falling back to DEFAULT_POLICY when the
+    // board has no explicit reviewPolicy. applyReviewPolicy is idempotent
+    // — existing reviews on previously-added tasks aren't duplicated.
+    const beforeIds = new Set(board.tasks.map((t) => t.id));
+    {
       const updatedBoard = applyReviewPolicy(board, resolveReviewPolicy(board.reviewPolicy));
       if (updatedBoard !== board) {
         board.tasks = updatedBoard.tasks;
       }
     }
+    const synthesizedReviewIds = board.tasks
+      .map((t) => t.id)
+      .filter((id) => !beforeIds.has(id));
     saveBoard(board, orchestratorSessionId);
     boards.set(orchestratorSessionId, board);
 
     log.info(
-      `added ${result.tasks.length} task(s) to ${board.projectId}: ${result.tasks.map((t) => t.id).join(", ")}`,
+      `added ${result.tasks.length} task(s) to ${board.projectId}: ${result.tasks.map((t) => t.id).join(", ")}${synthesizedReviewIds.length > 0 ? ` (+ ${synthesizedReviewIds.length} synthesized: ${synthesizedReviewIds.join(", ")})` : ""}`,
     );
     this.emitPlanUpdate(orchestratorSessionId, board);
 
@@ -1654,9 +1660,12 @@ export class PlannerBridge {
       result.warnings.length > 0
         ? `\n${result.warnings.length} parse warning${result.warnings.length === 1 ? "" : "s"}:\n${result.warnings.map((w) => `  - ${w}`).join("\n")}\n`
         : "";
+    const reviewBlurb = synthesizedReviewIds.length > 0
+      ? ` (+ ${synthesizedReviewIds.length} auto-synthesized review${synthesizedReviewIds.length === 1 ? "" : "s"}: ${synthesizedReviewIds.join(", ")})`
+      : "";
     await this.emitSyntheticMessage(
       orchestratorSessionId,
-      `+ Added ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"}: ${idsList}${warningsBlock}`,
+      `+ Added ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"}: ${idsList}${reviewBlurb}${warningsBlock}`,
     );
 
     // Kick off the scheduler — newly-added tasks with all-deps-met are
@@ -4086,10 +4095,16 @@ export class PlannerBridge {
       board.concurrencyCap = sweepLineConcurrencyCap(result.tasks);
     }
     // Synthesize review tasks according to the board's review policy.
-    // Only applies when reviewPolicy is explicitly set on the board —
-    // undefined means "don't synthesize" (preserves backward compatibility
-    // with boards that never had a reviewPolicy configured).
-    if (board.reviewPolicy) {
+    // ALWAYS run — when board.reviewPolicy is unset, applyReviewPolicy
+    // falls back to its DEFAULT_POLICY (mode: 'hints', overrideHint: false).
+    // Under hints mode, tasks without a reviewHint default to 'optional'
+    // and get a review synthesized; only explicit reviewHint='skip'
+    // (without overrideHint) suppresses. The previous behavior gated
+    // synthesis on `board.reviewPolicy != null`, which silently dropped
+    // reviews for every plan submitted via the set_plan MCP tool without
+    // a reviewPolicy block — the common case. Tasks can opt out via
+    // reviewHint='skip', or the agent can pass reviewPolicy={mode:'off'}.
+    {
       const updatedBoard = applyReviewPolicy(board, resolveReviewPolicy(board.reviewPolicy));
       if (updatedBoard !== board) {
         board.tasks = updatedBoard.tasks;
@@ -4286,9 +4301,31 @@ export class PlannerBridge {
             log.info(
               `${task.kind} ${task.id}: routing to worker lane (host-blocked) — execute_plan is holding the host session, so orchestrator-lane dispatch would stall`,
             );
+            // The user picked the orchestrator lane (explicitly or by
+            // default) because they wanted the HOST agent/model doing
+            // this review. We can't honor that under execute_plan, but
+            // we can do the next-best thing: spawn the worker with the
+            // host's agent/model. Stamp them onto the task so
+            // resolveAgent/resolveModel pick them up at spawn (and so a
+            // restart/persist sees the same intent). Only fill blanks —
+            // never clobber an explicit per-task value.
+            const orchAgent = board.orchestratorAgent ?? null;
+            const orchModel = board.orchestratorModel ?? null;
+            let stamped = false;
+            if (!task.agent && orchAgent) {
+              task.agent = orchAgent;
+              stamped = true;
+            }
+            if (!task.model && orchModel) {
+              task.model = orchModel;
+              stamped = true;
+            }
+            if (stamped) {
+              saveBoard(board, orchestratorSessionId);
+            }
             void this.emitSyntheticMessage(
               orchestratorSessionId,
-              `Routing ${task.id} to worker lane: execute_plan is holding the host session, so an orchestrator-lane ${task.kind} would stall. Configure fleetDefaults.${task.kind === "review" ? "review" : "distill"}.{agent,model} to silence this and pick your own reviewer.`,
+              `Routing ${task.id} to worker lane: execute_plan is holding the host session, so an orchestrator-lane ${task.kind} would stall. Spawning with the host agent/model (${orchAgent ?? "default"}${orchModel ? `, ${orchModel}` : ""}). Configure fleetDefaults.${task.kind === "review" ? "review" : "distill"}.{agent,model} to silence this and pick your own reviewer.`,
               { event: "task-lane-host-blocked", taskId: task.id },
             );
           }
@@ -6848,11 +6885,19 @@ export class PlannerBridge {
     const titles = normalized.tasks
       .map((t) => `${t.id} ${t.title}`)
       .join(" · ");
-    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.`;
+    // applyReviewPolicy ran inside setPlan; count the auto-synthesized
+    // reviews so the agent can narrate them to the user (otherwise the
+    // user sees N work tasks but the board has N + reviewCount).
+    const reviewCount = board.tasks.filter((t) => t.kind === "review").length;
+    const reviewBlurb = reviewCount > 0
+      ? ` + ${reviewCount} auto-synthesized review${reviewCount === 1 ? "" : "s"}`
+      : "";
+    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.`;
     this.replyMcpResult(reqId, summary, {
       projectId: board.projectId,
       replacedReadyProjectId: replacedReadyId,
       taskCount: normalized.tasks.length,
+      reviewTaskCount: reviewCount,
       concurrencyCap: board.concurrencyCap,
       warnings: normalized.warnings,
     });
@@ -7353,8 +7398,63 @@ export class PlannerBridge {
         }
       }
     }
+    // riskLevel / reviewHint: enum-validated. Empty string clears the
+    // field (reverts to the implicit defaults at decideReview time —
+    // 'medium' / 'optional'). Invalid values are rejected.
+    const RISK_VALUES = ["low", "medium", "high"] as const;
+    const HINT_VALUES = ["skip", "optional", "recommended", "required"] as const;
+    if (typeof args.riskLevel === "string") {
+      const raw = args.riskLevel.trim();
+      if (raw !== "" && !(RISK_VALUES as readonly string[]).includes(raw)) {
+        return this.replyMcpTextError(
+          reqId,
+          `update_task: invalid riskLevel '${raw}'; expected one of ${RISK_VALUES.join(", ")}`,
+        );
+      }
+      const next = raw === "" ? undefined : (raw as Task["riskLevel"]);
+      if (task.riskLevel !== next) {
+        task.riskLevel = next;
+        changes.riskLevel = next ?? "(cleared)";
+        touched = true;
+      }
+    }
+    let hintChanged = false;
+    if (typeof args.reviewHint === "string") {
+      const raw = args.reviewHint.trim();
+      if (raw !== "" && !(HINT_VALUES as readonly string[]).includes(raw)) {
+        return this.replyMcpTextError(
+          reqId,
+          `update_task: invalid reviewHint '${raw}'; expected one of ${HINT_VALUES.join(", ")}`,
+        );
+      }
+      const next = raw === "" ? undefined : (raw as Task["reviewHint"]);
+      if (task.reviewHint !== next) {
+        task.reviewHint = next;
+        changes.reviewHint = next ?? "(cleared)";
+        touched = true;
+        hintChanged = true;
+      }
+    }
+
     if (!touched) {
       return this.replyMcpResult(reqId, `update_task: no changes for ${taskId}.`);
+    }
+    // A reviewHint change can make a previously-skipped task newly
+    // eligible for review synthesis. applyReviewPolicy is idempotent
+    // (skips tasks that already have a review) so the cost is small.
+    // Note: going the other direction (e.g. optional → skip) does NOT
+    // tear down an existing review; the user can `skip review-Tx` if
+    // they want it gone.
+    let newReviewIds: string[] = [];
+    if (hintChanged) {
+      const before = new Set(board.tasks.map((t) => t.id));
+      const updated = applyReviewPolicy(board, resolveReviewPolicy(board.reviewPolicy));
+      if (updated !== board) {
+        board.tasks = updated.tasks;
+        newReviewIds = board.tasks
+          .map((t) => t.id)
+          .filter((id) => !before.has(id));
+      }
     }
     saveBoard(board, sessionId);
     this.emitPlanUpdate(sessionId, board);
@@ -7364,14 +7464,17 @@ export class PlannerBridge {
     const propSummary = propagated.length > 0
       ? ` (also updated ${propagated.join(", ")})`
       : "";
+    const reviewSummary = newReviewIds.length > 0
+      ? ` (synthesized ${newReviewIds.join(", ")})`
+      : "";
     void this.emitSyntheticMessage(
       sessionId,
-      `updated ${taskId}: ${summary}${propSummary}`,
+      `updated ${taskId}: ${summary}${propSummary}${reviewSummary}`,
       { event: "task-updated", taskId },
     );
     this.replyMcpResult(
       reqId,
-      `Updated ${taskId} (${Object.keys(changes).join(", ")})${propSummary}.`,
+      `Updated ${taskId} (${Object.keys(changes).join(", ")})${propSummary}${reviewSummary}.`,
     );
   }
 
