@@ -1,7 +1,7 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { isInFlight, resolveAgent, resolveModel, resolveTaskLane, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
+import { isInFlight, resolveAgent, resolveModel, resolveTaskLane, sessionLink, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
 import {
   buildReviewsByParent,
   isMultiRevieweeReview,
@@ -573,6 +573,37 @@ export function formatStatus(
   orchestratorSessionId?: string,
 ): string {
   return formatStatusBody(board, orchestratorSessionId, `   Planner: ${attached ? "attached (intercepts active)" : "not currently attached — next /hydra planner command will re-attach"}`);
+}
+
+// Markdown paragraph listing every session tied to this project as a
+// clickable hydra:// link. Intended to be appended below a fenced status
+// dump so alignment inside the fence stays intact while clients that
+// recognize hydra:// URLs still get click-to-jump. Returns "" when there
+// are no sessions to link (project has no orchestrator id AND no
+// workers — vanishingly rare, but defensible).
+export function formatSessionLinksFooter(
+  board: Board,
+  orchestratorSessionId?: string,
+): string {
+  const parts: string[] = [];
+  if (orchestratorSessionId) {
+    parts.push(sessionLink(orchestratorSessionId, `orch ${shortSessionId(orchestratorSessionId)}`));
+  }
+  // Index tasks by worker id so we can label each worker with the task
+  // it's currently on (or most recently was on).
+  const taskByWorker = new Map<string, Task>();
+  for (const t of board.tasks) {
+    if (t.assignedTo) taskByWorker.set(t.assignedTo, t);
+  }
+  for (const [workerId] of Object.entries(board.workers)) {
+    const t = taskByWorker.get(workerId);
+    const label = t
+      ? `${t.id} ${shortSessionId(workerId)}`
+      : `worker ${shortSessionId(workerId)}`;
+    parts.push(sessionLink(workerId, label));
+  }
+  if (parts.length === 0) return "";
+  return `Sessions: ${parts.join(", ")}`;
 }
 
 // A structured finding the orchestrator agent should act on after a

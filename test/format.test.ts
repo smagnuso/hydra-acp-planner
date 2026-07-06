@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionsTable, formatStatus, formatTaskTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatTaskTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
 import { setBoardState, type Board, type Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -907,6 +907,47 @@ describe("collectFindings", () => {
 //   2. Orchestrator-lane review/distill tasks: the `{orchestrator}`
 //      marker so the user can tell at a glance that the task runs
 //      inline in the host session rather than spawning a fresh one.
+describe("formatSessionLinksFooter", () => {
+  it("returns empty string when there are no sessions", () => {
+    assert.equal(formatSessionLinksFooter(board()), "");
+  });
+
+  it("emits an orch link when orchestratorSessionId is set", () => {
+    const out = formatSessionLinksFooter(board(), "hydra_session_abc123");
+    assert.equal(
+      out,
+      "Sessions: [orch abc123](hydra://sessions/hydra_session_abc123)",
+    );
+  });
+
+  it("emits worker links labeled with task id when assignedTo matches", () => {
+    const b = board({
+      tasks: [
+        task("T1", { assignedTo: "hydra_session_worker1", status: "in_flight" }),
+      ],
+      workers: {
+        "hydra_session_worker1": { agent: null, model: null, tasksCompleted: 0 },
+      },
+    });
+    const out = formatSessionLinksFooter(b, "hydra_session_orch");
+    assert.ok(out.includes("[orch orch](hydra://sessions/hydra_session_orch)"));
+    assert.ok(out.includes("[T1 worker1](hydra://sessions/hydra_session_worker1)"));
+  });
+
+  it("labels workers without a task assignment as 'worker <short>'", () => {
+    const b = board({
+      workers: {
+        "hydra_session_lonely": { agent: null, model: null, tasksCompleted: 0 },
+      },
+    });
+    const out = formatSessionLinksFooter(b);
+    assert.equal(
+      out,
+      "Sessions: [worker lonely](hydra://sessions/hydra_session_lonely)",
+    );
+  });
+});
+
 describe("formatTaskTag", () => {
   it("renders {agent·model} when both resolved", () => {
     const t = task("T1", { agent: "claude-acp", model: "claude-sonnet-4-5" });

@@ -579,6 +579,15 @@ export function shortSessionId(id: string): string {
     : id;
 }
 
+// Markdown-linked short form of a session id, for embedding in agent
+// messages. Clients that recognize the hydra:// scheme (TUI, browser)
+// route the click to a session switch; clients that don't render the
+// link text as plain text. The label defaults to shortSessionId(id).
+export function sessionLink(id: string, label?: string): string {
+  const short = label ?? shortSessionId(id);
+  return `[${short}](hydra://sessions/${id})`;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }

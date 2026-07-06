@@ -54,7 +54,7 @@ import {
   extractUsageUpdate,
   updateKind,
 } from "./util/text.js";
-import { collectFindings, countFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatFindingsBullets, formatFindingsHeadline, formatStatus, totalUsage } from "./format.js";
+import { collectFindings, countFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatFindingsBullets, formatFindingsHeadline, formatSessionLinksFooter, formatStatus, totalUsage } from "./format.js";
 import {
   buildAsciiPlanEnvelope,
   buildPlanUpdateEnvelope,
@@ -2317,8 +2317,10 @@ export class PlannerBridge {
       });
       return;
     }
+    const statusText = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const links = formatSessionLinksFooter(board, sessionId);
     this.client.reply(reqId, {
-      text: formatStatus(board, attachedSessions.has(sessionId), sessionId),
+      text: links ? `${statusText}\n\n${links}` : statusText,
     });
   }
 
@@ -2526,10 +2528,13 @@ export class PlannerBridge {
     const descNote = newDescription.length > 0
       ? ` with new description "${newDescription.slice(0, 60)}${newDescription.length > 60 ? "..." : ""}"`
       : "";
+    const statusText = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const links = formatSessionLinksFooter(board, sessionId);
+    const statusWithLinks = links ? `${statusText}\n\n${links}` : statusText;
     const text =
       `Forked ${shortProjectId(sourceId)} → ${shortProjectId(board.projectId)} (${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"})${descNote}.\n` +
       `All tasks reset to pending; plan is in \`ready\`. Review and run \`/hydra planner start\` when you're ready, or \`/hydra planner add <description>\` to revise.\n\n` +
-      formatStatus(board, attachedSessions.has(sessionId), sessionId);
+      statusWithLinks;
     this.client.reply(reqId, { text });
   }
 
@@ -4164,8 +4169,10 @@ export class PlannerBridge {
     // blob. Terminals render the fenced form the same as raw text,
     // so this is a strict improvement across clients.
     const statusDump = formatStatus(board, attachedSessions.has(sessionId), sessionId);
+    const links = formatSessionLinksFooter(board, sessionId);
+    const linksBlock = links ? `\n\n${links}` : "";
     const followup = `Plan ready: ${result.tasks.length} task${result.tasks.length === 1 ? "" : "s"} (concurrency cap ${board.concurrencyCap}). Run \`/hydra planner start\` to start working, or tell me what to change to revise the plan.`;
-    void this.emitSyntheticMessage(sessionId, `\`\`\`\n${statusDump}\n\`\`\`\n\n${followup}`);
+    void this.emitSyntheticMessage(sessionId, `\`\`\`\n${statusDump}\n\`\`\`${linksBlock}\n\n${followup}`);
   }
 
   // ── Worker scheduling ─────────────────────────────────────────────
@@ -4212,13 +4219,15 @@ export class PlannerBridge {
         ? `Project ${shortProjectId(board.projectId)} done with ${failed} failure${failed === 1 ? "" : "s"} (${done}/${board.tasks.length} done).`
         : `Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`;
       const statusDump = formatStatus(board, attachedSessions.has(orchestratorSessionId), orchestratorSessionId);
+      const links = formatSessionLinksFooter(board, orchestratorSessionId);
+      const statusWithLinks = links ? `${statusDump}\n\n${links}` : statusDump;
       const findings = formatCompletionFindings(board);
       const pointer = findings
         ? `\n\n(Run \`/hydra planner findings\` for a human-readable summary, or \`/hydra planner findings <taskId>\` to drill into one.)`
         : "";
       const summary = findings
-        ? `${headline}\n\n${statusDump}\n\n${findings}${pointer}`
-        : `${headline}\n\n${statusDump}`;
+        ? `${headline}\n\n${statusWithLinks}\n\n${findings}${pointer}`
+        : `${headline}\n\n${statusWithLinks}`;
       const heldResolved = resolveHeldTurn(orchestratorSessionId, {
         reason: failed > 0 ? "failed" : "complete",
         text: summary,
@@ -7174,9 +7183,11 @@ export class PlannerBridge {
       attachedSessions.has(ownerSessionId),
       ownerSessionId,
     );
+    const links = formatSessionLinksFooter(board, ownerSessionId);
+    const withLinks = links ? `${baseText}\n\n${links}` : baseText;
     const text = viaFork
-      ? `${baseText}\n\n(read-only: viewing parent session ${shortSessionId(ownerSessionId)}; use that session to control the project)`
-      : baseText;
+      ? `${withLinks}\n\n(read-only: viewing parent session ${shortSessionId(ownerSessionId)}; use that session to control the project)`
+      : withLinks;
     const totals = totalUsage(board);
     const done = board.tasks.filter((t) => t.status === "done").length;
     const failed = board.tasks.filter((t) => t.status === "failed").length;
