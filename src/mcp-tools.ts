@@ -30,6 +30,14 @@ Workflow:
      reviewHint='required' and usually want a reviewAgent / \
      reviewModel stronger than the default.
 
+     If you've already explored the repo, read files, noted \
+     conventions, or made decisions in dialog with the user that \
+     the worker would otherwise re-derive from scratch, put those \
+     into the per-task \`contextPack\` field. It's the cheapest way \
+     to save worker tokens — inlined into the worker's prompt \
+     directly, no re-exploration needed. Only include things you \
+     actually know; don't invent contents.
+
   2. Call set_plan with the DAG to materialize it as a \
      ready plan. Use list_agents first if you want to know \
      what agents are available for per-task overrides.
@@ -261,6 +269,33 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
                 description:
                   "Hard constraints the worker must respect (language, dependencies, file layout, etc.).",
               },
+              contextPack: {
+                type: "object",
+                description:
+                  "Optional. Orchestrator-prechewed context the worker would otherwise pay tokens to re-derive. Populate this whenever you (the orchestrator) have already read files, noticed codebase conventions, made decisions in dialog with the user, or spotted cross-task gotchas that are relevant to this specific task. All sub-fields are free-form markdown and all are optional — include only what you actually know. Do NOT invent contents; leave the field off entirely if you have nothing concrete to pass down. Not a substitute for `what` / `why` / `constraints` — those describe the task; contextPack describes what the worker walks in already knowing.",
+                properties: {
+                  filesToRead: {
+                    type: "string",
+                    description:
+                      "Files (with optional line ranges) the worker should read first, and why each matters. Markdown list. Example: '- src/auth.ts:40-120 — existing session lifecycle, mirror the shape\\n- src/errors.ts — all errors flow through Result<T,E>'.",
+                  },
+                  conventions: {
+                    type: "string",
+                    description:
+                      "Patterns and idioms this codebase follows that the worker should conform to. Example: 'errors bubble as Result<T,E>; tests use vitest describe/it; no default exports; comments are terse and only where non-obvious'.",
+                  },
+                  decisions: {
+                    type: "string",
+                    description:
+                      "Decisions already resolved (usually in dialog with the user) that the worker should NOT re-litigate. Include the chose/rejected/why so the worker understands the intent. Example: 'picked exponential backoff over fixed — user wants graceful degradation under partial outages'.",
+                  },
+                  gotchas: {
+                    type: "string",
+                    description:
+                      "Cross-task warnings, blast-radius notes, or non-obvious pitfalls. Example: 'don't touch bar.ts — sibling task T7 owns it; migration script is idempotent, safe to re-run'.",
+                  },
+                },
+              },
               deps: {
                 type: "array",
                 description:
@@ -429,6 +464,17 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         constraints: {
           type: "string",
           description: "Revised hard constraints.",
+        },
+        contextPack: {
+          type: "object",
+          description:
+            "Revised orchestrator-prechewed context. Same shape and semantics as on set_plan. Any sub-field passed as an empty string clears just that sub-field; pass an empty object to clear the whole pack.",
+          properties: {
+            filesToRead: { type: "string" },
+            conventions: { type: "string" },
+            decisions: { type: "string" },
+            gotchas: { type: "string" },
+          },
         },
         riskLevel: {
           type: "string",

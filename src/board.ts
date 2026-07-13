@@ -105,6 +105,15 @@ export interface TaskArtifacts {
   decisions?: string[];
   assumptions?: string[];
   follow_ups?: string[];
+  // Cross-cutting observations a reviewer wants passed to any task
+  // that depends on the reviewed work. Distinct from `follow_ups`
+  // (which describes deferred work on the reviewed task itself) and
+  // from `notes` (reviewer's reasoning, local to the review). Rendered
+  // into dependency context on downstream workers by
+  // formatDependencyContext in task.ts. Populated by the review kind's
+  // normalizeResult when the reviewer opts in via `forward_notes` in
+  // their hydra-result block.
+  forward_notes?: string[];
   // Filesystem-level audit of the worker session's actual edits,
   // fetched from the daemon's GET /v1/sessions/:id/diff endpoint at
   // task completion. files = unique paths from the diff; hunkCount =
@@ -127,6 +136,19 @@ export interface Task {
   why?: string;
   what?: string;
   constraints?: string;
+  // Orchestrator-prechewed context passed to the worker (and reviewer)
+  // to save them from re-doing work the orchestrator already paid tokens
+  // for: files it already read, conventions it noticed, decisions it
+  // made in dialog with the user, and cross-task gotchas. All fields are
+  // free-form markdown; the renderer inlines whichever are set into the
+  // worker prompt below the contractBrief and above dependency context.
+  // See formatContextPack in task.ts.
+  contextPack?: {
+    filesToRead?: string;
+    conventions?: string;
+    decisions?: string;
+    gotchas?: string;
+  };
   deps: string[];
   agent?: string | null;
   model?: string | null;

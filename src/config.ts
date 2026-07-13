@@ -8,6 +8,23 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+// How the planner exposes its MCP tools to agents.
+//
+//   "conservative" (default): register only `activate` at boot; the
+//     full 16-tool spec surfaces per-session after the agent calls
+//     activate. Cheap idle cost (~250 tokens) for sessions that never
+//     plan. Relies on the agent's MCP client honoring transport
+//     reconnect + re-list, which most implementations do but a few
+//     older ones may not.
+//
+//   "eager": register all 16 tools at boot, always. ~5,900 tokens per
+//     session whether it plans or not. Use when your agent runtime
+//     doesn't propagate MCP tool-list changes into the LLM's next-turn
+//     schema, or when you specifically want the LLM to see the full
+//     planner catalog from turn one.
+export type McpToolsMode = "conservative" | "eager";
+const VALID_MCP_TOOLS_MODES: readonly McpToolsMode[] = ["conservative", "eager"];
+
 export interface Config {
   hydraWsUrl: string;
   hydraToken: string;
@@ -23,18 +40,27 @@ export interface Config {
   // wins via the post-spawn set_model call — this is the safety net
   // for "agent gave me a bad model id" or "no per-task model set".
   defaultModels?: Record<string, string>;
+  // How the planner exposes its MCP tool catalog at session/new time.
+  // See McpToolsMode for the tradeoff. Defaults to "conservative".
+  mcpTools: McpToolsMode;
 }
 
 // Disk layout: ~/.hydra-acp/planner.json (sibling of the daemon's
 // config.json). Shape:
-//   { "defaultAgent": "claude", "defaultModels": { "claude": "claude-sonnet-4-5" } }
-// Env vars (HYDRA_ACP_PLANNER_DEFAULT_AGENT, HYDRA_ACP_PLANNER_DEFAULT_MODELS)
-// override the file when both are present, so one-off overrides don't
-// require editing the file. HYDRA_ACP_PLANNER_CONFIG=<path> selects a
-// different file (test fixtures, alternate profile).
+//   {
+//     "defaultAgent": "claude",
+//     "defaultModels": { "claude": "claude-sonnet-4-5" },
+//     "mcpTools": "conservative"
+//   }
+// Env vars (HYDRA_ACP_PLANNER_DEFAULT_AGENT, HYDRA_ACP_PLANNER_DEFAULT_MODELS,
+// HYDRA_ACP_PLANNER_MCP_TOOLS) override the file when both are present,
+// so one-off overrides don't require editing the file.
+// HYDRA_ACP_PLANNER_CONFIG=<path> selects a different file (test
+// fixtures, alternate profile).
 interface PlannerFileConfig {
   defaultAgent?: string;
   defaultModels?: Record<string, string>;
+  mcpTools?: McpToolsMode;
 }
 
 function deriveWsUrl(httpUrl: string): string {
@@ -98,7 +124,27 @@ function loadPlannerFile(): PlannerFileConfig {
   if (models) {
     out.defaultModels = models;
   }
+  if (typeof obj.mcpTools === "string") {
+    if (VALID_MCP_TOOLS_MODES.includes(obj.mcpTools as McpToolsMode)) {
+      out.mcpTools = obj.mcpTools as McpToolsMode;
+    } else {
+      process.stderr.write(
+        `hydra-acp-planner: ignoring ${file}:mcpTools="${obj.mcpTools}" — expected one of ${VALID_MCP_TOOLS_MODES.join(", ")}\n`,
+      );
+    }
+  }
   return out;
+}
+
+function parseEnvMcpTools(raw: string | undefined): McpToolsMode | undefined {
+  if (!raw) return undefined;
+  if (VALID_MCP_TOOLS_MODES.includes(raw as McpToolsMode)) {
+    return raw as McpToolsMode;
+  }
+  process.stderr.write(
+    `hydra-acp-planner: ignoring HYDRA_ACP_PLANNER_MCP_TOOLS="${raw}" — expected one of ${VALID_MCP_TOOLS_MODES.join(", ")}\n`,
+  );
+  return undefined;
 }
 
 function sanitizeModelMap(raw: unknown, source: string): Record<string, string> | undefined {
@@ -151,6 +197,7 @@ export function loadTransformerConfig(): Config {
   const file = loadPlannerFile();
   const envAgent = process.env.HYDRA_ACP_PLANNER_DEFAULT_AGENT || undefined;
   const envModels = parseEnvModels(process.env.HYDRA_ACP_PLANNER_DEFAULT_MODELS);
+  const envMcpTools = parseEnvMcpTools(process.env.HYDRA_ACP_PLANNER_MCP_TOOLS);
 
   // Env wins over file. defaultModels merges per-key (env keys override
   // file keys, file keys untouched by env survive).
@@ -159,6 +206,7 @@ export function loadTransformerConfig(): Config {
   if (file.defaultModels || envModels) {
     defaultModels = { ...(file.defaultModels ?? {}), ...(envModels ?? {}) };
   }
+  const mcpTools = envMcpTools ?? file.mcpTools ?? "conservative";
 
-  return { hydraWsUrl, hydraToken, debug, defaultAgent, defaultModels };
+  return { hydraWsUrl, hydraToken, debug, defaultAgent, defaultModels, mcpTools };
 }

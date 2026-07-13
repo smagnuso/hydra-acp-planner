@@ -27,6 +27,7 @@ async function runTransformer(): Promise<void> {
     token: config.hydraToken,
     defaultAgent: config.defaultAgent,
     defaultModels: config.defaultModels,
+    mcpTools: config.mcpTools,
   });
   bridge.start();
 

@@ -45,8 +45,15 @@ class FakeClient extends EventEmitter implements BridgeClient {
   request<R = unknown>(method: string, params?: unknown): Promise<R> {
     this.requests.push({ method, params });
     const responder = this.responders.get(method);
-    const result = responder ? responder(params) : this.defaultRequestResult;
-    return Promise.resolve(result as R);
+    // Wrap any sync throws in a rejected Promise to match real
+    // async-client semantics — production callers use .catch() and
+    // rely on rejection, not sync throw.
+    try {
+      const result = responder ? responder(params) : this.defaultRequestResult;
+      return Promise.resolve(result as R);
+    } catch (err) {
+      return Promise.reject(err);
+    }
   }
   reply(id: string | number, result: unknown): void {
     this.replies.push({ id, result });
@@ -89,11 +96,16 @@ let tmpHome: string;
 let bridge: PlannerBridge;
 let client: FakeClient;
 
-// Drain microtasks. Tool handlers that fire `void this.client.request(...)`
-// schedule promise callbacks; tests assert on side effects (like recorded
-// requests) that may not have settled yet. Waiting a couple of
-// macrotask boundaries is enough — no internal timers are armed.
+// Drain microtasks AND one macrotask cycle. Tool handlers that fire
+// `void this.client.request(...)` schedule promise callbacks; some
+// (like activate's refresh_session) defer with setImmediate to avoid
+// closing the transport before the tool reply drains. Waiting on
+// both microtask + setImmediate boundaries covers each shape.
 async function settle() {
+  for (let i = 0; i < 20; i++) {
+    await Promise.resolve();
+  }
+  await new Promise((r) => setImmediate(r));
   for (let i = 0; i < 20; i++) {
     await Promise.resolve();
   }
@@ -2200,6 +2212,32 @@ describe("list_tools handler", () => {
     );
   });
 
+  it("consults durable extension_state on first lookup and caches the result", async () => {
+    // Prior to any in-process activation, list_tools issues one
+    // extension_state/get to the daemon. On a second lookup for the
+    // SAME session, the cached result (via activatedSessions or
+    // confirmedNotActivated) makes the round-trip unnecessary.
+    const sid = "hydra_session_persistent_check";
+    // Configure the fake daemon to report the session as activated
+    // via extension_state.
+    client.responders.set(
+      "hydra-acp/session/extension_state/get",
+      () => ({ value: true }),
+    );
+    dispatchListTools(1010, sid);
+    await settle();
+    const r1 = client.lastReply();
+    const names1 = (r1.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+    assert.ok(names1.includes("set_plan"), "durable-activated session should see full spec");
+    const firstCallCount = client.requestsFor("hydra-acp/session/extension_state/get").length;
+    assert.equal(firstCallCount, 1, "first lookup should hit the daemon");
+    // Second lookup for same session — should NOT round-trip again.
+    dispatchListTools(1011, sid);
+    await settle();
+    const secondCallCount = client.requestsFor("hydra-acp/session/extension_state/get").length;
+    assert.equal(secondCallCount, 1, "second lookup for the same session must hit the cache");
+  });
+
   it("returns the full planner toolset for an activated session", async () => {
     const sid = "hydra_session_activated_test";
     (bridge as unknown as { activatedSessions: Set<string> }).activatedSessions.add(sid);
@@ -2221,6 +2259,33 @@ describe("list_tools handler", () => {
     assert.ok(r.error, "expected an error reply");
     assert.match(r.error!.message, /sessionId/);
   });
+
+  it("in eager mode, returns the full toolset for any session — activation is a no-op", async () => {
+    // Spin up a fresh bridge with mcpTools: "eager".
+    const eagerClient = new FakeClient();
+    const eagerBridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client: eagerClient,
+      fetchSessionInfo: async () => ({ interactive: true }),
+      mcpTools: "eager",
+    });
+    const sid = "hydra_session_eager";
+    // Session NOT in activatedSessions — but eager mode should still
+    // return the full spec.
+    (eagerBridge as unknown as { handleRequest: (r: unknown) => void }).handleRequest({
+      jsonrpc: "2.0",
+      id: 2000,
+      method: "hydra-acp/mcp_tools/list_tools",
+      params: { sessionId: sid },
+    });
+    await settle();
+    const r = eagerClient.lastReply();
+    const result = r.result as { tools: Array<{ name: string }> };
+    const names = result.tools.map((t) => t.name);
+    assert.ok(names.includes("set_plan"), "eager mode must expose set_plan without activation");
+    assert.ok(names.includes("execute_plan"));
+  });
 });
 
 describe("activate tool", () => {
@@ -2236,6 +2301,49 @@ describe("activate tool", () => {
     assert.deepEqual(refreshCalls[0]!.params, { sessionId: sid });
   });
 
+  it("persists the activation flag to durable extension_state", async () => {
+    const sid = "hydra_session_activate_persist";
+    dispatch(mkInvoke(1110, "activate", {}, sid));
+    await settle();
+    const setCalls = client.requestsFor("hydra-acp/session/extension_state/set");
+    assert.equal(setCalls.length, 1, "activate must write the durable flag once");
+    assert.deepEqual(setCalls[0]!.params, {
+      sessionId: sid,
+      key: "activated",
+      value: true,
+    });
+  });
+
+  it("re-activating an already-activated session is a fast no-op (no extra daemon calls)", async () => {
+    const sid = "hydra_session_activate_idempotent_daemon";
+    dispatch(mkInvoke(1120, "activate", {}, sid));
+    await settle();
+    const setCallsAfterFirst = client.requestsFor(
+      "hydra-acp/session/extension_state/set",
+    ).length;
+    const refreshCallsAfterFirst = client.requestsFor(
+      "hydra-acp/mcp_tools/refresh_session",
+    ).length;
+    // Same sessionId again — should hit the "already activated" fast path.
+    dispatch(mkInvoke(1121, "activate", {}, sid));
+    await settle();
+    assert.equal(
+      client.requestsFor("hydra-acp/session/extension_state/set").length,
+      setCallsAfterFirst,
+      "second activate on already-active session must not re-write extension_state",
+    );
+    assert.equal(
+      client.requestsFor("hydra-acp/mcp_tools/refresh_session").length,
+      refreshCallsAfterFirst,
+      "second activate on already-active session must not re-fire refresh_session",
+    );
+    // Result mentions "already active" wording so the LLM knows it was
+    // a no-op, not a fresh activation.
+    const r = client.lastReply();
+    const result = r.result as { content: Array<{ text: string }> };
+    assert.match(result.content[0]!.text, /already active/i);
+  });
+
   it("returns a success result mentioning set_plan so the LLM knows what to do next", async () => {
     const sid = "hydra_session_activate_result";
     dispatch(mkInvoke(1101, "activate", {}, sid));
@@ -2247,24 +2355,14 @@ describe("activate tool", () => {
     assert.match(text, /set_plan/, "result must mention set_plan");
   });
 
-  it("is idempotent — calling twice keeps activation and issues a second refresh", async () => {
-    const sid = "hydra_session_activate_idempotent";
-    dispatch(mkInvoke(1102, "activate", {}, sid));
-    await settle();
-    dispatch(mkInvoke(1103, "activate", {}, sid));
-    await settle();
-    const activated = (bridge as unknown as { activatedSessions: Set<string> })
-      .activatedSessions;
-    assert.ok(activated.has(sid));
-    // Set semantics — one entry, not two — but the request goes out
-    // both times (safe; daemon-side eviction is a no-op when there's
-    // nothing to evict).
-    assert.equal(client.requestsFor("hydra-acp/mcp_tools/refresh_session").length, 2);
-  });
-
-  it("still marks the session activated when refresh_session fails (soft-warn path)", async () => {
+  it("still marks the session activated when refresh_session fails (post-reply)", async () => {
     const sid = "hydra_session_activate_refresh_fail";
-    // Configure the FakeClient to reject refresh_session calls.
+    // The handler replies to the tool call optimistically BEFORE
+    // scheduling refresh_session (to avoid closing the SSE stream
+    // the reply travels on). A late refresh failure therefore can't
+    // change the reply — it's already gone — but activation state
+    // must persist so a future retry (or another trigger) picks up
+    // the expanded catalog.
     client.responders.set("hydra-acp/mcp_tools/refresh_session", () => {
       throw new Error("daemon dropped the ball");
     });
@@ -2275,7 +2373,70 @@ describe("activate tool", () => {
     assert.ok(activated.has(sid), "activation state should persist even on refresh failure");
     const r = client.lastReply();
     const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
-    assert.notEqual(result.isError, true, "soft-warn result must NOT be isError");
+    assert.notEqual(result.isError, true, "reply must NOT be isError");
     assert.match(result.content[0]!.text, /activated/i);
+  });
+});
+
+describe("planner slash commands auto-activate the session", () => {
+  it("any /hydra planner slash command triggers the same activation state transitions as the activate tool", async () => {
+    const sid = "hydra_session_slash_activate";
+    // Seed a board so `status` has something to report — the point is
+    // to verify auto-activation, not to test status. Pick any verb.
+    seedBoard(sid);
+    dispatch({
+      jsonrpc: "2.0" as const,
+      id: 1200,
+      method: "hydra-acp/commands/invoke",
+      params: { sessionId: sid, verb: "status", args: "" },
+    });
+    await settle();
+    // Session should now be in activatedSessions.
+    const activated = (bridge as unknown as { activatedSessions: Set<string> })
+      .activatedSessions;
+    assert.ok(
+      activated.has(sid),
+      "slash command should auto-populate activatedSessions",
+    );
+    // And the durable flag + refresh should have fired.
+    const setCalls = client.requestsFor("hydra-acp/session/extension_state/set");
+    assert.equal(setCalls.length, 1);
+    assert.deepEqual(setCalls[0]!.params, {
+      sessionId: sid,
+      key: "activated",
+      value: true,
+    });
+    const refreshCalls = client.requestsFor(
+      "hydra-acp/mcp_tools/refresh_session",
+    );
+    assert.equal(refreshCalls.length, 1);
+    assert.deepEqual(refreshCalls[0]!.params, { sessionId: sid });
+  });
+
+  it("does NOT re-activate on subsequent slash commands (in-memory fast path)", async () => {
+    const sid = "hydra_session_slash_repeat";
+    seedBoard(sid);
+    dispatch({
+      jsonrpc: "2.0" as const,
+      id: 1210,
+      method: "hydra-acp/commands/invoke",
+      params: { sessionId: sid, verb: "status", args: "" },
+    });
+    await settle();
+    const setAfterOne = client.requestsFor(
+      "hydra-acp/session/extension_state/set",
+    ).length;
+    dispatch({
+      jsonrpc: "2.0" as const,
+      id: 1211,
+      method: "hydra-acp/commands/invoke",
+      params: { sessionId: sid, verb: "status", args: "" },
+    });
+    await settle();
+    assert.equal(
+      client.requestsFor("hydra-acp/session/extension_state/set").length,
+      setAfterOne,
+      "second slash command on same session must not re-write extension_state",
+    );
   });
 });

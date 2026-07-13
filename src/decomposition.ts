@@ -345,6 +345,7 @@ export function normalizeAddedTasks(
       why: typeof t.why === "string" ? t.why : undefined,
       what: typeof t.what === "string" ? t.what : undefined,
       constraints: typeof t.constraints === "string" ? t.constraints : undefined,
+      ...(validateContextPack(t.contextPack) ? { contextPack: validateContextPack(t.contextPack)! } : {}),
       deps,
       agent: typeof t.agent === "string" ? t.agent : null,
       model: typeof t.model === "string" ? t.model : null,
@@ -432,6 +433,23 @@ export function assertNoDecomposerDistill(raw: unknown): void {
   }
 }
 
+// Coerce a `contextPack` field from raw input. Every sub-field is
+// optional free-form markdown; empty strings and non-string values are
+// dropped. Returns undefined when nothing survives, so callers can
+// conditionally omit the field on the Task record.
+function validateContextPack(v: unknown): Task["contextPack"] | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const rec = v as Record<string, unknown>;
+  const out: NonNullable<Task["contextPack"]> = {};
+  for (const key of ["filesToRead", "conventions", "decisions", "gotchas"] as const) {
+    const raw = rec[key];
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      out[key] = raw;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 // Coerce a `reviews` field from raw input. Accepts string or array of
 // strings (matching the Task.reviews shape). Returns undefined when
 // missing or malformed.
@@ -484,6 +502,7 @@ export function normalizeDecomposition(raw: unknown): DecompositionResult | unde
       why: typeof t.why === "string" ? t.why : undefined,
       what: typeof t.what === "string" ? t.what : undefined,
       constraints: typeof t.constraints === "string" ? t.constraints : undefined,
+      ...(validateContextPack(t.contextPack) ? { contextPack: validateContextPack(t.contextPack)! } : {}),
       deps,
       agent: typeof t.agent === "string" ? t.agent : null,
       model: typeof t.model === "string" ? t.model : null,

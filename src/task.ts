@@ -96,6 +96,7 @@ Write whatever prose / evidence-citing you need first, then end with:
     { "command": "npm test -- --grep btw", "exit_code": 0, "output_excerpt": "12 passing" }
   ],
   "follow_ups":         ["optional: any deferred work to capture (amend only)"],
+  "forward_notes":      ["optional: cross-cutting observations for downstream tasks"],
   "applied":            true
 }
 \`\`\`
@@ -106,6 +107,15 @@ both SHOULD be non-empty — empty arrays mean either "I didn't check" or
 "there was nothing to check" (be honest about which). \`follow_ups\` and
 \`applied\` are optional. \`applied: true\` is for the \`fix\` decision when
 you've made the corrections yourself this turn.
+
+\`forward_notes\` is optional and usually empty. Populate it ONLY when you
+spot something a downstream task (one that depends on the work you just
+reviewed) would benefit from knowing — a cross-cutting assumption, a
+recurring pattern with a caveat, a subtle constraint that isn't visible
+from the reviewed task's artifacts alone. Do NOT put reviewed-task-local
+nits, style preferences, or restatements of \`notes\` here. Each entry
+should be one crisp sentence a downstream worker can act on. If nothing
+crosses that bar, omit the field.
 
 This block MUST be the literal last thing in your reply — after any prose,
 tool-call output, or code samples. The fence must be exactly \`\`\`hydra-result
@@ -217,6 +227,37 @@ function formatContractBrief(board: Board): string {
   ].join("\n");
 }
 
+// Render a task's contextPack (orchestrator-prechewed context) as a
+// prompt block. Each sub-field is emitted as its own labelled section
+// so the worker can skim. Returns "" when the pack is empty or missing,
+// so callers can conditionally include the section header.
+//
+// This exists to save tokens: by the time the orchestrator dispatches a
+// task, it has typically already read files, noted conventions, and
+// resolved ambiguities in dialog with the user. Rather than have each
+// worker re-derive that context from scratch, the orchestrator packs it
+// into the task at plan time and the bridge inlines it here.
+function formatContextPack(task: Task): string {
+  const pack = task.contextPack;
+  if (!pack) return "";
+  const sections: string[] = [];
+  if (pack.filesToRead && pack.filesToRead.trim())
+    sections.push(`**Files worth reading first:**\n${pack.filesToRead}`);
+  if (pack.conventions && pack.conventions.trim())
+    sections.push(`**Conventions in this codebase:**\n${pack.conventions}`);
+  if (pack.decisions && pack.decisions.trim())
+    sections.push(`**Decisions already made (don't re-litigate):**\n${pack.decisions}`);
+  if (pack.gotchas && pack.gotchas.trim())
+    sections.push(`**Gotchas / cross-task warnings:**\n${pack.gotchas}`);
+  if (sections.length === 0) return "";
+  return [
+    "## Prechewed context",
+    "The orchestrator has already done some of the exploration for this task. Use what's here instead of re-deriving it — but verify anything that looks stale before betting on it.",
+    "",
+    sections.join("\n\n"),
+  ].join("\n");
+}
+
 // Parse an array of evidence objects from a reviewer's hydra-result block.
 // Each entry must be an object with at least the named keys, all strings
 // (exit_code is allowed as a number). Returns a normalized array of the
@@ -266,9 +307,27 @@ function formatDependencyContext(task: Task, board: Board): string {
   }
   const blocks: string[] = [];
   for (const dep of deps) {
-    blocks.push(
-      `### ${dep.id} — ${dep.title}\n${JSON.stringify(dep.artifacts, null, 2)}`,
+    const parts = [
+      `### ${dep.id} — ${dep.title}`,
+      JSON.stringify(dep.artifacts, null, 2),
+    ];
+    // If this dep had a review that opted to forward observations to
+    // downstream tasks, inline them here. The reviewer is the only
+    // agent with both the observation and the timing to affect this
+    // downstream worker — the orchestrator is blocked in execute_plan
+    // for the duration of the run.
+    const review = board.tasks.find(
+      (t) => t.kind === "review" && t.id === `review-${dep.id}`,
     );
+    const forwardNotes = review?.artifacts?.forward_notes;
+    if (forwardNotes && forwardNotes.length > 0) {
+      parts.push("");
+      parts.push(`**Reviewer forward notes for ${dep.id}** (from ${review!.id} — cross-cutting observations the reviewer thought would help downstream tasks; treat as advisory context, not spec):`);
+      for (const note of forwardNotes) {
+        parts.push(`- ${note}`);
+      }
+    }
+    blocks.push(parts.join("\n"));
   }
   return blocks.join("\n\n");
 }
@@ -297,6 +356,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       if (workBrief) {
         parts.push("");
         parts.push(workBrief);
+      }
+      const workPack = formatContextPack(task);
+      if (workPack) {
+        parts.push("");
+        parts.push(workPack);
       }
       const attachments = formatAttachments(board);
       if (attachments) {
@@ -443,6 +507,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         parts.push("");
         parts.push(reviewBrief);
       }
+      const reviewPack = formatContextPack(task);
+      if (reviewPack) {
+        parts.push("");
+        parts.push(reviewPack);
+      }
       const attachments = formatAttachments(board);
       if (attachments) {
         parts.push("");
@@ -563,6 +632,16 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         artifacts.follow_ups = followUps;
       }
 
+      const forwardNotes = Array.isArray(obj.forward_notes)
+        ? obj.forward_notes
+            .filter((v): v is string => typeof v === "string")
+            .map((v) => v.trim())
+            .filter((v) => v.length > 0)
+        : undefined;
+      if (forwardNotes && forwardNotes.length > 0) {
+        artifacts.forward_notes = forwardNotes;
+      }
+
       const applied = obj.applied;
       if (typeof applied === "boolean") {
         (artifacts as Record<string, unknown>).applied = applied;
@@ -650,6 +729,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       if (brief) {
         parts.push("");
         parts.push(brief);
+      }
+      const distillPack = formatContextPack(task);
+      if (distillPack) {
+        parts.push("");
+        parts.push(distillPack);
       }
       const attachments = formatAttachments(board);
       if (attachments) {
