@@ -2314,7 +2314,7 @@ describe("activate tool", () => {
     });
   });
 
-  it("re-activating an already-activated session is a fast no-op (no extra daemon calls)", async () => {
+  it("re-activating an already-activated session skips persistence but STILL refreshes the client (resurrect-race safety)", async () => {
     const sid = "hydra_session_activate_idempotent_daemon";
     dispatch(mkInvoke(1120, "activate", {}, sid));
     await settle();
@@ -2324,7 +2324,10 @@ describe("activate tool", () => {
     const refreshCallsAfterFirst = client.requestsFor(
       "hydra-acp/mcp_tools/refresh_session",
     ).length;
-    // Same sessionId again — should hit the "already activated" fast path.
+    // Same sessionId again — the LLM is calling activate because its
+    // current tool schema is stale. State is idempotent (no re-write),
+    // but the client refresh MUST still fire — otherwise the client
+    // stays on the stale gateway spec.
     dispatch(mkInvoke(1121, "activate", {}, sid));
     await settle();
     assert.equal(
@@ -2334,14 +2337,19 @@ describe("activate tool", () => {
     );
     assert.equal(
       client.requestsFor("hydra-acp/mcp_tools/refresh_session").length,
-      refreshCallsAfterFirst,
-      "second activate on already-active session must not re-fire refresh_session",
+      refreshCallsAfterFirst + 1,
+      "second activate on already-active session MUST still fire refresh_session (client may be stale)",
     );
-    // Result mentions "already active" wording so the LLM knows it was
-    // a no-op, not a fresh activation.
+    // Result mentions "already active" but also communicates refresh
+    // so the LLM knows it should re-check its tool catalog.
     const r = client.lastReply();
     const result = r.result as { content: Array<{ text: string }> };
     assert.match(result.content[0]!.text, /already active/i);
+    assert.match(
+      result.content[0]!.text,
+      /refresh/i,
+      "already-active message should mention that tools are refreshing",
+    );
   });
 
   it("returns a success result mentioning set_plan so the LLM knows what to do next", async () => {
@@ -2375,6 +2383,100 @@ describe("activate tool", () => {
     const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
     assert.notEqual(result.isError, true, "reply must NOT be isError");
     assert.match(result.content[0]!.text, /activated/i);
+  });
+});
+
+describe("session.starting rehydration (resurrect race fix)", () => {
+  function dispatchSessionStarting(id: number, sessionId: string): void {
+    (bridge as unknown as { handleNotification: (n: unknown) => void }).handleNotification({
+      jsonrpc: "2.0",
+      method: "hydra-acp/transformer/session_event",
+      params: { event: "session.starting", sessionId },
+    });
+  }
+
+  it("pre-populates activatedSessions, attaches as transformer, and fires refresh_session when activated:true on disk", async () => {
+    const sid = "hydra_session_rehydrate_activated";
+    client.responders.set(
+      "hydra-acp/session/extension_state/get",
+      () => ({ value: true }),
+    );
+    dispatchSessionStarting(2000, sid);
+    await settle();
+    const activated = (bridge as unknown as { activatedSessions: Set<string> })
+      .activatedSessions;
+    assert.ok(
+      activated.has(sid),
+      "session.starting for an activated session must pre-populate the in-memory set",
+    );
+    const attachCalls = client.requestsFor("hydra-acp/transformer/attach");
+    assert.equal(attachCalls.length, 1, "must attach as transformer");
+    assert.deepEqual(attachCalls[0]!.params, { sessionId: sid });
+    const refreshCalls = client.requestsFor(
+      "hydra-acp/mcp_tools/refresh_session",
+    );
+    assert.equal(refreshCalls.length, 1);
+    assert.deepEqual(refreshCalls[0]!.params, { sessionId: sid });
+  });
+
+  it("does NOT attach or refresh when the session has never been activated (avoids waking clients for nothing)", async () => {
+    const sid = "hydra_session_rehydrate_not_activated";
+    client.responders.set(
+      "hydra-acp/session/extension_state/get",
+      () => ({ value: null }),
+    );
+    dispatchSessionStarting(2001, sid);
+    await settle();
+    const activated = (bridge as unknown as { activatedSessions: Set<string> })
+      .activatedSessions;
+    assert.ok(!activated.has(sid));
+    const confirmedNotActivated = (
+      bridge as unknown as { confirmedNotActivated: Set<string> }
+    ).confirmedNotActivated;
+    assert.ok(
+      confirmedNotActivated.has(sid),
+      "not-activated sessions should be cached to avoid repeat lookups",
+    );
+    assert.equal(
+      client.requestsFor("hydra-acp/transformer/attach").length,
+      0,
+      "must NOT attach on a session we don't care about",
+    );
+    assert.equal(
+      client.requestsFor("hydra-acp/mcp_tools/refresh_session").length,
+      0,
+    );
+  });
+
+  it("skips the daemon lookup when already tracked in memory — but STILL attaches + refreshes (fresh client)", async () => {
+    // Every session.starting corresponds to a fresh agent process
+    // whose MCP client has never received our earlier list_changed
+    // notification. Our in-memory activatedSessions belief is
+    // orthogonal to the current client's tool catalog — we MUST still
+    // attach and refresh, but we can skip the durable-state lookup
+    // since our belief is authoritative for state.
+    const sid = "hydra_session_rehydrate_already_in_memory";
+    (bridge as unknown as { activatedSessions: Set<string> }).activatedSessions.add(sid);
+    dispatchSessionStarting(2002, sid);
+    await settle();
+    // Cache hit: NO durable-state lookup.
+    assert.equal(
+      client.requestsFor("hydra-acp/session/extension_state/get").length,
+      0,
+      "in-memory cache hit should skip the durable-state lookup",
+    );
+    // But YES to attach (idempotent on daemon side) and refresh (client
+    // may be on stale gateway from its initial handshake).
+    assert.equal(
+      client.requestsFor("hydra-acp/transformer/attach").length,
+      1,
+      "must attach — the fresh session's chain doesn't include us until we do",
+    );
+    assert.equal(
+      client.requestsFor("hydra-acp/mcp_tools/refresh_session").length,
+      1,
+      "must refresh — the fresh agent's MCP client may be on stale gateway",
+    );
   });
 });
 

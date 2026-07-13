@@ -172,6 +172,14 @@ const INTERCEPTS = [
   // sessionUpdate kind ("agent_message_chunk", "turn_complete", ...)
   // to demultiplex what we'd otherwise want as separate intercepts.
   "response:session/update",
+  // Out-of-chain "session is coming to life" broadcast. Fires on
+  // session/new AND resurrect BEFORE the agent produces events. Lets
+  // the planner opt into sessions it cares about (activated
+  // previously, persisted board, etc.) by inspecting its own state
+  // and calling hydra-acp/transformer/attach — without depending on
+  // the session already having the planner in its transform chain.
+  // See rehydrateActivationOnStarting.
+  "lifecycle:session.starting",
   "lifecycle:session.opened",
   "lifecycle:session.idle",
   "lifecycle:session.closed",
@@ -6361,6 +6369,12 @@ export class PlannerBridge {
       log.debug(
         `lifecycle ${params.event} session=${params.sessionId?.slice(-8) ?? "?"}`,
       );
+      if (
+        params.event === "session.starting" &&
+        typeof params.sessionId === "string"
+      ) {
+        void this.rehydrateActivationOnStarting(params.sessionId);
+      }
       return;
     }
     if (note.method === "hydra-acp/commands/cancel") {
@@ -6751,6 +6765,78 @@ export class PlannerBridge {
     this.client.reply(req.id, { tools });
   }
 
+  // Daemon fires `session.starting` for every session bring-up
+  // (fresh session/new AND cold resurrect), broadcast to every
+  // transformer subscribed to `lifecycle:session.starting` regardless
+  // of whether they're already in the session's chain. This is our
+  // opt-in point: check whether the planner has persisted activation
+  // state for this session, and if so:
+  //
+  //   1. Pre-populate the in-memory activatedSessions set (so any
+  //      subsequent tools/list from the agent returns the full spec).
+  //   2. Attach into the session's transformer chain so we receive
+  //      subsequent lifecycle events (session.idle, session.closed)
+  //      and message intercepts.
+  //   3. Fire refresh_session, which pushes
+  //      notifications/tools/list_changed on the extension-MCP
+  //      transport, so the agent re-fetches tools/list AFTER the
+  //      token has been bound to the session (closes the resurrect
+  //      race where the agent's initial tools/list serves static
+  //      gateway tools because peekSessionId returned undefined
+  //      during pre-bind).
+  //
+  // No-op when the session was never activated (avoids waking the
+  // agent's MCP client for nothing) or when we already track this
+  // session in memory (repeat lifecycle events are safe).
+  private async rehydrateActivationOnStarting(sessionId: string): Promise<void> {
+    // Determine activation state:
+    //   1. In-memory activatedSessions: we already know
+    //   2. In-memory confirmedNotActivated: we already know (skip early)
+    //   3. Neither cache hit: consult the daemon (durable state)
+    //
+    // CRITICAL: even when the in-memory cache says "activated", we
+    // still need to run the client-side refresh. Every session.starting
+    // event corresponds to a fresh agent process — the agent's MCP
+    // client has NO persistent memory across daemon restarts / session
+    // kills. It just did its initial tools/list handshake (which got
+    // static gateway because peekSessionId returned undefined during
+    // the pre-bind race). Our in-memory belief that "the session is
+    // activated" is orthogonal to "the current client's tool catalog
+    // matches that belief." If we don't fire refresh_session here, the
+    // client stays on gateway forever even though everything else is
+    // correct — exactly the "kill and reopen → only activate available"
+    // bug the user hit.
+    let activated: boolean;
+    if (this.activatedSessions.has(sessionId)) {
+      activated = true;
+    } else if (this.confirmedNotActivated.has(sessionId)) {
+      return;
+    } else {
+      activated = await this.loadActivatedFromDaemon(sessionId);
+      if (!activated) {
+        this.confirmedNotActivated.add(sessionId);
+        return;
+      }
+      this.activatedSessions.add(sessionId);
+    }
+    // Attach into the session's transformer chain so future
+    // intercepted messages / lifecycle events flow to us. Idempotent
+    // on the daemon side — a repeat attach on a resurrected session
+    // just refreshes the ref.
+    try {
+      await this.client.request("hydra-acp/transformer/attach", { sessionId });
+      attachedSessions.add(sessionId);
+    } catch (err) {
+      log.warn(
+        `rehydrateActivationOnStarting: transformer/attach failed for ${sessionId}: ${(err as Error).message}`,
+      );
+    }
+    // Always force the (potentially fresh) client to re-list against
+    // the dynamic path. See CRITICAL comment above — the client cache
+    // and our state cache are independent.
+    this.scheduleRefreshSession(sessionId);
+  }
+
   // Query the daemon for this session's persisted `activated` flag
   // in the planner's extension_state bucket. Returns false on any
   // error — the agent still gets the gateway and can re-activate.
@@ -6816,23 +6902,35 @@ export class PlannerBridge {
     sessionId: string,
   ): void {
     const wasAlreadyActivated = this.activatedSessions.has(sessionId);
+    // Mark activated — no-op for state when already in the Set, but we
+    // ALWAYS need to schedule a refresh_session below. Reason: the LLM
+    // is calling `activate` because its current tool schema doesn't
+    // show planner tools. Even if OUR in-memory state says activated,
+    // the agent's MCP client may still be on the stale gateway spec
+    // (typical after a resurrect race where the client's initial
+    // tools/list saw peekSessionId return undefined). "Idempotent from
+    // the state machine's view" ≠ "the client already knows."
     this.markSessionActivated(sessionId);
     const toolList = PLANNER_MCP_TOOLS.filter((t) => t.name !== "activate")
       .map((t) => t.name)
       .join(", ");
-    // Reply first; markSessionActivated already scheduled the
-    // refresh_session on the next macrotask so the reply frame has
-    // fully drained through the daemon's SSE writer before the
-    // notification arrives. See markSessionActivated for the
-    // rationale on ordering.
+    // Reply first so it flushes through the SSE writer before the
+    // list_changed notification we're about to fire.
     const message = wasAlreadyActivated
-      ? `Planner toolset already active on this session. Available tools: ${toolList}. Start with \`set_plan\` to author the DAG.`
+      ? `Planner toolset already active on this session. Available tools: ${toolList}. Refreshing tool catalog now — you'll see them on your next turn if you don't already. Start with \`set_plan\` to author the DAG.`
       : `Planner toolset activated for this session. On your next turn you will see: ${toolList}. Start with \`set_plan\` to author the DAG.`;
     this.replyMcpResult(
       reqId,
       message,
       { activated: true, refreshed: true },
     );
+    // Always schedule a refresh — even when state was already
+    // activated. markSessionActivated only scheduled one if this was
+    // a first-time transition, so re-activate calls need this to
+    // sync the client.
+    if (wasAlreadyActivated) {
+      this.scheduleRefreshSession(sessionId);
+    }
   }
 
   // Idempotent state transition: mark this session activated in
@@ -6862,12 +6960,23 @@ export class PlannerBridge {
     this.activatedSessions.add(sessionId);
     this.confirmedNotActivated.delete(sessionId);
     void this.markActivatedDurable(sessionId);
+    this.scheduleRefreshSession(sessionId);
+  }
+
+  // Fire hydra-acp/mcp_tools/refresh_session on the next macrotask.
+  // Deferred via setImmediate so the reply frame from any in-flight
+  // tool call finishes draining through the daemon's SSE writer
+  // before the notifications/tools/list_changed we're about to push
+  // arrives at the client — otherwise the two race and the client
+  // can lose the reply. Always safe to call, idempotent at the
+  // daemon layer (no-op when no matching transport exists).
+  private scheduleRefreshSession(sessionId: string): void {
     setImmediate(() => {
       this.client
         .request("hydra-acp/mcp_tools/refresh_session", { sessionId })
         .catch((err) => {
           log.warn(
-            `activate: refresh_session failed for ${sessionId}: ${(err as Error).message}`,
+            `refresh_session failed for ${sessionId}: ${(err as Error).message}`,
           );
         });
     });
