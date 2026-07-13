@@ -1710,7 +1710,7 @@ describe("remove", () => {
     await settle();
 
     // Worker session/delete request fired with the worker id.
-    const deletes = client.requestsFor("hydra-acp/session/delete");
+    const deletes = client.requestsFor("session/delete");
     assert.equal(deletes.length, 1);
     assert.deepEqual(deletes[0]!.params, { sessionId: "hydra_session_w1" });
 

@@ -2283,7 +2283,7 @@ export class PlannerBridge {
     void (async () => {
       for (const workerId of workerIds) {
         try {
-          await this.client.request("hydra-acp/session/delete", {
+          await this.client.request("session/delete", {
             sessionId: workerId,
           });
         } catch {
@@ -8075,7 +8075,7 @@ export class PlannerBridge {
     void (async () => {
       for (const workerId of workerIds) {
         try {
-          await this.client.request("hydra-acp/session/delete", { sessionId: workerId });
+          await this.client.request("session/delete", { sessionId: workerId });
         } catch {
           // already-gone is fine
         }
