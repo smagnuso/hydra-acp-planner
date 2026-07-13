@@ -76,7 +76,12 @@ import {
   takeDeferredMcpReply,
 } from "./deferred-mcp.js";
 import { WorkerForwarder } from "./worker-forward.js";
-import { PLANNER_MCP_INSTRUCTIONS, PLANNER_MCP_TOOLS } from "./mcp-tools.js";
+import {
+  PLANNER_MCP_GATEWAY_INSTRUCTIONS,
+  PLANNER_MCP_GATEWAY_TOOLS,
+  PLANNER_MCP_INSTRUCTIONS,
+  PLANNER_MCP_TOOLS,
+} from "./mcp-tools.js";
 import { readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
@@ -486,6 +491,14 @@ export class PlannerBridge {
   // when the board exits the blocked state (any pending task becomes
   // eligible again, e.g. via retry of the failed root).
   private blockedNotifiedFor = new Set<string>();
+
+  // Sessions that have called `activate` on this planner process's
+  // lifetime. Non-activated sessions see only the gateway tool
+  // (`activate` itself) via the list_tools handler; once activated,
+  // they see the full PLANNER_MCP_TOOLS spec. Persistence isn't
+  // necessary — worst case after a daemon restart is that a session
+  // has to re-activate on its next planning turn.
+  private activatedSessions = new Set<string>();
 
   // Cache mapping a forked session id to the ancestor session id that
   // actually owns a board (or null if no board lives anywhere up the
@@ -934,24 +947,41 @@ export class PlannerBridge {
   }
 
   // Advertise MCP tools the planner implements. The daemon injects
-  // them into each session's mcpServers list at session/new time, so
-  // MCP-capable agents (Claude, opencode, codex, …) see them
-  // natively and can call them from conversational turns without the
-  // user needing to remember slash command syntax.
+  // them into every top-level session (session/new — user TUI +
+  // orchestrator sessions) via mintExtensionMcpDescriptors, so
+  // MCP-capable agents (Claude, opencode, codex, …) see them natively
+  // and can call them from conversational turns without the user
+  // needing to remember slash command syntax.
+  //
+  // NOT injected into workers spawned via hydra-acp/child_session/spawn
+  // — that path bypasses the extension-MCP mint step by design.
+  // Workers execute individual tasks and never call planner tools;
+  // giving them the catalog would be waste and would risk them
+  // authoring plans of their own. Resurrect paths (session/attach,
+  // session/load) do re-mint via the same helper, so a woken-cold
+  // top-level session regains the tools it had originally; whether
+  // that helper correctly no-ops for resurrected workers is worth
+  // verifying but out of scope here.
   //
   // Tool invocations arrive on this transformer's WS connection as
   // hydra-acp/mcp_tools/invoke requests; dispatched in handleRequest.
   private async registerMcpTools(): Promise<void> {
+    // Boot registration is intentionally the gateway set: one tool
+    // (`activate`) + a short instructions block. Sessions that never
+    // plan pay only this ~250-token surface. The daemon's per-session
+    // ListTools handler forwards to our handleListTools below, which
+    // returns the FULL PLANNER_MCP_TOOLS spec for any session in
+    // this.activatedSessions.
     try {
       const result = await this.client.request<{ ok: boolean; registered: number }>(
         "hydra-acp/mcp_tools/register",
         {
-          instructions: PLANNER_MCP_INSTRUCTIONS,
-          tools: PLANNER_MCP_TOOLS,
+          instructions: PLANNER_MCP_GATEWAY_INSTRUCTIONS,
+          tools: PLANNER_MCP_GATEWAY_TOOLS,
         },
       );
       log.info(
-        `registered ${result.registered ?? PLANNER_MCP_TOOLS.length} MCP tool(s): ${PLANNER_MCP_TOOLS.map((t) => t.name).join(", ")}`,
+        `registered ${result.registered ?? PLANNER_MCP_GATEWAY_TOOLS.length} MCP tool(s) at boot (gateway): ${PLANNER_MCP_GATEWAY_TOOLS.map((t) => t.name).join(", ")}. Full toolset (${PLANNER_MCP_TOOLS.length} tools) surfaces per-session after \`activate\`.`,
       );
     } catch (err) {
       log.error(`mcp_tools/register failed: ${(err as Error).message}`);
@@ -1248,6 +1278,10 @@ export class PlannerBridge {
           isError: true,
         });
       });
+      return;
+    }
+    if (req.method === "hydra-acp/mcp_tools/list_tools") {
+      this.handleMcpListTools(req);
       return;
     }
     log.warn(`unexpected request method: ${req.method}`);
@@ -6615,6 +6649,83 @@ export class PlannerBridge {
 
   // ── MCP tool dispatch ──────────────────────────────────────────────
 
+  // Serve the daemon's hydra-acp/mcp_tools/list_tools request for a
+  // specific session. Sessions in this.activatedSessions see the full
+  // planner toolset; everyone else sees only the gateway (`activate`).
+  // Called every time an agent's MCP client asks for tools/list —
+  // which happens on initial handshake AND after each transport reset
+  // (the mechanism we use to force a re-list after activation via
+  // hydra-acp/mcp_tools/refresh_session).
+  //
+  // The daemon falls back to whatever was registered at boot
+  // (PLANNER_MCP_GATEWAY_TOOLS) if this handler ever throws or
+  // returns nothing, so worst-case behavior is "session sees gateway
+  // only" — never a broken tool catalog.
+  private handleMcpListTools(req: JsonRpcRequest): void {
+    const params = (req.params ?? {}) as { sessionId?: unknown };
+    const sessionId =
+      typeof params.sessionId === "string" ? params.sessionId : "";
+    if (!sessionId) {
+      this.client.replyError(
+        req.id,
+        -32602,
+        "list_tools: missing sessionId",
+      );
+      return;
+    }
+    const tools = this.activatedSessions.has(sessionId)
+      ? PLANNER_MCP_TOOLS
+      : PLANNER_MCP_GATEWAY_TOOLS;
+    this.client.reply(req.id, { tools });
+  }
+
+  // Handle the `activate` tool call. Marks the session as activated
+  // so subsequent list_tools requests return the full spec,
+  // then asks the daemon to evict this session's MCP transport for
+  // our extension — that forces the agent's MCP client to reconnect
+  // and re-fetch tools/list on its next request, which is when it
+  // picks up the expanded catalog. The tool result tells the LLM what
+  // just happened so it can proceed on the next turn without
+  // guessing.
+  //
+  // Idempotent: calling twice is harmless (Set semantics; refresh is
+  // safe to re-issue). This matters if the LLM ever calls it in a
+  // session that's already activated — e.g. after a client-side
+  // context reset that lost the tool list.
+  private async handleActivatePlanner(
+    reqId: number | string,
+    sessionId: string,
+  ): Promise<void> {
+    this.activatedSessions.add(sessionId);
+    try {
+      await this.client.request("hydra-acp/mcp_tools/refresh_session", {
+        sessionId,
+      });
+    } catch (err) {
+      // A refresh failure means the agent won't see the expanded tool
+      // list on its next turn — but the activation state is set, so
+      // any subsequent tools/list (say, triggered by another
+      // extension's registration event) will still land the full
+      // catalog. Log loudly and return a soft-warn result.
+      log.warn(
+        `activate: refresh_session failed for ${sessionId}: ${(err as Error).message}`,
+      );
+      return this.replyMcpResult(
+        reqId,
+        `Planner activated but the tool-catalog refresh failed (${(err as Error).message}). Try again in a new session, or invoke set_plan directly — the tools work even if they don't appear in your visible catalog yet.`,
+        { activated: true, refreshed: false },
+      );
+    }
+    const toolList = PLANNER_MCP_TOOLS.filter((t) => t.name !== "activate")
+      .map((t) => t.name)
+      .join(", ");
+    this.replyMcpResult(
+      reqId,
+      `Planner toolset activated for this session. On your next turn you will see: ${toolList}. Start with \`set_plan\` to author the DAG.`,
+      { activated: true, refreshed: true },
+    );
+  }
+
   // Dispatch incoming hydra-acp/mcp_tools/invoke to the right tool
   // handler. Returns an MCP CallToolResult ({content, isError?,
   // structuredContent?}) shape that the daemon hands back to the
@@ -6651,6 +6762,8 @@ export class PlannerBridge {
     log.info(`mcp tool ${tool} on session …${sessionId.slice(-8)}`);
     try {
       switch (tool) {
+        case "activate":
+          return await this.handleActivatePlanner(req.id, sessionId);
         case "list_agents":
           return await this.toolListAgents(req.id);
         case "set_plan":

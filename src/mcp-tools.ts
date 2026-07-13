@@ -97,6 +97,38 @@ export interface PlannerMcpTool {
   inputSchema: Record<string, unknown>;
 }
 
+// Short instructions block registered alongside the gateway tool set.
+// Kept intentionally minimal — the full planner workflow prose only
+// materializes once the agent has activated (and thus committed to the
+// planning context). Idle sessions that never plan pay only this ~250-
+// token surface plus the single `activate` tool.
+export const PLANNER_MCP_GATEWAY_INSTRUCTIONS = `\
+Multi-agent planning is available on this session but not currently \
+loaded. If the user asks you to build, fix, refactor, or otherwise \
+execute work that would benefit from being broken into a parallel task \
+DAG, call \`activate\` on this MCP server first — that unlocks the full \
+planning toolset (set_plan, execute_plan, get_status, and the rest). \
+Until activated, this MCP server exposes only that one tool.\
+`;
+
+// Gateway tool set. Registered at boot. Kept to one tool so the fixed
+// per-session cost is minimal — non-planning sessions pay only this.
+// Once the agent calls `activate`, the planner's per-session state
+// marks the session activated and the daemon-forwarded list_tools
+// handler returns the full PLANNER_MCP_TOOLS spec on the next
+// tools/list (triggered by the eviction-forced transport reset).
+export const PLANNER_MCP_GATEWAY_TOOLS: PlannerMcpTool[] = [
+  {
+    name: "activate",
+    description:
+      "Unlock the full planner toolset on this session. Call this once when the user first asks for multi-agent planning, decomposition, or coordinated parallel work. After activation the tool list grows to include set_plan, execute_plan, get_status, and the rest — you'll see them on your next turn. No arguments; the activation state is per-session and idempotent (calling again is harmless).",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+];
+
 export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "list_agents",

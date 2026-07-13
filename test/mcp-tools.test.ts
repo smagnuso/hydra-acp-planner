@@ -2172,3 +2172,110 @@ describe("interactive guard", () => {
     assert.match(result.content[0]!.text, /already running/);
   });
 });
+
+// ── activate + list_tools (gateway → full transition) ─────────────
+
+describe("list_tools handler", () => {
+  // Dispatches a hydra-acp/mcp_tools/list_tools request through
+  // handleRequest. Uses the same private dispatcher plumbing as
+  // dispatch() but with the different method envelope.
+  function dispatchListTools(id: number, sessionId?: string): void {
+    const req = {
+      jsonrpc: "2.0" as const,
+      id,
+      method: "hydra-acp/mcp_tools/list_tools",
+      params: sessionId !== undefined ? { sessionId } : {},
+    };
+    (bridge as unknown as { handleRequest: (r: unknown) => void }).handleRequest(req);
+  }
+
+  it("returns the gateway (activate only) for a session that has NOT activated", async () => {
+    dispatchListTools(1000, "hydra_session_gateway_test");
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { tools: Array<{ name: string }> };
+    assert.deepEqual(
+      result.tools.map((t) => t.name),
+      ["activate"],
+    );
+  });
+
+  it("returns the full planner toolset for an activated session", async () => {
+    const sid = "hydra_session_activated_test";
+    (bridge as unknown as { activatedSessions: Set<string> }).activatedSessions.add(sid);
+    dispatchListTools(1001, sid);
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { tools: Array<{ name: string }> };
+    const names = result.tools.map((t) => t.name);
+    assert.ok(names.includes("set_plan"), "full toolset should include set_plan");
+    assert.ok(names.includes("execute_plan"), "full toolset should include execute_plan");
+    assert.ok(names.includes("get_status"), "full toolset should include get_status");
+    assert.ok(names.length > 5, `expected many tools, got ${names.length}: ${names.join(",")}`);
+  });
+
+  it("rejects list_tools with a missing sessionId", async () => {
+    dispatchListTools(1002 /* no sessionId */);
+    await settle();
+    const r = client.lastReply();
+    assert.ok(r.error, "expected an error reply");
+    assert.match(r.error!.message, /sessionId/);
+  });
+});
+
+describe("activate tool", () => {
+  it("adds the session to activatedSessions and calls refresh_session", async () => {
+    const sid = "hydra_session_activate_add";
+    dispatch(mkInvoke(1100, "activate", {}, sid));
+    await settle();
+    const activated = (bridge as unknown as { activatedSessions: Set<string> })
+      .activatedSessions;
+    assert.ok(activated.has(sid), "session should be in activatedSessions");
+    const refreshCalls = client.requestsFor("hydra-acp/mcp_tools/refresh_session");
+    assert.equal(refreshCalls.length, 1);
+    assert.deepEqual(refreshCalls[0]!.params, { sessionId: sid });
+  });
+
+  it("returns a success result mentioning set_plan so the LLM knows what to do next", async () => {
+    const sid = "hydra_session_activate_result";
+    dispatch(mkInvoke(1101, "activate", {}, sid));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
+    assert.notEqual(result.isError, true, "activate should succeed");
+    const text = result.content[0]!.text;
+    assert.match(text, /set_plan/, "result must mention set_plan");
+  });
+
+  it("is idempotent — calling twice keeps activation and issues a second refresh", async () => {
+    const sid = "hydra_session_activate_idempotent";
+    dispatch(mkInvoke(1102, "activate", {}, sid));
+    await settle();
+    dispatch(mkInvoke(1103, "activate", {}, sid));
+    await settle();
+    const activated = (bridge as unknown as { activatedSessions: Set<string> })
+      .activatedSessions;
+    assert.ok(activated.has(sid));
+    // Set semantics — one entry, not two — but the request goes out
+    // both times (safe; daemon-side eviction is a no-op when there's
+    // nothing to evict).
+    assert.equal(client.requestsFor("hydra-acp/mcp_tools/refresh_session").length, 2);
+  });
+
+  it("still marks the session activated when refresh_session fails (soft-warn path)", async () => {
+    const sid = "hydra_session_activate_refresh_fail";
+    // Configure the FakeClient to reject refresh_session calls.
+    client.responders.set("hydra-acp/mcp_tools/refresh_session", () => {
+      throw new Error("daemon dropped the ball");
+    });
+    dispatch(mkInvoke(1104, "activate", {}, sid));
+    await settle();
+    const activated = (bridge as unknown as { activatedSessions: Set<string> })
+      .activatedSessions;
+    assert.ok(activated.has(sid), "activation state should persist even on refresh failure");
+    const r = client.lastReply();
+    const result = r.result as { isError?: boolean; content: Array<{ text: string }> };
+    assert.notEqual(result.isError, true, "soft-warn result must NOT be isError");
+    assert.match(result.content[0]!.text, /activated/i);
+  });
+});
