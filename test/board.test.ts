@@ -590,8 +590,8 @@ describe("listProjects", () => {
 });
 
 describe("BOARD_SCHEMA_VERSION", () => {
-  it("is 3 after running-status split", () => {
-    assert.equal(BOARD_SCHEMA_VERSION, 3);
+  it("is 4 after workerSessions history addition", () => {
+    assert.equal(BOARD_SCHEMA_VERSION, 4);
   });
 });
 
@@ -636,6 +636,42 @@ describe("schema migration v1 → v2", () => {
     const loaded = loadBoard(b.projectId);
     assert.ok(loaded);
     assert.equal(loaded!.tasks[0]!.kind, "review");
+  });
+
+  it("v3 → v4 seeds workerSessions from a currently-assigned worker", () => {
+    const b = makeV1Board();
+    b.version = 3;
+    b.tasks[0]!.kind = "work";
+    b.tasks[0]!.status = "running";
+    b.tasks[0]!.assignedTo = "hydra_sess_live1234";
+    saveBoard(b, "s_mig_v4_live");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.deepEqual(loaded!.tasks[0]!.workerSessions, ["hydra_sess_live1234"]);
+  });
+
+  it("v3 → v4 filters the 'orchestrator' sentinel out of workerSessions", () => {
+    const b = makeV1Board();
+    b.version = 3;
+    b.tasks[0]!.kind = "review";
+    b.tasks[0]!.status = "running";
+    b.tasks[0]!.assignedTo = "orchestrator";
+    saveBoard(b, "s_mig_v4_orch");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.deepEqual(loaded!.tasks[0]!.workerSessions, []);
+  });
+
+  it("v3 → v4 leaves workerSessions [] on completed tasks (assignedTo already cleared)", () => {
+    const b = makeV1Board();
+    b.version = 3;
+    b.tasks[0]!.kind = "work";
+    b.tasks[0]!.status = "done";
+    b.tasks[0]!.assignedTo = null;
+    saveBoard(b, "s_mig_v4_done");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.deepEqual(loaded!.tasks[0]!.workerSessions, []);
   });
 
   it("does not re-migrate a board already at current version", () => {

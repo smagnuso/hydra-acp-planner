@@ -4647,6 +4647,10 @@ export class PlannerBridge {
     // assignedTo was held null until the childSessionId existed.
     task.status = "running";
     task.assignedTo = childSessionId;
+    if (!Array.isArray(task.workerSessions))
+      task.workerSessions = [];
+    if (!task.workerSessions.includes(childSessionId))
+      task.workerSessions.push(childSessionId);
     // Worker agent/model resolution is layered:
     //   1) pre-spawn resolve chain (task override → fleet default → board)
     //      yields effectiveAgent/effectiveModel.
@@ -7477,6 +7481,7 @@ export class PlannerBridge {
         model: t.model,
         status: t.status,
         assignedTo: t.assignedTo,
+        workerSessions: Array.isArray(t.workerSessions) ? [...t.workerSessions] : [],
         artifacts: t.artifacts,
       })),
     });

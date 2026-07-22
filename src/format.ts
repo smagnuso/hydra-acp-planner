@@ -637,6 +637,7 @@ export interface Finding {
   followUps: string[];
   decision: string | null;
   attemptCount: number;
+  workerSessions: string[];
   verifiedDiff: TaskArtifacts["verified_diff"] | null;
   distillReport?: DistillReport;
 }
@@ -733,6 +734,7 @@ export function collectFindings(
       followUps,
       decision,
       attemptCount: t.attemptCount,
+      workerSessions: Array.isArray(t.workerSessions) ? [...t.workerSessions] : [],
       verifiedDiff,
       ...(distillReport ? { distillReport } : {}),
     });
@@ -778,6 +780,16 @@ export function formatFindingBlock(f: Finding): string {
     lines.push(
       `verified_diff: ${fileCount} file(s), ${vd.hunkCount} hunk(s) (sample: ${sampleFile})`,
     );
+  }
+  if (f.workerSessions.length > 0) {
+    const shortIds = f.workerSessions.map(shortSessionId).join(", ");
+    const latest = f.workerSessions[f.workerSessions.length - 1]!;
+    const hint =
+      f.workerSessions.length === 1
+        ? `hydra session attach ${latest}`
+        : `hydra session attach ${latest}  # latest of ${f.workerSessions.length}`;
+    lines.push(`sessions: ${shortIds}`);
+    lines.push(`  ${hint}`);
   }
   return lines.join("\n");
 }

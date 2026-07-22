@@ -8,7 +8,7 @@ import {
   projectsDir,
 } from "./paths.js";
 
-export const BOARD_SCHEMA_VERSION = 3;
+export const BOARD_SCHEMA_VERSION = 4;
 
 export type TaskStatus =
   | "pending"
@@ -161,6 +161,13 @@ export interface Task {
   reviewModel?: string | null;
   status: TaskStatus;
   assignedTo?: string | null;
+  // Every worker session that has run (or is running) this task, oldest
+  // first. Appended on each spawn; never cleared. Retries and reruns add
+  // entries so the user can `hydra session attach` any historical
+  // attempt. Orchestrator-lane reviews (assignedTo === "orchestrator")
+  // do NOT push here — that sentinel is not a real hydra session id and
+  // would produce a broken attach hint.
+  workerSessions?: string[];
   attemptCount: number;
   artifacts?: TaskArtifacts | null;
   startedAt?: string | null;
@@ -805,6 +812,25 @@ function migrateBoard(b: Board): void {
       }
     }
     b.version = 3;
+  }
+  // v3 → v4: introduce workerSessions[] history on Task. Best-effort
+  // backfill from assignedTo when it's still populated (currently
+  // in-flight tasks). Completed tasks on old boards start with an
+  // empty history — assignedTo was cleared to null on completion, so
+  // there's nothing to salvage. The "orchestrator" sentinel is not a
+  // real session id and is filtered out.
+  if (b.version < 4) {
+    for (const t of b.tasks) {
+      if (!Array.isArray(t.workerSessions)) t.workerSessions = [];
+      if (
+        t.assignedTo &&
+        t.assignedTo !== "orchestrator" &&
+        !t.workerSessions.includes(t.assignedTo)
+      ) {
+        t.workerSessions.push(t.assignedTo);
+      }
+    }
+    b.version = 4;
   }
 }
 

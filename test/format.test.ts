@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatTaskTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
+import { collectFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatTaskTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
 import { setBoardState, type Board, type Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -1027,5 +1027,78 @@ describe("formatTaskTag", () => {
     const tag = formatTaskTag(t, b);
     assert.ok(!tag.includes("orchestrator"), "work tasks never get the orchestrator marker");
     assert.equal(tag, " {opencode-dev}");
+  });
+});
+
+describe("workerSessions in findings", () => {
+  it("collectFindings copies workerSessions onto the Finding", () => {
+    const out = collectFindings(
+      board({
+        tasks: [
+          task("T1", {
+            status: "failed",
+            artifacts: { summary: "boom" },
+            workerSessions: ["hydra_sess_aaaaaaaa", "hydra_sess_bbbbbbbb"],
+          }),
+        ],
+      }),
+    );
+    assert.equal(out.length, 1);
+    assert.deepEqual(out[0]!.workerSessions, [
+      "hydra_sess_aaaaaaaa",
+      "hydra_sess_bbbbbbbb",
+    ]);
+  });
+
+  it("collectFindings defaults workerSessions to [] when missing", () => {
+    const out = collectFindings(
+      board({
+        tasks: [task("T1", { status: "failed", artifacts: { summary: "boom" } })],
+      }),
+    );
+    assert.deepEqual(out[0]!.workerSessions, []);
+  });
+
+  it("formatFindingBlock renders a sessions line and attach hint", () => {
+    const [finding] = collectFindings(
+      board({
+        tasks: [
+          task("T1", {
+            status: "failed",
+            artifacts: { summary: "boom" },
+            workerSessions: ["hydra_sess_aaaaaaaa"],
+          }),
+        ],
+      }),
+    );
+    const block = formatFindingBlock(finding!);
+    assert.match(block, /sessions:/);
+    assert.match(block, /hydra session attach hydra_sess_aaaaaaaa/);
+  });
+
+  it("formatFindingBlock marks the latest of multiple attempts", () => {
+    const [finding] = collectFindings(
+      board({
+        tasks: [
+          task("T1", {
+            status: "failed",
+            artifacts: { summary: "boom" },
+            workerSessions: ["hydra_sess_aaaaaaaa", "hydra_sess_bbbbbbbb"],
+          }),
+        ],
+      }),
+    );
+    const block = formatFindingBlock(finding!);
+    assert.match(block, /hydra session attach hydra_sess_bbbbbbbb\s+# latest of 2/);
+  });
+
+  it("formatFindingBlock omits the sessions line when history is empty", () => {
+    const [finding] = collectFindings(
+      board({
+        tasks: [task("T1", { status: "failed", artifacts: { summary: "boom" } })],
+      }),
+    );
+    const block = formatFindingBlock(finding!);
+    assert.doesNotMatch(block, /sessions:/);
   });
 });
