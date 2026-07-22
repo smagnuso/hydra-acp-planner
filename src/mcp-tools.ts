@@ -141,7 +141,7 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
   {
     name: "list_agents",
     description:
-      "List the agents available for spawning workers on this session's tasks. Returns an array of {id, description} pairs. Call this when you're deciding per-task agent overrides and want to know what's installed. The default agent (used when no per-task or fleet override is set) is whatever this session was created with — usually the same agent that's currently talking.",
+      "List the agents available for spawning workers on this session's tasks. Returns an array of {id, description, installed} entries. Agents with installed=false are known to hydra but not yet installed locally; the daemon will install them on first use when a worker requests them, so they are still valid picks (expect a small one-time latency the first time). Call this when you're deciding per-task agent overrides. The default agent (used when no per-task or fleet override is set) is whatever this session was created with, usually the same agent that's currently talking.",
     inputSchema: {
       type: "object",
       properties: {},

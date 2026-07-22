@@ -669,8 +669,10 @@ export class PlannerBridge {
     }
   }
 
-  private async ensureAgentChoices(): Promise<AgentChoice[] | undefined> {
-    if (this.agentChoices !== undefined) return this.agentChoices;
+  private async ensureAgentChoices(
+    opts: { refresh?: boolean } = {},
+  ): Promise<AgentChoice[] | undefined> {
+    if (!opts.refresh && this.agentChoices !== undefined) return this.agentChoices;
     try {
       const result = await this.client.request<{
         agents?: Array<{ id?: unknown; description?: unknown; installed?: unknown }>;
@@ -678,14 +680,15 @@ export class PlannerBridge {
       const out: AgentChoice[] = [];
       for (const a of result?.agents ?? []) {
         if (typeof a.id !== "string") continue;
-        if (a.installed !== "yes") continue;
         out.push({
           id: a.id,
           description: typeof a.description === "string" ? a.description : undefined,
+          installed: a.installed === "yes",
         });
       }
       this.agentChoices = out;
-      log.info(`fetched ${out.length} installed agent choice(s) for prompts`);
+      const installed = out.filter((a) => a.installed).length;
+      log.info(`fetched ${out.length} agent choice(s) for prompts (${installed} installed)`);
       return out;
     } catch (err) {
       log.warn(`agents/list failed; decomposition prompt will omit agent options: ${(err as Error).message}`);
@@ -4548,12 +4551,15 @@ export class PlannerBridge {
         },
       };
       if (effectiveAgent) {
-        const known = (this.agentChoices ?? []).some((a) => a.id === effectiveAgent);
-        if (known) {
-          spawnParams.agentId = effectiveAgent;
-        } else {
+        spawnParams.agentId = effectiveAgent;
+        const choice = (this.agentChoices ?? []).find((a) => a.id === effectiveAgent);
+        if (!choice) {
           log.warn(
-            `task ${task.id} requested unknown agent "${effectiveAgent}"; spawning with default`,
+            `task ${task.id} requested agent "${effectiveAgent}" not present in agents/list; passing through (daemon will install on demand or reject)`,
+          );
+        } else if (choice.installed === false) {
+          log.info(
+            `task ${task.id} requested agent "${effectiveAgent}" (not yet installed); daemon will install on first use`,
           );
         }
       }
@@ -7113,14 +7119,19 @@ export class PlannerBridge {
   // ── Individual tool handlers ───────────────────────────────────────
 
   private async toolListAgents(reqId: number | string): Promise<void> {
-    const choices = (await this.ensureAgentChoices()) ?? [];
+    const choices = (await this.ensureAgentChoices({ refresh: true })) ?? [];
     const list = choices.map((a) => ({
       id: a.id,
       description: a.description ?? "",
+      installed: a.installed !== false,
     }));
     const text = list.length === 0
-      ? "No agents are installed. Workers will spawn with the daemon's default agent."
-      : `Available agents (${list.length}):\n${list.map((a) => `  - ${a.id}${a.description ? ` — ${a.description}` : ""}`).join("\n")}`;
+      ? "No agents are available. Workers will spawn with the daemon's default agent."
+      : `Available agents (${list.length}):\n${list.map((a) => {
+          const desc = a.description ? `, ${a.description}` : "";
+          const status = a.installed ? "" : " (not installed, will be installed on first use)";
+          return `  - ${a.id}${desc}${status}`;
+        }).join("\n")}`;
     this.replyMcpResult(reqId, text, { agents: list });
   }
 

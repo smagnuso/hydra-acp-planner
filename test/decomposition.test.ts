@@ -56,7 +56,7 @@ describe("buildDecompositionPrompt", () => {
       { id: "code-codex" },
     ]);
     assert.match(p, /Available specialist agents/);
-    assert.match(p, /code-claude — Claude coding agent/);
+    assert.match(p, /code-claude, Claude coding agent/);
     assert.match(p, /code-codex/);
   });
 

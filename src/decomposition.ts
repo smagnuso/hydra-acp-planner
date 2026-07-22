@@ -11,6 +11,7 @@ import { formatBoardContext } from "./format.js";
 export interface AgentChoice {
   id: string;
   description?: string | undefined;
+  installed?: boolean;
 }
 
 const DECOMPOSITION_SYSTEM = `You are helping plan a software project that will be executed by parallel coding agents. Your job is to break the project into a minimal task DAG and respond with structured JSON.
@@ -101,8 +102,9 @@ export function formatAgentChoices(agents: AgentChoice[] | undefined): string {
   if (!agents || agents.length === 0) return "";
   const lines = ["Available specialist agents (pick by id, or omit for default):"];
   for (const a of agents) {
-    const desc = a.description ? ` — ${a.description}` : "";
-    lines.push(`  - ${a.id}${desc}`);
+    const desc = a.description ? `, ${a.description}` : "";
+    const notInstalled = a.installed === false ? " (not installed, hydra will install on first use)" : "";
+    lines.push(`  - ${a.id}${desc}${notInstalled}`);
   }
   return lines.join("\n");
 }

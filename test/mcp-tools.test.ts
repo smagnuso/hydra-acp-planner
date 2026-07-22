@@ -226,30 +226,36 @@ describe("list_agents", () => {
     await settle();
     const r = client.lastReply();
     const result = r.result as { content: Array<{ text: string }>; structuredContent: { agents: unknown[] } };
-    assert.match(result.content[0]!.text, /No agents are installed/);
+    assert.match(result.content[0]!.text, /No agents are available/);
     assert.deepEqual(result.structuredContent.agents, []);
   });
 
-  it("lists installed agents with descriptions and skips installed!=yes", async () => {
+  it("lists all agents including not-yet-installed, and skips non-string ids", async () => {
     client.responders.set("hydra-acp/agents/list", () => ({
       agents: [
         { id: "code-claude", description: "Claude code agent", installed: "yes" },
         { id: "code-gemini", description: "Gemini code agent", installed: "yes" },
-        { id: "shadow-only", description: "not installed", installed: "no" },
+        { id: "code-codex", description: "Codex agent", installed: "no" },
         { id: 42, description: "bogus", installed: "yes" }, // non-string id
       ],
     }));
     dispatch(mkInvoke(11, "list_agents", {}));
     await settle();
     const r = client.lastReply();
-    const result = r.result as { content: Array<{ text: string }>; structuredContent: { agents: Array<{ id: string }> } };
-    assert.equal(result.structuredContent.agents.length, 2);
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: { agents: Array<{ id: string; installed: boolean }> };
+    };
+    assert.equal(result.structuredContent.agents.length, 3);
     assert.deepEqual(
       result.structuredContent.agents.map((a) => a.id),
-      ["code-claude", "code-gemini"],
+      ["code-claude", "code-gemini", "code-codex"],
     );
-    assert.match(result.content[0]!.text, /code-claude — Claude code agent/);
-    assert.match(result.content[0]!.text, /code-gemini — Gemini code agent/);
+    const byId = new Map(result.structuredContent.agents.map((a) => [a.id, a.installed]));
+    assert.equal(byId.get("code-claude"), true);
+    assert.equal(byId.get("code-codex"), false);
+    assert.match(result.content[0]!.text, /code-claude, Claude code agent/);
+    assert.match(result.content[0]!.text, /code-codex.*not installed/);
   });
 });
 
