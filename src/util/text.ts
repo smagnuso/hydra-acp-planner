@@ -109,8 +109,8 @@ export function updateKind(envelope: unknown): string | undefined {
 // Extract the fields planner cares about from a usage_update envelope.
 // Returns undefined for non-usage updates. Individual fields are
 // optional — agents emit varying subsets, callers should merge onto
-// prior state. Cost may also ride under update._meta["hydra-acp"]
-// .cumulativeCost when hydra has stamped a cross-life total.
+// prior state. Cost rides in update.cost.amount as a collapsed lifetime
+// total.
 export function extractUsageUpdate(envelope: unknown): {
   used?: number;
   size?: number;
@@ -130,11 +130,13 @@ export function extractUsageUpdate(envelope: unknown): {
     if (typeof cost.amount === "number") out.costAmount = cost.amount;
     if (typeof cost.currency === "string") out.costCurrency = cost.currency;
   }
-  const meta = update._meta as Record<string, unknown> | undefined;
-  const ns = meta?.["hydra-acp"] as Record<string, unknown> | undefined;
-  if (ns && typeof ns.cumulativeCost === "number") {
-    out.costAmount = ns.cumulativeCost;
-  }
+  // Deliberately does NOT consult _meta["hydra-acp"].cumulativeCost. hydra has
+  // never emitted that field (verified across all daemon revisions), and under
+  // hydra's split ledger it means "spend on retired agent lives" — a COMPONENT
+  // of lifetime cost, not the total. Per PROTOCOL.md "Cost ledger scope" every
+  // wire shape collapses the split into cost.amount, so cost.amount is
+  // authoritative. Honouring cumulativeCost here would under-report any
+  // session that had rotated its agent.
   return out;
 }
 

@@ -5,6 +5,7 @@ import {
   buildTextPromptEnvelope,
   extractPromptText,
   extractUpdateText,
+  extractUsageUpdate,
 } from "../src/util/text.ts";
 
 describe("extractPromptText", () => {
@@ -100,5 +101,48 @@ describe("extractUpdateText", () => {
     assert.equal(extractUpdateText(null), "");
     assert.equal(extractUpdateText({}), "");
     assert.equal(extractUpdateText({ params: {} }), "");
+  });
+});
+
+describe("extractUsageUpdate", () => {
+  it("reads used/size/cost from the envelope", () => {
+    const u = extractUsageUpdate({
+      update: {
+        sessionUpdate: "usage_update",
+        used: 100,
+        size: 200000,
+        cost: { amount: 12.5, currency: "USD" },
+      },
+    });
+    assert.deepEqual(u, {
+      used: 100,
+      size: 200000,
+      costAmount: 12.5,
+      costCurrency: "USD",
+    });
+  });
+
+  // Regression: cost.amount is the authoritative collapsed lifetime total on
+  // every hydra wire shape (PROTOCOL.md "Cost ledger scope"). hydra has never
+  // emitted _meta["hydra-acp"].cumulativeCost, and under the split ledger it
+  // means "retired agent lives only" — a component, not the total. Honouring
+  // it would under-report every session that had rotated its agent.
+  it("ignores _meta['hydra-acp'].cumulativeCost", () => {
+    const u = extractUsageUpdate({
+      update: {
+        sessionUpdate: "usage_update",
+        used: 100,
+        cost: { amount: 12.5, currency: "USD" },
+        _meta: { "hydra-acp": { cumulativeCost: 3.5 } },
+      },
+    });
+    assert.equal(u?.costAmount, 12.5);
+  });
+
+  it("returns undefined for non-usage updates", () => {
+    assert.equal(
+      extractUsageUpdate({ update: { sessionUpdate: "tool_call" } }),
+      undefined,
+    );
   });
 });
