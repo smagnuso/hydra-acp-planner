@@ -3837,7 +3837,7 @@ export class PlannerBridge {
     if (
       kind === "usage_update" ||
       kind === "session_info_update" ||
-      kind === "current_model_update"
+      kind === "_hydra_current_model_update"
     ) {
       const orchestratorId = orchestratorOfWorker(sessionId);
       const board = orchestratorId ? boards.get(orchestratorId) : undefined;
@@ -3857,7 +3857,7 @@ export class PlannerBridge {
             changed = true;
           }
           this.invalidateInteractiveCache(sessionId);
-        } else if (kind === "current_model_update") {
+        } else if (kind === "_hydra_current_model_update") {
           const model = extractCurrentModelUpdate(envelope);
           if (model && model !== w.model) {
             w.model = model;
@@ -4064,7 +4064,7 @@ export class PlannerBridge {
             saveBoard(board, sessionId);
           }
           this.invalidateInteractiveCache(sessionId);
-        } else if (kind === "current_model_update") {
+        } else if (kind === "_hydra_current_model_update") {
           const model = extractCurrentModelUpdate(envelope);
           if (model && model !== board.orchestratorModel) {
             board.orchestratorModel = model;
@@ -4073,7 +4073,7 @@ export class PlannerBridge {
         }
       } else if (
         kind === "session_info_update" ||
-        kind === "current_model_update"
+        kind === "_hydra_current_model_update"
       ) {
         // Post-spawn one-shot fetch is the fast path; this reactive
         // handler catches slow-starting agents (e.g. local LLMs) whose

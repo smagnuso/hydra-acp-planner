@@ -120,7 +120,7 @@ function sessionInfoUpdate(agentId: string): unknown {
 function currentModelUpdate(currentModel: string): unknown {
   return {
     update: {
-      sessionUpdate: "current_model_update",
+      sessionUpdate: "_hydra_current_model_update",
       currentModel,
     },
   };

@@ -157,7 +157,7 @@ export function extractAgentIdUpdate(envelope: unknown): string | undefined {
 export function extractCurrentModelUpdate(envelope: unknown): string | undefined {
   const env = envelope as { update?: Record<string, unknown> } | undefined;
   const update = env?.update;
-  if (!update || update.sessionUpdate !== "current_model_update") return undefined;
+  if (!update || update.sessionUpdate !== "_hydra_current_model_update") return undefined;
   const m = update.currentModel;
   return typeof m === "string" ? m : undefined;
 }
