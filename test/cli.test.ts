@@ -74,7 +74,7 @@ function setupBoard(label: string, opts: BoardOpts): { home: string; projId: str
 function runInfo(home: string, projId: string, extra: string[] = []) {
   return spawnSync("node", [bin, "info", projId, ...extra], {
     encoding: "utf8",
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home },
   });
 }
 

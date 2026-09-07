@@ -38,7 +38,7 @@ describe("hydra-acp-planner CLI", () => {
     // Empty $HOME so we don't read the developer's real boards.
     const r = spawnSync("node", [bin], {
       encoding: "utf8",
-      env: { ...process.env, HOME: "/tmp/planner-test-empty-home-do-not-create" },
+      env: { ...process.env, HOME: "/tmp/planner-test-empty-home-do-not-create", USERPROFILE: "/tmp/planner-test-empty-home-do-not-create" },
     });
     assert.equal(r.status, 0);
     // With no projects, list shows the hint message.
@@ -78,7 +78,7 @@ describe("hydra-acp-planner CLI", () => {
 
     const r = spawnSync("node", [bin, "info", projId], {
       encoding: "utf8",
-      env: { ...process.env, HOME: tmpHome },
+      env: { ...process.env, HOME: tmpHome, USERPROFILE: tmpHome },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
 
