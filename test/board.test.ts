@@ -41,10 +41,18 @@ beforeEach(() => {
   originalHome = process.env.HOME ?? homedir();
   tmpHome = mkdtempSync(join(tmpdir(), "hydra-planner-test-"));
   process.env.HOME = tmpHome;
+  // os.homedir() reads USERPROFILE on Windows and HOME
+  // everywhere else, so redirecting only HOME leaves the
+  // code under test writing into the real profile.
+  process.env.USERPROFILE = process.env.HOME;
 });
 
 afterEach(() => {
   process.env.HOME = originalHome;
+  // os.homedir() reads USERPROFILE on Windows and HOME
+  // everywhere else, so redirecting only HOME leaves the
+  // code under test writing into the real profile.
+  process.env.USERPROFILE = process.env.HOME;
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
