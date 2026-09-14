@@ -27,6 +27,30 @@ export interface SessionInfo {
   // yet) or the value is unknown. Consumers MUST fail-closed on
   // undefined when using this to gate mutations.
   interactive?: boolean;
+  // Where the session's agent actually runs. For an ISOLATED session
+  // this is the workspace path, not the project — use
+  // `integrationTreeOf` rather than reading it directly.
+  cwd?: string;
+  // Present iff the session runs in an isolated workspace. `sourceCwd`
+  // is the load-bearing field: a workspace lives outside its source tree
+  // and shares no path prefix with it, so this recorded edge is the only
+  // way back.
+  workspace?: {
+    path: string;
+    sourceCwd: string;
+    label: string;
+    provider: string;
+  };
+}
+
+// The tree a session's work ultimately belongs to: its own cwd normally,
+// or the tree its workspace derives from when it is isolated. This is the
+// daemon's own documented rule for reading an isolated session's location
+// (`workspace.sourceCwd ?? cwd`), and it is what makes a plan run under an
+// isolated orchestrator land back into that orchestrator's workspace
+// rather than into the user's checkout.
+export function integrationTreeOf(info: SessionInfo): string | undefined {
+  return info.workspace?.sourceCwd ?? info.cwd;
 }
 
 export interface FetchSessionInfoOpts {
@@ -71,6 +95,29 @@ export async function fetchSessionInfo(
     }
     if (typeof body.interactive === "boolean") {
       out.interactive = body.interactive;
+    }
+    if (typeof body.cwd === "string") {
+      out.cwd = body.cwd;
+    }
+    // Field-by-field, like the daemon parses its own meta: a malformed
+    // block must read as "not isolated" rather than reaching the planner
+    // as junk that later resolves to a bogus integration tree.
+    const ws = body.workspace;
+    if (ws !== null && typeof ws === "object" && !Array.isArray(ws)) {
+      const w = ws as Record<string, unknown>;
+      if (
+        typeof w.path === "string" &&
+        typeof w.sourceCwd === "string" &&
+        typeof w.label === "string" &&
+        typeof w.provider === "string"
+      ) {
+        out.workspace = {
+          path: w.path,
+          sourceCwd: w.sourceCwd,
+          label: w.label,
+          provider: w.provider,
+        };
+      }
     }
     return out;
   } catch (err) {

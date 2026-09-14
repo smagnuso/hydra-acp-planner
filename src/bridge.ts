@@ -100,6 +100,9 @@ import {
   newBoard,
   nowIso,
   parseFleetDefaultsFromObject,
+  isCompetitionCandidate,
+  isCompetitionReview,
+  needsIsolatedWorkspace,
   parseIsolationFromObject,
   pickEligible,
   resolveAgent,
@@ -125,7 +128,7 @@ import {
   summarizeDiff,
   type DiffFile,
 } from "./util/session-diff.js";
-import { fetchSessionInfo } from "./util/session-info.js";
+import { fetchSessionInfo, integrationTreeOf, type SessionInfo } from "./util/session-info.js";
 import {
   buildAddTaskPrompt,
   buildDecompositionPrompt,
@@ -1814,7 +1817,14 @@ export class PlannerBridge {
     // to reflect the (potentially wider) DAG. Persist before
     // scheduling so an immediate restart picks up the new tasks.
     board.tasks.push(...result.tasks);
-    board.concurrencyCap = sweepLineConcurrencyCap(board.tasks);
+    // Gated, like finishDecomposition's recompute: a cap the user pinned
+    // (`--workers N`, or set_plan's concurrencyCap) is a deliberate
+    // choice, and silently widening it on every add_task both overrides
+    // them and — now that the cap gates isolation — can change whether
+    // tasks get isolated workspaces at all.
+    if (!board.concurrencyCapLocked) {
+      board.concurrencyCap = sweepLineConcurrencyCap(board.tasks);
+    }
     // Synthesize review tasks for the newly added tasks. Mirrors the
     // setPlan path: always run, falling back to DEFAULT_POLICY when the
     // board has no explicit reviewPolicy. applyReviewPolicy is idempotent
@@ -2037,6 +2047,52 @@ export class PlannerBridge {
     void this.scheduleEligibleTasks(sessionId, board);
   }
 
+  // Resolve, record, and (when it matters) report the tree isolated task
+  // workspaces fork from and land back into.
+  //
+  // Resolved at RUN start rather than at plan creation because the user
+  // may put their session in a workspace in between — `/hydra workspace
+  // start` after planning but before running is an entirely reasonable
+  // thing to do, and it changes where every task's work ends up.
+  //
+  // Only reported when isolation is actually on. Unisolated runs already
+  // happen in the session's own tree, which needs no announcement; an
+  // isolated run changes what workers can see, and that does.
+  private async resolveIntegrationTree(
+    sessionId: string,
+    board: Board,
+  ): Promise<void> {
+    if (board.isolation?.mode !== "per-task") return;
+    const fetcher = this.fetchSessionInfoOverride
+      ?? ((sid: string) =>
+        fetchSessionInfo(sid, {
+          daemonHttpBase: this.daemonHttpBase,
+          token: this.daemonToken,
+        }));
+    let info: SessionInfo | undefined;
+    try {
+      info = await fetcher(sessionId);
+    } catch {
+      info = undefined;
+    }
+    const tree = info ? integrationTreeOf(info) : undefined;
+    if (tree === undefined) {
+      log.warn(
+        `${shortProjectId(board.projectId)}: isolation is on but the orchestrator's working tree could not be resolved; tasks will fall back to inheriting it implicitly`,
+      );
+      return;
+    }
+    board.integrationTree = tree;
+    saveBoard(board, sessionId);
+    log.info(`${shortProjectId(board.projectId)}: integration tree ${tree}`);
+    void this.emitSyntheticMessage(
+      sessionId,
+      `Isolation is on. Task work happens in separate workspaces and lands into ${tree} as each task is accepted. ` +
+        `Workers fork from the last commit, so they will NOT see uncommitted changes in that tree — commit or stash first if this plan is meant to build on work in progress.`,
+      { event: "project-integration-tree" },
+    );
+  }
+
   private async resumeBoardToRunning(
     sessionId: string,
     board: Board,
@@ -2055,6 +2111,7 @@ export class PlannerBridge {
         `resumeBoardToRunning: transformer/attach failed for ${board.projectId}: ${(err as Error).message}`,
       );
     }
+    await this.resolveIntegrationTree(sessionId, board);
     void this.scheduleEligibleTasks(sessionId, board);
     return { resumedFrom: prevState };
   }
@@ -4634,25 +4691,33 @@ export class PlannerBridge {
       // awaiting mergeTaskWorkspace before scheduling dependents (see
       // handleTaskComplete/finishReview) is what keeps that current
       // state meaning "this task's deps already landed."
-      // Competition candidates always request required:true, regardless
-      // of board.isolation.required — a silent fallback would put every
-      // candidate back in one shared tree, exactly the interleaving-edits
-      // soundness bug isolation exists to fix for this lane (see
-      // docs/worktree-isolation-planner.md's motivating bug).
-      // findReviewedTask finds the review even though it's still
-      // "pending" at spawn time (its deps — the candidates — aren't
-      // done yet); reviews is only an array (vs. a bare string) for a
-      // multi-candidate competition review.
-      const competitionReview = this.findReviewedTask(task.id, board);
-      const isCompetitionCandidate =
-        Array.isArray(competitionReview?.reviews) && competitionReview.reviews.length > 1;
-      const workspaceRequest =
-        board.isolation?.mode === "per-task"
-          ? {
-              label: task.id,
-              ...(isCompetitionCandidate || board.isolation.required ? { required: true } : {}),
-            }
-          : undefined;
+      // Scoped by DAG shape, not applied to every task: isolation buys
+      // exactly one thing — keeping concurrent writers off each other —
+      // so a plan that cannot produce two simultaneous writers gets no
+      // workspaces at all and behaves precisely as it does unisolated.
+      // needsIsolatedWorkspace also excludes reviews and distills, which
+      // never get a tree of their own.
+      //
+      // Competition candidates additionally request required:true,
+      // regardless of board.isolation.required — a silent fallback would
+      // put every candidate back in one shared tree, exactly the
+      // interleaving-edits soundness bug isolation exists to fix here.
+      //
+      // The label is project-scoped because a `hydra/<label>` branch
+      // outlives its checkout, so a bare task id collides across two
+      // plans in one repo that both have a T1 — and the collision is
+      // SILENT, handing back an empty suffixed workspace (see the
+      // requested-vs-returned check after the spawn).
+      const wantsIsolation = needsIsolatedWorkspace(board, task.id);
+      const workspaceLabel = `${shortProjectId(board.projectId)}-${task.id}`;
+      const workspaceRequest = wantsIsolation
+        ? {
+            label: workspaceLabel,
+            ...(isCompetitionCandidate(board, task.id) || board.isolation?.required
+              ? { required: true }
+              : {}),
+          }
+        : undefined;
       const spawnParams: Record<string, unknown> = {
         parentSessionId: orchestratorSessionId,
         // cwd omitted → inherits from parent
@@ -4697,6 +4762,24 @@ export class PlannerBridge {
         if (task.workspaceError) {
           log.warn(
             `task ${task.id}: isolation requested but not honored (falling back to shared tree): ${task.workspaceError}`,
+          );
+        }
+        // createWorkspace SUFFIXES a taken label rather than failing, so
+        // a collision hands back a valid but EMPTY workspace and the only
+        // signal is the label coming back different. We scope labels by
+        // project precisely so this cannot happen; if it does, something
+        // we believed about the label namespace is wrong, and the tree
+        // this task is about to work in is not the one we think.
+        const assignedLabel = task.workspace?.label;
+        if (assignedLabel !== undefined && assignedLabel !== workspaceLabel) {
+          log.error(
+            `task ${task.id}: asked for workspace "${workspaceLabel}" but got "${assignedLabel}" — ` +
+              `the label was already taken, so this worker is in a DIFFERENT tree than intended`,
+          );
+          void this.emitSyntheticMessage(
+            orchestratorSessionId,
+            `${task.id}: workspace label "${workspaceLabel}" was already taken; the daemon assigned "${assignedLabel}" instead. This worker is not in the tree the plan expected — stop and investigate before trusting its output.`,
+            { event: "task-workspace-label-collision", taskId: task.id },
           );
         }
       }
@@ -5385,7 +5468,7 @@ export class PlannerBridge {
 
     const decision = (normalized.artifacts as Record<string, unknown>).review_decision as string;
     const notes = (normalized.artifacts as Record<string, unknown>).notes as string ?? "";
-    const isCompetition = Array.isArray(reviews) && reviews.length > 1;
+    const isCompetition = isCompetitionReview(reviewTask);
 
     // Competition reviews only accept "winner" or "synthesize". Other
     // decisions on a competition are reviewer error — routed to the

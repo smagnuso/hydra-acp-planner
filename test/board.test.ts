@@ -16,6 +16,10 @@ import {
   newBoard,
   newProjectId,
   parseFleetDefaultsFromObject,
+  canOverlapAnotherWriter,
+  isCompetitionCandidate,
+  isCompetitionReview,
+  needsIsolatedWorkspace,
   parseIsolationFromObject,
   pickEligible,
   resolveAgent,
@@ -707,6 +711,160 @@ describe("schema migration v1 → v2", () => {
     loaded = loadBoard(b.projectId);
     assert.ok(loaded);
     assert.equal(loaded!.version, BOARD_SCHEMA_VERSION);
+  });
+});
+
+describe("canOverlapAnotherWriter / needsIsolatedWorkspace", () => {
+  function boardWith(tasks: Array<Partial<Task>>, opts: Partial<Board> = {}): Board {
+    const b = newBoard({ description: "shape", concurrencyCap: 4 });
+    b.tasks = tasks.map((t) => ({
+      id: t.id!,
+      title: t.title ?? t.id!,
+      deps: t.deps ?? [],
+      status: t.status ?? "pending",
+      attemptCount: 0,
+      ...(t.kind !== undefined ? { kind: t.kind } : {}),
+      ...(t.reviews !== undefined ? { reviews: t.reviews } : {}),
+    })) as Task[];
+    Object.assign(b, opts);
+    return b;
+  }
+
+  it("a linear chain never overlaps", () => {
+    const b = boardWith([
+      { id: "T1" },
+      { id: "T2", deps: ["T1"] },
+      { id: "T3", deps: ["T2"] },
+    ]);
+    for (const id of ["T1", "T2", "T3"]) {
+      assert.equal(canOverlapAnotherWriter(b, id), false, `${id} should not overlap`);
+    }
+  });
+
+  it("fan-out siblings overlap each other", () => {
+    const b = boardWith([
+      { id: "T1" },
+      { id: "T2", deps: ["T1"] },
+      { id: "T3", deps: ["T1"] },
+    ]);
+    assert.equal(canOverlapAnotherWriter(b, "T2"), true);
+    assert.equal(canOverlapAnotherWriter(b, "T3"), true);
+    // T1 is an ancestor of both, so it is ordered against everything.
+    assert.equal(canOverlapAnotherWriter(b, "T1"), false);
+  });
+
+  it("catches the case a layer-based predicate gets WRONG", () => {
+    // T3 sits at a deeper layer than T2, so an ASAP/layer view calls
+    // them non-concurrent. But the real scheduler is eligibility-driven:
+    // once T1 finishes, T3 becomes eligible and runs alongside T2, which
+    // has no dependency relationship to it at all. This is exactly the
+    // case that made layer equality unsound as the predicate.
+    const b = boardWith([
+      { id: "T1" },
+      { id: "T2" },
+      { id: "T3", deps: ["T1"] },
+    ]);
+    assert.equal(canOverlapAnotherWriter(b, "T3"), true);
+    assert.equal(canOverlapAnotherWriter(b, "T2"), true);
+  });
+
+  it("fan-in: the join is ordered after both parents, the parents overlap", () => {
+    const b = boardWith([
+      { id: "T1" },
+      { id: "T2" },
+      { id: "T3", deps: ["T1", "T2"] },
+    ]);
+    assert.equal(canOverlapAnotherWriter(b, "T3"), false);
+    assert.equal(canOverlapAnotherWriter(b, "T1"), true);
+  });
+
+  it("reviews and distills are not writers and never overlap-isolate", () => {
+    const b = boardWith([
+      { id: "T1" },
+      { id: "T2" },
+      { id: "R1", kind: "review", reviews: "T1", deps: ["T1"] },
+      { id: "D1", kind: "distill", reviews: ["T1", "T2"], deps: ["T1", "T2"] },
+    ]);
+    assert.equal(canOverlapAnotherWriter(b, "R1"), false);
+    assert.equal(canOverlapAnotherWriter(b, "D1"), false);
+  });
+
+  it("a review sibling does not make an otherwise-ordered task overlap", () => {
+    // Only WRITING tasks count as the thing to avoid colliding with.
+    const b = boardWith([
+      { id: "T1" },
+      { id: "R1", kind: "review", reviews: "T1", deps: ["T1"] },
+    ]);
+    assert.equal(canOverlapAnotherWriter(b, "T1"), false);
+  });
+
+  it("needsIsolatedWorkspace is off unless the plan opted in", () => {
+    const b = boardWith([{ id: "T1" }, { id: "T2" }]);
+    assert.equal(needsIsolatedWorkspace(b, "T1"), false);
+    b.isolation = { mode: "off" };
+    assert.equal(needsIsolatedWorkspace(b, "T1"), false);
+    b.isolation = { mode: "per-task" };
+    assert.equal(needsIsolatedWorkspace(b, "T1"), true);
+  });
+
+  it("a concurrency cap of 1 serializes everything, so nothing needs isolating", () => {
+    const b = boardWith([{ id: "T1" }, { id: "T2" }]);
+    b.isolation = { mode: "per-task" };
+    b.concurrencyCap = 1;
+    assert.equal(canOverlapAnotherWriter(b, "T1"), true, "the DAG still allows it");
+    assert.equal(needsIsolatedWorkspace(b, "T1"), false, "but the cap forbids it");
+  });
+});
+
+describe("competition predicates", () => {
+  it("distinguishes the review side from the candidate side", () => {
+    const b = newBoard({ description: "comp" });
+    b.tasks = [
+      { id: "T1", title: "one", deps: [], status: "pending", attemptCount: 0 },
+      { id: "T2", title: "two", deps: [], status: "pending", attemptCount: 0 },
+      {
+        id: "R1",
+        title: "review",
+        deps: ["T1", "T2"],
+        status: "pending",
+        attemptCount: 0,
+        kind: "review",
+        reviews: ["T1", "T2"],
+      },
+      {
+        id: "R2",
+        title: "solo review",
+        deps: ["T1"],
+        status: "pending",
+        attemptCount: 0,
+        kind: "review",
+        reviews: "T1",
+      },
+    ] as Task[];
+    assert.equal(isCompetitionReview(b.tasks.find((t) => t.id === "R1")!), true);
+    assert.equal(isCompetitionReview(b.tasks.find((t) => t.id === "R2")!), false);
+    assert.equal(isCompetitionCandidate(b, "T1"), true);
+    assert.equal(isCompetitionCandidate(b, "T2"), true);
+  });
+
+  it("stays true after the review starts, unlike findReviewedTask", () => {
+    // Candidates need to know what they are at spawn time and on retry,
+    // long before and after the review's own status moves.
+    const b = newBoard({ description: "comp2" });
+    b.tasks = [
+      { id: "T1", title: "one", deps: [], status: "pending", attemptCount: 0 },
+      { id: "T2", title: "two", deps: [], status: "pending", attemptCount: 0 },
+      {
+        id: "R1",
+        title: "review",
+        deps: ["T1", "T2"],
+        status: "done",
+        attemptCount: 0,
+        kind: "review",
+        reviews: ["T1", "T2"],
+      },
+    ] as Task[];
+    assert.equal(isCompetitionCandidate(b, "T1"), true);
   });
 });
 

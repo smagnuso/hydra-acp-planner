@@ -1,3 +1,4 @@
+import { isCompetitionReview } from "./board.js";
 import type { Board, Task, TaskArtifacts } from "./board.js";
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -521,7 +522,7 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       parts.push("## Context from completed dependencies");
       parts.push(formatDependencyContext(task, board));
       parts.push("");
-      const isCompetition = Array.isArray(task.reviews) && task.reviews.length > 1;
+      const isCompetition = isCompetitionReview(task);
       if (isCompetition) {
         const reviewees: Task[] = [];
         for (const revieweeId of task.reviews as string[]) {

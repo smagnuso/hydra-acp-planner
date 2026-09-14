@@ -11,7 +11,7 @@ import {
   clientAttachedSessions,
   type BridgeClient,
 } from "../src/bridge.ts";
-import { newBoard, saveBoard, type Board } from "../src/board.ts";
+import { newBoard, saveBoard, shortProjectId, type Board } from "../src/board.ts";
 
 // Tests that worker sessions spawned via spawnTaskOnNewWorker are
 // attached as regular ACP clients (session/attach) but NEVER receive
@@ -325,94 +325,136 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
   );
 
   it(
-    "spawnTaskOnNewWorker: requests a labeled workspace and records workspaceInfo when board.isolation.mode='per-task'",
+    "spawnTaskOnNewWorker: no workspace for a LINEAR plan, even with isolation on",
     async () => {
-      const childSessionId = "hydra_session_worker_iso_1";
+      // The scoping rule: isolation buys keeping concurrent writers off
+      // each other, so a chain that can never produce two at once gets
+      // none of it and behaves exactly as an unisolated run.
       const board = seedBoard("hydra_session_test", {
         state: "ready",
-        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+        cap: 4,
+        tasks: [
+          { id: "T1", title: "first", status: "pending", deps: [] },
+          { id: "T2", title: "second", status: "pending", deps: ["T1"] },
+        ],
       });
       board.isolation = { mode: "per-task" };
       saveBoard(board, "hydra_session_test");
-
-      const workspaceInfo = {
-        path: "/home/u/.hydra-acp/workspaces/abc/T1",
-        sourceCwd: "/home/u/repo",
-        label: "T1",
-        provider: "git",
-      };
       client.responders.set("hydra-acp/child_session/spawn", () => ({
-        childSessionId,
-        _meta: { "hydra-acp": { workspaceInfo } },
+        childSessionId: "hydra_session_worker_linear_1",
+      }));
+
+      dispatch(mkInvoke(12, "start", {}));
+      await settle(10);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      assert.ok(spawns.length >= 1, "the head of the chain should have spawned");
+      for (const s of spawns) {
+        const meta = (s.params as { _meta?: { "hydra-acp"?: Record<string, unknown> } })
+          ._meta?.["hydra-acp"];
+        assert.equal(meta?.workspace, undefined, "a chain needs no isolation");
+      }
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: isolates overlapping work tasks, with project-scoped labels",
+    async () => {
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        cap: 2,
+        tasks: [
+          { id: "T1", title: "one", status: "pending", deps: [] },
+          { id: "T2", title: "two", status: "pending", deps: [] },
+        ],
+      });
+      board.isolation = { mode: "per-task" };
+      saveBoard(board, "hydra_session_test");
+      let n = 0;
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId: `hydra_session_worker_iso_${n++}`,
       }));
 
       dispatch(mkInvoke(13, "start", {}));
-      await settle(7);
+      await settle(10);
 
       const spawns = client.requestsFor("hydra-acp/child_session/spawn");
-      assert.equal(spawns.length, 1);
-      const meta = (spawns[0]!.params as { _meta?: { "hydra-acp"?: Record<string, unknown> } })
-        ._meta?.["hydra-acp"];
-      assert.deepEqual(meta?.workspace, { label: "T1" });
-
-      const task1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
-      assert.deepEqual(task1.workspace, workspaceInfo);
-      assert.equal(task1.workspaceError, undefined);
-    },
-  );
-
-  it(
-    "spawnTaskOnNewWorker: sets required:true on the workspace request when board.isolation.required is true",
-    async () => {
-      const childSessionId = "hydra_session_worker_iso_req_1";
-      const board = seedBoard("hydra_session_test", {
-        state: "ready",
-        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+      assert.equal(spawns.length, 2, "both independent tasks should have spawned");
+      const short = shortProjectId(boards.get("hydra_session_test")!.projectId);
+      const labels = spawns.map((s) => {
+        const meta = (s.params as {
+          _meta?: { "hydra-acp"?: { workspace?: { label?: string } } };
+        })._meta?.["hydra-acp"];
+        assert.ok(meta?.workspace, "an overlapping work task must be isolated");
+        return meta!.workspace!.label;
       });
-      board.isolation = { mode: "per-task", required: true };
-      saveBoard(board, "hydra_session_test");
-
-      client.responders.set("hydra-acp/child_session/spawn", () => ({
-        childSessionId,
-      }));
-
-      dispatch(mkInvoke(14, "start", {}));
-      await settle(7);
-
-      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
-      const meta = (spawns[0]!.params as { _meta?: { "hydra-acp"?: Record<string, unknown> } })
-        ._meta?.["hydra-acp"];
-      assert.deepEqual(meta?.workspace, { label: "T1", required: true });
+      // Project-scoped: a bare task id would collide with another plan's
+      // T1 in the same repo, and the collision is silent.
+      assert.deepEqual(labels.sort(), [`${short}-T1`, `${short}-T2`]);
     },
   );
 
   it(
-    "spawnTaskOnNewWorker: records workspaceError and logs a fallback warning when isolation falls back",
+    "spawnTaskOnNewWorker: never isolates a review task",
     async () => {
-      const childSessionId = "hydra_session_worker_iso_fallback_1";
+      // A review has no tree of its own to write in; under the redesign
+      // it joins the tree of the task it is reviewing.
       const board = seedBoard("hydra_session_test", {
         state: "ready",
-        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+        cap: 3,
+        tasks: [
+          { id: "T1", title: "one", status: "awaiting_review", deps: [] },
+          { id: "T2", title: "two", status: "pending", deps: [] },
+          {
+            id: "R1",
+            title: "review T1",
+            status: "pending",
+            deps: ["T1"],
+            kind: "review",
+            reviews: "T1",
+            runOn: "worker",
+          },
+        ],
       });
       board.isolation = { mode: "per-task" };
       saveBoard(board, "hydra_session_test");
-
+      let n = 0;
       client.responders.set("hydra-acp/child_session/spawn", () => ({
-        childSessionId,
-        _meta: { "hydra-acp": { workspaceError: "not a git repository" } },
+        childSessionId: `hydra_session_worker_rev_${n++}`,
       }));
 
-      dispatch(mkInvoke(15, "start", {}));
-      await settle(7);
+      dispatch(mkInvoke(14, "start", {}));
+      await settle(10);
 
-      const task1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
-      assert.equal(task1.workspace, undefined);
-      assert.equal(task1.workspaceError, "not a git repository");
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      const short = shortProjectId(boards.get("hydra_session_test")!.projectId);
+      for (const s of spawns) {
+        const p = s.params as {
+          _meta?: { "hydra-acp"?: { title?: string; workspace?: { label?: string } } };
+        };
+        const meta = p._meta?.["hydra-acp"];
+        if (meta?.title?.startsWith("R1")) {
+          assert.equal(meta.workspace, undefined, "a review must not get its own workspace");
+        }
+      }
+      // And the work task beside it still is isolated.
+      const t2 = spawns.find((s) => {
+        const meta = (s.params as { _meta?: { "hydra-acp"?: { title?: string } } })._meta?.[
+          "hydra-acp"
+        ];
+        return meta?.title?.startsWith("T2");
+      });
+      if (t2) {
+        const meta = (t2.params as {
+          _meta?: { "hydra-acp"?: { workspace?: { label?: string } } };
+        })._meta?.["hydra-acp"];
+        assert.equal(meta?.workspace?.label, `${short}-T2`);
+      }
     },
   );
 
   it(
-    "spawnTaskOnNewWorker: competition candidates always request required:true, even when board.isolation.required is unset",
+    "spawnTaskOnNewWorker: competition candidates always request required:true",
     async () => {
       const board = seedBoard("hydra_session_test", {
         state: "ready",
@@ -430,28 +472,72 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
           },
         ],
       });
-      board.isolation = { mode: "per-task" }; // required left unset (defaults false for ordinary tasks)
+      board.isolation = { mode: "per-task" }; // required deliberately unset
       saveBoard(board, "hydra_session_test");
-
       let n = 0;
       client.responders.set("hydra-acp/child_session/spawn", () => ({
         childSessionId: `hydra_session_worker_comp_${n++}`,
       }));
 
-      dispatch(mkInvoke(16, "start", {}));
-      await settle(7);
+      dispatch(mkInvoke(15, "start", {}));
+      await settle(10);
 
       const spawns = client.requestsFor("hydra-acp/child_session/spawn");
       assert.equal(spawns.length, 2, "both competition candidates should have spawned");
       for (const s of spawns) {
-        const meta = (s.params as { _meta?: { "hydra-acp"?: { workspace?: Record<string, unknown> } } })
-          ._meta?.["hydra-acp"];
-        assert.equal(meta?.workspace?.required, true, "competition candidate must request required:true");
-        assert.ok(
-          meta?.workspace?.label === "T1" || meta?.workspace?.label === "T2",
-          "workspace label should be the candidate's own task id",
-        );
+        const meta = (s.params as {
+          _meta?: { "hydra-acp"?: { workspace?: Record<string, unknown> } };
+        })._meta?.["hydra-acp"];
+        assert.equal(meta?.workspace?.required, true, "candidates must fail closed");
       }
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: surfaces a workspace label collision instead of accepting it",
+    async () => {
+      // createWorkspace SUFFIXES a taken label rather than failing, so a
+      // collision hands back a valid but empty workspace and the only
+      // signal is the label coming back different.
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        cap: 2,
+        tasks: [
+          { id: "T1", title: "one", status: "pending", deps: [] },
+          { id: "T2", title: "two", status: "pending", deps: [] },
+        ],
+      });
+      board.isolation = { mode: "per-task" };
+      saveBoard(board, "hydra_session_test");
+      let n = 0;
+      client.responders.set("hydra-acp/child_session/spawn", (params) => {
+        const asked = (params as {
+          _meta?: { "hydra-acp"?: { workspace?: { label?: string } } };
+        })._meta?.["hydra-acp"]?.workspace?.label;
+        return {
+          childSessionId: `hydra_session_worker_collide_${n++}`,
+          _meta: {
+            "hydra-acp": {
+              workspaceInfo: {
+                path: "/tmp/ws",
+                sourceCwd: "/tmp/repo",
+                // The daemon's suffix-on-collision behavior.
+                label: `${asked}-2`,
+                provider: "git",
+              },
+            },
+          },
+        };
+      });
+
+      dispatch(mkInvoke(16, "start", {}));
+      await settle(10);
+
+      const emits = client.requestsFor("hydra-acp/message/emit");
+      const collisionNote = emits.find((r) =>
+        JSON.stringify(r.params).includes("was already taken"),
+      );
+      assert.ok(collisionNote, "a label collision must be surfaced, not silently accepted");
     },
   );
 });

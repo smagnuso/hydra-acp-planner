@@ -482,6 +482,12 @@ export interface Board {
     mode: "off" | "per-task";
     required?: boolean;
   };
+  // The tree isolated task workspaces fork from and land back into: the
+  // orchestrator session's effective cwd, which is the user's checkout
+  // unless they put the session in a workspace themselves. Resolved at
+  // run start rather than at plan creation, because they may do that in
+  // between. Absent on boards that never ran isolated.
+  integrationTree?: string;
   tasks: Task[];
   workers: Record<string, {
     currentTaskId: string | null;
@@ -725,6 +731,10 @@ export function forkBoard(opts: {
     },
     reviewPolicy: src.reviewPolicy ? { ...src.reviewPolicy } : undefined,
     isolation: src.isolation ? { ...src.isolation } : undefined,
+    // Deliberately NOT carried: the fork belongs to a different session,
+    // whose effective cwd may be a different tree entirely. Re-resolved
+    // at the fork's own run start.
+    integrationTree: undefined,
     tasks: src.tasks.map((t) => ({
       id: t.id,
       title: t.title,
@@ -1058,6 +1068,113 @@ export function inFlightCount(board: Board): number {
     if (isInFlight(t.status)) n += 1;
   }
   return n;
+}
+
+// Is this REVIEW task judging a competition — i.e. does it name more
+// than one reviewee? Distinct from isCompetitionCandidate below, which
+// asks the opposite question of a work task ("is some review judging me
+// against siblings"). Both existed open-coded in several places and the
+// two are easy to mistake for each other, which is why they are named
+// for the side they answer for.
+export function isCompetitionReview(task: Task): boolean {
+  return Array.isArray(task.reviews) && task.reviews.length > 1;
+}
+
+// Is this task one of N candidates competing on the same work?
+//
+// A competition is a review whose `reviews` names more than one task, so
+// each named task is a candidate. Status-agnostic on purpose: the
+// candidates need to know what they are at SPAWN time, long before the
+// review runs, and `findReviewedTask` cannot answer that because it only
+// matches reviews still `pending` and so stops matching the moment the
+// review starts.
+export function isCompetitionCandidate(board: Board, taskId: string): boolean {
+  for (const t of board.tasks) {
+    if (t.kind !== "review") continue;
+    const reviews = t.reviews;
+    if (!Array.isArray(reviews) || reviews.length < 2) continue;
+    if (reviews.includes(taskId)) return true;
+  }
+  return false;
+}
+
+// Tasks that write to a tree. Reviews and distills are excluded: a
+// distiller is explicitly forbidden from writing code (DISTILL_SYSTEM in
+// task.ts), and a review's one writing decision (`fix`) belongs in the
+// tree of the task it is reviewing, not in one of its own.
+function isWritingKind(task: Task): boolean {
+  const kind = task.kind ?? "work";
+  return kind !== "review" && kind !== "distill";
+}
+
+// Could this task ever be in flight at the same time as another writing
+// task? This is what decides whether a task needs an isolated workspace:
+// isolation buys exactly one thing — keeping concurrent writers off each
+// other — so a plan that cannot produce two simultaneous writers needs
+// none of it.
+//
+// The test is comparability in the transitive dependency closure: `t` can
+// never overlap `u` exactly when one is an ancestor of the other, because
+// only a dependency edge forces an ordering between them.
+//
+// NOT layer equality. `sweepLineConcurrencyCap`'s layers describe an ASAP
+// schedule, but the real scheduler is greedy and eligibility-driven
+// (pickEligible, below): a deeper task whose own dependency finished
+// early runs alongside a shallower one that is still going. Layer-based
+// reasoning would call those two safe and skip isolation precisely where
+// it is needed.
+//
+// Conservative by construction: a task that COULD run counts as a writer
+// even if it may later be superseded or fail. Over-isolating costs a
+// worktree; under-isolating is the race this exists to prevent.
+export function canOverlapAnotherWriter(board: Board, taskId: string): boolean {
+  const task = board.tasks.find((t) => t.id === taskId);
+  if (task === undefined || !isWritingKind(task)) return false;
+
+  const byId = new Map<string, Task>(board.tasks.map((t) => [t.id, t]));
+  const dependents = new Map<string, string[]>();
+  for (const t of board.tasks) {
+    for (const d of t.deps) {
+      const list = dependents.get(d);
+      if (list === undefined) dependents.set(d, [t.id]);
+      else list.push(t.id);
+    }
+  }
+
+  const reach = (start: string, next: (id: string) => string[]): Set<string> => {
+    const seen = new Set<string>();
+    const stack = [...next(start)];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      stack.push(...next(id));
+    }
+    return seen;
+  };
+  const ancestors = reach(taskId, (id) => byId.get(id)?.deps ?? []);
+  const descendants = reach(taskId, (id) => dependents.get(id) ?? []);
+
+  for (const other of board.tasks) {
+    if (other.id === taskId) continue;
+    if (!isWritingKind(other)) continue;
+    if (ancestors.has(other.id) || descendants.has(other.id)) continue;
+    return true;
+  }
+  return false;
+}
+
+// Does this task need an isolated workspace? Plan opted in, the task
+// writes, the cap actually permits two at once, and the DAG actually lets
+// it overlap something.
+export function needsIsolatedWorkspace(board: Board, taskId: string): boolean {
+  if (board.isolation?.mode !== "per-task") return false;
+  // A cap of 1 serializes every writer regardless of DAG shape, so
+  // nothing can collide and nothing needs isolating. Orchestrator-lane
+  // reviews/distills don't count against the cap, but they are not
+  // writers either, so this stays true for the writers it governs.
+  if (board.concurrencyCap <= 1) return false;
+  return canOverlapAnotherWriter(board, taskId);
 }
 
 // Revert all in-flight (assigned) tasks back to pending and clear their
