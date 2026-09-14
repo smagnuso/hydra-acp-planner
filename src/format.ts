@@ -175,6 +175,18 @@ export function formatTaskTag(task: Task, board?: Board): string {
   return ` {${inner}}`;
 }
 
+// Live-panel annotation for a task whose isolated workspace didn't
+// confirm landing back in the source tree (declined or unknown — see
+// mergeTaskWorkspace/classifyMergeReply in bridge.ts). Rendered
+// alongside formatTaskTag so the run stays visible during execution,
+// not just in get_findings after the fact. "landed"/"skipped" render
+// nothing — those are the unremarkable, expected outcomes.
+export function formatWorkspaceLandingTag(task: Task): string {
+  const status = task.workspaceLanding?.status;
+  if (status !== "declined" && status !== "unknown") return "";
+  return " ⚠ unmerged";
+}
+
 // Execution-time accounting. Counts only the time the project has
 // spent in `running` state across all execute/retry cycles. Excludes
 // time in ready/decomposing/paused/stopped — i.e. amend/review pauses
@@ -615,7 +627,8 @@ export type FindingCategory =
   | "review_amend"
   | "review_fix"
   | "follow_ups"
-  | "distill";
+  | "distill"
+  | "workspace_unmerged";
 
 export interface DistillReport {
   summary: string;
@@ -721,23 +734,51 @@ export function collectFindings(
     } else if (t.status === "done" && kind === "work" && followUps.length > 0) {
       category = "follow_ups";
     }
-    if (!category) continue;
 
-    out.push({
-      taskId: t.id,
-      title: t.title,
-      kind,
-      status: t.status,
-      category,
-      summary,
-      notes,
-      followUps,
-      decision,
-      attemptCount: t.attemptCount,
-      workerSessions: Array.isArray(t.workerSessions) ? [...t.workerSessions] : [],
-      verifiedDiff,
-      ...(distillReport ? { distillReport } : {}),
-    });
+    if (category) {
+      out.push({
+        taskId: t.id,
+        title: t.title,
+        kind,
+        status: t.status,
+        category,
+        summary,
+        notes,
+        followUps,
+        decision,
+        attemptCount: t.attemptCount,
+        workerSessions: Array.isArray(t.workerSessions) ? [...t.workerSessions] : [],
+        verifiedDiff,
+        ...(distillReport ? { distillReport } : {}),
+      });
+    }
+
+    // Independent of the category above (a task can be "done" with
+    // follow-ups AND have an unconfirmed workspace landing): a task's
+    // work isn't safely on the source tree until mergeTaskWorkspace
+    // reports "landed". Surfacing this separately, rather than folding
+    // it into the exclusive category chain above, means it's never
+    // silently shadowed by a follow_ups/review finding on the same task.
+    const landing = t.workspaceLanding;
+    if (landing && (landing.status === "declined" || landing.status === "unknown")) {
+      out.push({
+        taskId: t.id,
+        title: t.title,
+        kind,
+        status: t.status,
+        category: "workspace_unmerged",
+        summary,
+        notes:
+          landing.status === "declined"
+            ? `Workspace merge was refused: ${landing.detail ?? "no reason given"}. Attach to the session below, run \`/hydra workspace status\` to see what's pending, then \`/hydra workspace sync\` and \`/hydra workspace merge\`.`
+            : `Workspace merge outcome could not be confirmed (${landing.detail ?? "no reply recognized"}). The work may still exist only in the session's workspace — attach and check with \`/hydra workspace status\`.`,
+        followUps: [],
+        decision: null,
+        attemptCount: t.attemptCount,
+        workerSessions: Array.isArray(t.workerSessions) ? [...t.workerSessions] : [],
+        verifiedDiff,
+      });
+    }
   }
   return out;
 }
@@ -800,6 +841,7 @@ export interface FindingsListCounts {
   reviewIssues: number;
   followUps: number;
   distill: number;
+  workspaceUnmerged: number;
 }
 
 export function countFindings(findings: Finding[]): FindingsListCounts {
@@ -812,7 +854,8 @@ export function countFindings(findings: Finding[]): FindingsListCounts {
   ).length;
   const followUps = findings.filter((f) => f.category === "follow_ups").length;
   const distill = findings.filter((f) => f.category === "distill").length;
-  return { total: findings.length, failed, reviewIssues, followUps, distill };
+  const workspaceUnmerged = findings.filter((f) => f.category === "workspace_unmerged").length;
+  return { total: findings.length, failed, reviewIssues, followUps, distill, workspaceUnmerged };
 }
 
 // Build the headline used by both the get_findings MCP text and the
@@ -833,6 +876,9 @@ export function formatFindingsHeadline(
       ? `${c.reviewIssues} review issue${c.reviewIssues === 1 ? "" : "s"}`
       : null,
     c.followUps ? `${c.followUps} with follow-ups` : null,
+    c.workspaceUnmerged
+      ? `${c.workspaceUnmerged} unmerged workspace${c.workspaceUnmerged === 1 ? "" : "s"}`
+      : null,
   ].filter(Boolean).join(", ");
   return `${findings.length} finding${findings.length === 1 ? "" : "s"} on project ${shortProjectId(board.projectId)}${forkNote}: ${parts}.`;
 }
@@ -861,17 +907,21 @@ export function formatCompletionFindings(board: Board): string {
     const tag =
       f.category === "failed"
         ? "[!]"
-        : f.kind === "distill"
-          ? "[distill]"
-          : f.kind === "review"
-            ? `[${f.decision ?? "review"}]`
-            : "[x]";
+        : f.category === "workspace_unmerged"
+          ? "[⚠ unmerged]"
+          : f.kind === "distill"
+            ? "[distill]"
+            : f.kind === "review"
+              ? `[${f.decision ?? "review"}]`
+              : "[x]";
     const headSuffix =
       f.category === "failed"
         ? " — failed"
-        : f.kind === "work" && f.summary
-          ? ` — ${truncate(f.summary)}`
-          : "";
+        : f.category === "workspace_unmerged"
+          ? " — workspace not confirmed merged"
+          : f.kind === "work" && f.summary
+            ? ` — ${truncate(f.summary)}`
+            : "";
     const lines = [`   ${tag} ${f.taskId}  ${f.title}${headSuffix}`];
     if (f.category === "failed" && f.summary) {
       lines.push(`       ${truncate(f.summary)}`);

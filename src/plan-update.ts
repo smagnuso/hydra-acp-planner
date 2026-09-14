@@ -22,7 +22,7 @@ import {
   type UpdateEnvelope,
 } from "./util/text.js";
 import { isInFlight, shortProjectId } from "./board.js";
-import { formatTaskTag } from "./format.js";
+import { formatTaskTag, formatWorkspaceLandingTag } from "./format.js";
 import {
   buildReviewsByParent,
   isMultiRevieweeReview,
@@ -146,7 +146,7 @@ export function buildPlanUpdateEnvelope(opts: {
   for (const t of board.tasks) {
     const failedPrefix = t.status === "failed" ? "[FAILED] " : "";
     entries.push({
-      content: `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}`,
+      content: `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}${formatWorkspaceLandingTag(t)}`,
       priority: taskPriority(t, blockedByCount),
       status: mapStatus(t),
     });
@@ -212,7 +212,7 @@ export function buildAsciiPlanText(board: Board): string {
   const reviewsByParent = buildReviewsByParent(board.tasks);
   const renderedReviews = new Set<string>();
 
-  const tagFor = (t: Task) => formatTaskTag(t, board);
+  const tagFor = (t: Task) => `${formatTaskTag(t, board)}${formatWorkspaceLandingTag(t)}`;
   const cap = workerSubtodoCap();
   const workerByTask = new Map<string, string>();
   for (const [wid, w] of Object.entries(board.workers)) {

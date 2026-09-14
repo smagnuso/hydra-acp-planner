@@ -4403,6 +4403,7 @@ export class PlannerBridge {
               reviewIssues: findingsCounts.reviewIssues,
               followUps: findingsCounts.followUps,
               distill: findingsCounts.distill,
+              workspaceUnmerged: findingsCounts.workspaceUnmerged,
             },
             findings: structuredFindings,
           },
@@ -7762,6 +7763,7 @@ export class PlannerBridge {
         reviewIssues: counts.reviewIssues,
         followUps: counts.followUps,
         distill: counts.distill,
+        workspaceUnmerged: counts.workspaceUnmerged,
       },
       findings,
     });

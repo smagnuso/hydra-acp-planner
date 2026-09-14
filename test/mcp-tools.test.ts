@@ -905,6 +905,35 @@ describe("get_findings", () => {
     assert.match(result.content[0]!.text, /3 findings/);
   });
 
+  it("returns a workspace_unmerged finding when a task's landing is declined", async () => {
+    seedBoard("hydra_session_test", {
+      state: "done",
+      tasks: [
+        { id: "T1", title: "did the thing", status: "done", artifacts: { summary: "did the thing" } },
+      ],
+    });
+    const board = boards.get("hydra_session_test")!;
+    board.tasks[0]!.workspaceLanding = {
+      status: "declined",
+      detail: "not a fast-forward; run /hydra workspace sync first",
+      at: "2026-01-01T00:00:00Z",
+    };
+    dispatch(mkInvoke(63, "get_findings", {}));
+    await settle();
+    const r = client.lastReply();
+    const result = r.result as {
+      content: Array<{ text: string }>;
+      structuredContent: {
+        counts: { total: number; workspaceUnmerged: number };
+        findings: Array<{ taskId: string; category: string; notes: string | null }>;
+      };
+    };
+    assert.equal(result.structuredContent.counts.workspaceUnmerged, 1);
+    const finding = result.structuredContent.findings.find((f) => f.category === "workspace_unmerged");
+    assert.ok(finding, "expected a workspace_unmerged finding");
+    assert.match(finding!.notes ?? "", /not a fast-forward/);
+  });
+
   it("returns a distill finding with structured distillReport payload", async () => {
     seedBoard("hydra_session_test", {
       state: "done",

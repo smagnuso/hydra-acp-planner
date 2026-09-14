@@ -95,6 +95,23 @@ describe("buildPlanUpdateEnvelope", () => {
     assert.equal(entries[2]!.priority, "medium"); // T3
     assert.equal(entries[3]!.priority, "medium"); // T4
   });
+
+  it("annotates a task with unconfirmed workspace landing with the unmerged marker", () => {
+    const b = board({
+      tasks: [
+        task("T1", {
+          status: "done",
+          title: "Boom",
+          workspaceLanding: { status: "declined", at: "2026-01-01T00:00:00Z" },
+        }),
+        task("T2", { status: "done", workspaceLanding: { status: "landed", at: "x" } }),
+      ],
+    });
+    const env = buildPlanUpdateEnvelope({ sessionId: "s", board: b });
+    const entries = (env.update as { entries: Array<{ content: string }> }).entries;
+    assert.ok(entries[0]!.content.includes("⚠ unmerged"));
+    assert.ok(!entries[1]!.content.includes("⚠ unmerged"));
+  });
 });
 
 describe("buildAsciiPlanText", () => {
@@ -131,6 +148,18 @@ describe("buildAsciiPlanText", () => {
     const b = board({ tasks: [task("T1", { status: "failed" })] });
     const out = buildAsciiPlanText(b);
     assert.ok(out.split("\n")[0]!.includes("1 failed"));
+  });
+
+  it("annotates a task line with the unmerged marker when landing didn't confirm", () => {
+    const b = board({
+      tasks: [
+        task("T1", { status: "done", workspaceLanding: { status: "unknown", at: "x" } }),
+        task("T2", { status: "done", workspaceLanding: { status: "skipped", at: "x" } }),
+      ],
+    });
+    const lines = buildAsciiPlanText(b).split("\n");
+    assert.match(lines[1]!, /T1.*⚠ unmerged/);
+    assert.ok(!lines[2]!.includes("⚠ unmerged"));
   });
 });
 

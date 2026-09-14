@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatTaskTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
+import { collectFindings, countFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatTaskTag, formatWorkspaceLandingTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
 import { setBoardState, type Board, type Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -1027,6 +1027,93 @@ describe("formatTaskTag", () => {
     const tag = formatTaskTag(t, b);
     assert.ok(!tag.includes("orchestrator"), "work tasks never get the orchestrator marker");
     assert.equal(tag, " {opencode-dev}");
+  });
+});
+
+describe("formatWorkspaceLandingTag", () => {
+  it("renders the unmerged marker for declined landing", () => {
+    const t = task("T1", { workspaceLanding: { status: "declined", at: "2026-01-01T00:00:00Z" } });
+    assert.equal(formatWorkspaceLandingTag(t), " ⚠ unmerged");
+  });
+
+  it("renders the unmerged marker for unknown landing", () => {
+    const t = task("T1", { workspaceLanding: { status: "unknown", at: "2026-01-01T00:00:00Z" } });
+    assert.equal(formatWorkspaceLandingTag(t), " ⚠ unmerged");
+  });
+
+  it("renders nothing for landed, skipped, or absent workspaceLanding", () => {
+    assert.equal(
+      formatWorkspaceLandingTag(task("T1", { workspaceLanding: { status: "landed", at: "x" } })),
+      "",
+    );
+    assert.equal(
+      formatWorkspaceLandingTag(task("T2", { workspaceLanding: { status: "skipped", at: "x" } })),
+      "",
+    );
+    assert.equal(formatWorkspaceLandingTag(task("T3")), "");
+  });
+});
+
+describe("collectFindings — workspace_unmerged", () => {
+  it("surfaces a workspace_unmerged finding for declined landing, quoting the daemon's detail", () => {
+    const b = board({
+      tasks: [
+        task("T1", {
+          status: "done",
+          artifacts: { summary: "did the thing" },
+          workerSessions: ["hydra_session_worker1"],
+          workspaceLanding: {
+            status: "declined",
+            detail: "not a fast-forward; run /hydra workspace sync first",
+            at: "2026-01-01T00:00:00Z",
+          },
+        }),
+      ],
+    });
+    const out = collectFindings(b);
+    const finding = out.find((f) => f.category === "workspace_unmerged");
+    assert.ok(finding, "expected a workspace_unmerged finding");
+    assert.equal(finding!.taskId, "T1");
+    assert.match(finding!.notes ?? "", /not a fast-forward; run \/hydra workspace sync first/);
+    assert.deepEqual(finding!.workerSessions, ["hydra_session_worker1"]);
+  });
+
+  it("surfaces workspace_unmerged alongside another category for the same task (not shadowed)", () => {
+    const b = board({
+      tasks: [
+        task("T1", {
+          status: "done",
+          artifacts: { summary: "did the thing", follow_ups: ["clean up later"] },
+          workspaceLanding: { status: "unknown", detail: "no reply", at: "x" },
+        }),
+      ],
+    });
+    const out = collectFindings(b);
+    const categories = out.filter((f) => f.taskId === "T1").map((f) => f.category).sort();
+    assert.deepEqual(categories, ["follow_ups", "workspace_unmerged"]);
+  });
+
+  it("does not surface a finding for landed or skipped workspaceLanding", () => {
+    const b = board({
+      tasks: [
+        task("T1", { status: "done", artifacts: { summary: "x" }, workspaceLanding: { status: "landed", at: "x" } }),
+        task("T2", { status: "done", artifacts: { summary: "x" }, workspaceLanding: { status: "skipped", at: "x" } }),
+      ],
+    });
+    const out = collectFindings(b);
+    assert.equal(out.some((f) => f.category === "workspace_unmerged"), false);
+  });
+
+  it("countFindings tallies workspaceUnmerged", () => {
+    const b = board({
+      tasks: [
+        task("T1", { status: "done", artifacts: { summary: "x" }, workspaceLanding: { status: "declined", at: "x" } }),
+        task("T2", { status: "done", artifacts: { summary: "x" }, workspaceLanding: { status: "unknown", at: "x" } }),
+      ],
+    });
+    const counts = countFindings(collectFindings(b));
+    assert.equal(counts.workspaceUnmerged, 2);
+    assert.equal(counts.total, 2);
   });
 });
 
