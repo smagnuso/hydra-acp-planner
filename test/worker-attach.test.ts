@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -217,6 +217,24 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       assert.ok(
         workerSessionAttach,
         "expected session/attach for the spawned worker",
+      );
+
+      // The version on this attach is not cosmetic. The daemon reports
+      // the most recent clientInfo it saw under a given name, so a stale
+      // literal here OVERWRITES the version the transformer registered
+      // with, and `transformer list` reports the wrong one from the
+      // first worker spawn onward. It also rides along as
+      // `sentBy.version` on every prompt the planner sends a worker.
+      const attachInfo = (workerSessionAttach.params as {
+        clientInfo?: { name?: string; version?: string };
+      }).clientInfo;
+      assert.equal(attachInfo?.name, "hydra-acp-planner");
+      assert.equal(
+        attachInfo?.version,
+        JSON.parse(
+          readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+        ).version,
+        "session/attach must report our real package version",
       );
 
       // Additional sanity: verify message/emit was sent to the worker.

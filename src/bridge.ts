@@ -216,6 +216,26 @@ const INTERCEPTS = [
 // short form: `/hydra planner create ...` routes here. Both forms work.
 const PROCESS_NAME = "hydra-acp-planner";
 
+// Reported alongside PROCESS_NAME on the peer `session/attach` in
+// attachAsClient. Read from our own package.json rather than written
+// down, because a literal here does not just go stale: the daemon shows
+// the most recent clientInfo it saw under this name, so a wrong version
+// on the attach OVERWRITES the correct one the transformer registered,
+// and `hydra-acp transformer list` then reports it for the rest of the
+// process's life. It also rides along as `sentBy.version` on every
+// prompt the planner sends a worker, which is exactly where somebody
+// debugging planner/daemon version skew would look.
+const PROCESS_VERSION = ((): string => {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version?: string };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
 const COMMANDS = [
   {
     // Bare `/hydra planner` (no verb) routes here. Treated as a
@@ -4032,7 +4052,7 @@ export class PlannerBridge {
         // historyPolicy: "none" — we only care about future
         // permission requests, not past transcript replay.
         historyPolicy: "none",
-        clientInfo: { name: PROCESS_NAME, version: "0.0.2" },
+        clientInfo: { name: PROCESS_NAME, version: PROCESS_VERSION },
       });
       attachedSessions.add(sessionId);
       log.debug(`session/attach (client) for worker …${sessionId.slice(-8)}`);
