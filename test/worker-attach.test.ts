@@ -295,4 +295,117 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       );
     },
   );
+
+  it(
+    "spawnTaskOnNewWorker: omits workspace request when board.isolation is unset (default off)",
+    async () => {
+      const childSessionId = "hydra_session_worker_noiso_1";
+      seedBoard("hydra_session_test", {
+        state: "ready",
+        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+      });
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId,
+      }));
+
+      dispatch(mkInvoke(12, "start", {}));
+      await settle(7);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      assert.equal(spawns.length, 1);
+      const meta = (spawns[0]!.params as { _meta?: { "hydra-acp"?: Record<string, unknown> } })
+        ._meta?.["hydra-acp"];
+      assert.equal(meta?.workspace, undefined);
+
+      const board = boards.get("hydra_session_test")!;
+      assert.equal(board.tasks.find((t) => t.id === "T1")!.workspace, undefined);
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: requests a labeled workspace and records workspaceInfo when board.isolation.mode='per-task'",
+    async () => {
+      const childSessionId = "hydra_session_worker_iso_1";
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+      });
+      board.isolation = { mode: "per-task" };
+      saveBoard(board, "hydra_session_test");
+
+      const workspaceInfo = {
+        path: "/home/u/.hydra-acp/workspaces/abc/T1",
+        sourceCwd: "/home/u/repo",
+        label: "T1",
+        provider: "git",
+      };
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId,
+        _meta: { "hydra-acp": { workspaceInfo } },
+      }));
+
+      dispatch(mkInvoke(13, "start", {}));
+      await settle(7);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      assert.equal(spawns.length, 1);
+      const meta = (spawns[0]!.params as { _meta?: { "hydra-acp"?: Record<string, unknown> } })
+        ._meta?.["hydra-acp"];
+      assert.deepEqual(meta?.workspace, { label: "T1" });
+
+      const task1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
+      assert.deepEqual(task1.workspace, workspaceInfo);
+      assert.equal(task1.workspaceError, undefined);
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: sets required:true on the workspace request when board.isolation.required is true",
+    async () => {
+      const childSessionId = "hydra_session_worker_iso_req_1";
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+      });
+      board.isolation = { mode: "per-task", required: true };
+      saveBoard(board, "hydra_session_test");
+
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId,
+      }));
+
+      dispatch(mkInvoke(14, "start", {}));
+      await settle(7);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      const meta = (spawns[0]!.params as { _meta?: { "hydra-acp"?: Record<string, unknown> } })
+        ._meta?.["hydra-acp"];
+      assert.deepEqual(meta?.workspace, { label: "T1", required: true });
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: records workspaceError and logs a fallback warning when isolation falls back",
+    async () => {
+      const childSessionId = "hydra_session_worker_iso_fallback_1";
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        tasks: [{ id: "T1", title: "work item", status: "pending", deps: [] }],
+      });
+      board.isolation = { mode: "per-task" };
+      saveBoard(board, "hydra_session_test");
+
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId,
+        _meta: { "hydra-acp": { workspaceError: "not a git repository" } },
+      }));
+
+      dispatch(mkInvoke(15, "start", {}));
+      await settle(7);
+
+      const task1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
+      assert.equal(task1.workspace, undefined);
+      assert.equal(task1.workspaceError, "not a git repository");
+    },
+  );
 });

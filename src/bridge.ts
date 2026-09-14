@@ -371,6 +371,61 @@ export const pendingActivation = new Set<string>(); // orchestratorSessionId
 // rationale (avoids `[Tn] ` injection mid-sentence).
 const workerForwarders = new Map<string, WorkerForwarder>();
 
+// One-shot listeners for a `/hydra workspace <verb>` reply, keyed by the
+// worker session it was sent to. The daemon delivers this as a plain
+// session/update (agent_message_chunk, _meta.synthetic=true) rather than
+// as the session/prompt RPC's return value — the RPC just resolves
+// {stopReason:"end_turn"} — so mergeTaskWorkspace/discardTaskWorkspace
+// register here before sending and handleNotification's session/update
+// branch resolves it when the reply arrives. Independent of
+// workerState/resultAccumulator (the task-turn text accumulator): by the
+// time we send this, the task's own turn is already over and workerState
+// is typically already cleared.
+const pendingWorkspaceReplies = new Map<string, (text: string) => void>();
+
+// Pull the text out of a session/update notification IF it's a
+// hydra-emitted synthetic reply (emitExtensionReply on the daemon side —
+// used for every `/hydra ...` slash-command reply, not just workspace
+// verbs). Returns undefined for anything else (real agent output,
+// non-text content, a chunk missing the synthetic marker) so callers
+// don't mistake a worker's own turn output for the command reply.
+function extractSyntheticReplyText(update: unknown): string | undefined {
+  if (!update || typeof update !== "object") return undefined;
+  const u = update as {
+    sessionUpdate?: string;
+    content?: { type?: string; text?: string };
+    _meta?: { "hydra-acp"?: { synthetic?: boolean } };
+  };
+  if (u.sessionUpdate !== "agent_message_chunk") return undefined;
+  if (u._meta?.["hydra-acp"]?.synthetic !== true) return undefined;
+  if (u.content?.type !== "text" || typeof u.content.text !== "string") return undefined;
+  return u.content.text.trim();
+}
+
+// Classify a `/hydra workspace merge` reply into a landing outcome.
+// Matches literal, hardcoded daemon prefixes (see
+// cli/src/core/session-manager.ts's mergeWorkspaceIntoSource, and
+// cli/src/core/session.ts's runWorkspaceCommand catch block) rather than
+// anything more forgiving — this text is written for a human, not a
+// wire contract, and a false-positive "landed" is far worse than an
+// "unknown" that just prompts the user to check by hand. Exported for
+// direct unit testing against those exact strings.
+export function classifyMergeReply(
+  reply: string | undefined,
+): NonNullable<Task["workspaceLanding"]> {
+  const at = nowIso();
+  if (reply === undefined) {
+    return { status: "unknown", detail: "no reply received", at };
+  }
+  if (reply.startsWith("Merged ")) {
+    return { status: "landed", detail: reply, at };
+  }
+  if (reply.startsWith("Workspace merge failed: ")) {
+    return { status: "declined", detail: reply.slice("Workspace merge failed: ".length), at };
+  }
+  return { status: "unknown", detail: reply, at };
+}
+
 // Tracks in-flight commands/invoke dispatches keyed by the daemon-
 // assigned messageId. Set when handleCommandsInvoke receives the
 // request, cleared when it finishes. The `cancelled` flag is set by
@@ -4536,6 +4591,22 @@ export class PlannerBridge {
     }
     let childSessionId: string;
     try {
+      // Isolation request: only when the plan opted in
+      // (board.isolation.mode === "per-task"). `label` derives from the
+      // task id so a workspace directory reads back to its task at a
+      // glance; `required` mirrors the plan's own fail-open/fail-closed
+      // choice. `from` is deliberately omitted — "current state of
+      // sourceCwd" is exactly what we want: DAG dependency gating plus
+      // awaiting mergeTaskWorkspace before scheduling dependents (see
+      // handleTaskComplete/finishReview) is what keeps that current
+      // state meaning "this task's deps already landed."
+      const workspaceRequest =
+        board.isolation?.mode === "per-task"
+          ? {
+              label: task.id,
+              ...(board.isolation.required ? { required: true } : {}),
+            }
+          : undefined;
       const spawnParams: Record<string, unknown> = {
         parentSessionId: orchestratorSessionId,
         // cwd omitted → inherits from parent
@@ -4548,6 +4619,7 @@ export class PlannerBridge {
           "hydra-acp": {
             title: `${task.id}: ${task.title}`,
             ...(seedModel ? { model: seedModel } : {}),
+            ...(workspaceRequest ? { workspace: workspaceRequest } : {}),
           },
         },
       };
@@ -4564,11 +4636,24 @@ export class PlannerBridge {
           );
         }
       }
-      const spawnResult = await this.client.request<{ childSessionId: string }>(
+      const spawnResult = await this.client.request<{
+        childSessionId: string;
+        _meta?: { "hydra-acp"?: { workspaceInfo?: Task["workspace"]; workspaceError?: string } };
+      }>(
         "hydra-acp/child_session/spawn",
         spawnParams,
       );
       childSessionId = spawnResult.childSessionId;
+      if (workspaceRequest) {
+        const spawnedWorkspaceMeta = spawnResult._meta?.["hydra-acp"];
+        task.workspace = spawnedWorkspaceMeta?.workspaceInfo;
+        task.workspaceError = spawnedWorkspaceMeta?.workspaceError;
+        if (task.workspaceError) {
+          log.warn(
+            `task ${task.id}: isolation requested but not honored (falling back to shared tree): ${task.workspaceError}`,
+          );
+        }
+      }
     } catch (err) {
       log.error(
         `failed to spawn worker for ${task.id}: ${(err as Error).message}`,
@@ -5020,8 +5105,8 @@ export class PlannerBridge {
       // Review tasks are handled by handleReviewComplete, which
       // processes the reviewer's decision and updates the reviewed
       // task accordingly.
-      this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
-      this.handleReviewComplete(task, board, orchestratorSessionId, result);
+      await this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
+      await this.handleReviewComplete(task, board, orchestratorSessionId, result);
       void this.scheduleEligibleTasks(orchestratorSessionId, board);
       return;
     }
@@ -5030,7 +5115,7 @@ export class PlannerBridge {
       // Distill tasks: parser already validated source citations
       // and recommended_action. Drive the per-action dispatch and
       // surface the report on the originating review.
-      this.handleDistillComplete(task, board, orchestratorSessionId, result);
+      await this.handleDistillComplete(task, board, orchestratorSessionId, result);
       void this.scheduleEligibleTasks(orchestratorSessionId, board);
       return;
     }
@@ -5078,7 +5163,7 @@ export class PlannerBridge {
       return;
     }
 
-    this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
+    await this.markTaskDone(task, result.artifacts, board, orchestratorSessionId, workerSessionId);
 
     // Try to refill the freed slot. Completing this task may have also
     // unblocked dependents — scheduleEligibleTasks loops until it hits
@@ -5130,13 +5215,13 @@ export class PlannerBridge {
     }
   }
 
-  private markTaskDone(
+  private async markTaskDone(
     task: Task,
     artifacts: TaskArtifacts,
     board: Board,
     orchestratorSessionId: string,
     workerSessionId: string,
-  ): void {
+  ): Promise<void> {
     task.status = "done";
     task.finishedAt = nowIso();
     task.artifacts = artifacts;
@@ -5168,10 +5253,27 @@ export class PlannerBridge {
     }
 
     if (!isOrchestratorLane) {
-      this.endWorkerForward(workerSessionId, { flush: true });
-      clearWorkerState(workerSessionId);
-      unregisterWorker(workerSessionId);
-      void this.closeWorker(workerSessionId);
+      // Awaited so a dependent's spawn (scheduleEligibleTasks, called by
+      // every caller right after this) never forks its workspace before
+      // this task's edits have actually landed in the source tree.
+      await this.mergeTaskWorkspace(task);
+      saveBoard(board, orchestratorSessionId);
+      // A worker whose landing didn't confirm stays open AND keeps its
+      // bookkeeping — its workspace still holds the only copy of the
+      // work, and the get_findings entry (emitted by mergeTaskWorkspace's
+      // caller chain surfacing workspaceLanding) tells the user to
+      // attach and land it by hand. Tearing down worker state/
+      // registration while leaving the session itself open would be an
+      // inconsistent half-close; closing it here would strand that work
+      // with no live session left to run `/hydra workspace merge` in.
+      const landingUnconfirmed =
+        task.workspaceLanding?.status === "declined" || task.workspaceLanding?.status === "unknown";
+      if (!landingUnconfirmed) {
+        this.endWorkerForward(workerSessionId, { flush: true });
+        clearWorkerState(workerSessionId);
+        unregisterWorker(workerSessionId);
+        void this.closeWorker(workerSessionId);
+      }
     }
   }
 
@@ -5218,12 +5320,12 @@ export class PlannerBridge {
   // carries `review_decision` and `notes` in artifacts. We pass it in
   // explicitly so callers don't have to round-trip through task.artifacts
   // (which has the normalized shape and can't be re-parsed by normalizeReview).
-  private handleReviewComplete(
+  private async handleReviewComplete(
     reviewTask: Task,
     board: Board,
     orchestratorSessionId: string,
     normalized: NormalizedResult | undefined,
-  ): void {
+  ): Promise<void> {
     const reviews = reviewTask.reviews;
     if (!reviews) return;
 
@@ -5231,7 +5333,7 @@ export class PlannerBridge {
       log.warn(
         `review ${reviewTask.id}: missing or malformed review result, treating as reject`,
       );
-      this.handleReviewReject(reviewTask, board, orchestratorSessionId, "missing review result");
+      await this.handleReviewReject(reviewTask, board, orchestratorSessionId, "missing review result");
       return;
     }
 
@@ -5246,50 +5348,50 @@ export class PlannerBridge {
       log.warn(
         `review ${reviewTask.id}: competition received invalid decision '${decision}', treating as winner with no valid winnerId`,
       );
-      this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
+      await this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
       return;
     }
 
     switch (decision) {
       case "approve":
-        this.handleReviewApprove(reviewTask, normalized, board, orchestratorSessionId);
+        await this.handleReviewApprove(reviewTask, normalized, board, orchestratorSessionId);
         break;
       case "reject":
-        this.handleReviewReject(reviewTask, board, orchestratorSessionId, notes);
+        await this.handleReviewReject(reviewTask, board, orchestratorSessionId, notes);
         break;
       case "amend":
-        this.handleReviewAmend(reviewTask, normalized, notes, board, orchestratorSessionId);
+        await this.handleReviewAmend(reviewTask, normalized, notes, board, orchestratorSessionId);
         break;
       case "fix":
-        this.handleReviewFix(reviewTask, normalized, notes, board, orchestratorSessionId);
+        await this.handleReviewFix(reviewTask, normalized, notes, board, orchestratorSessionId);
         break;
       case "winner":
-        this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
+        await this.handleReviewWinner(reviewTask, normalized, notes, board, orchestratorSessionId);
         break;
       case "synthesize":
-        this.handleReviewSynthesize(reviewTask, normalized, notes, board, orchestratorSessionId);
+        await this.handleReviewSynthesize(reviewTask, normalized, notes, board, orchestratorSessionId);
         break;
       default:
         log.warn(
           `review ${reviewTask.id}: unrecognized decision '${decision}', treating as reject`,
         );
-        this.handleReviewReject(reviewTask, board, orchestratorSessionId, `unrecognized decision: ${decision}`);
+        await this.handleReviewReject(reviewTask, board, orchestratorSessionId, `unrecognized decision: ${decision}`);
         break;
     }
   }
 
   // Approve: mark the reviewed task done with merged artifacts.
-  private handleReviewApprove(
+  private async handleReviewApprove(
     reviewTask: Task,
     normalized: NormalizedResult,
     board: Board,
     orchestratorSessionId: string,
-  ): void {
+  ): Promise<void> {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
     const reviewNotes = (normalized.artifacts as Record<string, unknown>).notes as string;
-    this.finishReview({
+    await this.finishReview({
       reviewedTask,
       reviewTask,
       board,
@@ -5308,12 +5410,12 @@ export class PlannerBridge {
 
   // Reject: retask the reviewed task with reviewFeedback. On maxAttempts
   // exceed, mark the reviewed task as failed.
-    private handleReviewReject(
+  private async handleReviewReject(
     reviewTask: Task,
     board: Board,
     orchestratorSessionId: string,
     feedback: string,
-  ): void {
+  ): Promise<void> {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
@@ -5326,7 +5428,7 @@ export class PlannerBridge {
       if (!reviewedTask.reviewFeedback.includes(feedback)) {
         reviewedTask.reviewFeedback.push(feedback);
       }
-      this.finishReview({
+      await this.finishReview({
         reviewedTask,
         reviewTask,
         board,
@@ -5353,7 +5455,7 @@ export class PlannerBridge {
           : !esc.agent
             ? "onReject.strategy='escalate' but onReject.escalateTo.agent is missing"
             : "onReject.strategy='escalate' but onReject.escalateTo.model is missing";
-        this.finishReview({
+        await this.finishReview({
           reviewedTask,
           reviewTask,
           board,
@@ -5437,7 +5539,7 @@ export class PlannerBridge {
       reviewedTask.reviewFeedback.push(feedback);
     }
 
-    this.finishReview({
+    await this.finishReview({
       reviewedTask,
       reviewTask,
       board,
@@ -5450,17 +5552,17 @@ export class PlannerBridge {
   }
 
   // Amend: mark the reviewed task done with notes appended to artifacts.decisions.
-  private handleReviewAmend(
+  private async handleReviewAmend(
     reviewTask: Task,
     normalized: NormalizedResult,
     notes: string,
     board: Board,
     orchestratorSessionId: string,
-  ): void {
+  ): Promise<void> {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
-    this.finishReview({
+    await this.finishReview({
       reviewedTask,
       reviewTask,
       board,
@@ -5479,13 +5581,13 @@ export class PlannerBridge {
 
   // Fix: reviewer applies corrections directly and marks the task done.
   // Gated by canApplyFixes — if false (e.g. worker-lane review), treat as reject.
-  private handleReviewFix(
+  private async handleReviewFix(
     reviewTask: Task,
     normalized: NormalizedResult,
     notes: string,
     board: Board,
     orchestratorSessionId: string,
-  ): void {
+  ): Promise<void> {
     const reviewedTask = this.getReviewedTask(reviewTask, board);
     if (!reviewedTask) return;
 
@@ -5504,11 +5606,18 @@ export class PlannerBridge {
       log.info(
         `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=${reviewTask.canApplyFixes ?? "derived:false"}), treating as reject`,
       );
-      this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane (canApplyFixes=false)`);
+      await this.handleReviewReject(reviewTask, board, orchestratorSessionId, `fix decision not permitted on this review lane (canApplyFixes=false)`);
       return;
     }
 
-    this.finishReview({
+    // NOTE: an orchestrator-lane fix edits the orchestrator's OWN cwd,
+    // not reviewedTask.workspace — if reviewedTask ran isolated, this
+    // mergeTaskWorkspace call below lands the worker's pre-fix edits
+    // only; the orchestrator's fix additions live wherever the
+    // orchestrator's own cwd is, unmerged by this path. Isolation +
+    // canApplyFixes is an unresolved interaction, not something this
+    // phase attempts to fix.
+    await this.finishReview({
       reviewedTask,
       reviewTask,
       board,
@@ -5531,19 +5640,19 @@ export class PlannerBridge {
   // for the distill. Reviewees are left in their current status
   // (typically awaiting_review) — handleDistillComplete decides their
   // final disposition.
-  private handleReviewSynthesize(
+  private async handleReviewSynthesize(
     reviewTask: Task,
     _normalized: NormalizedResult,
     _notes: string,
     board: Board,
     orchestratorSessionId: string,
-  ): void {
+  ): Promise<void> {
     const reviews = reviewTask.reviews;
     if (!reviews || typeof reviews === "string" || reviews.length < 2) {
       log.warn(
         `review ${reviewTask.id}: synthesize decision on non-competition review, treating as reject`,
       );
-      this.handleReviewReject(
+      await this.handleReviewReject(
         reviewTask,
         board,
         orchestratorSessionId,
@@ -5614,12 +5723,12 @@ export class PlannerBridge {
   // in all branches. Apply-Tx mirrors handleReviewWinner. Rework/new-work
   // supersedes all reviewees, spawns a follow-up work task, and rewires
   // dependents to point at the new work task instead of the distill.
-  private handleDistillComplete(
+  private async handleDistillComplete(
     distillTask: Task,
     board: Board,
     orchestratorSessionId: string,
     normalized: NormalizedResult | undefined,
-  ): void {
+  ): Promise<void> {
     const reviews = distillTask.reviews;
     if (!reviews || typeof reviews === "string" || reviews.length < 1) {
       log.warn(
@@ -5705,7 +5814,7 @@ export class PlannerBridge {
         return;
       }
 
-      this.finishReview({
+      await this.finishReview({
         reviewedTask: winnerTask,
         reviewTask: distillTask,
         board,
@@ -5907,13 +6016,13 @@ export class PlannerBridge {
   }
 
   // Winner: competition mode — pick the winning task and supersede the rest.
-  private handleReviewWinner(
+  private async handleReviewWinner(
     reviewTask: Task,
     normalized: NormalizedResult,
     notes: string,
     board: Board,
     orchestratorSessionId: string,
-  ): void {
+  ): Promise<void> {
     const reviews = reviewTask.reviews;
     if (!reviews) return;
 
@@ -5921,7 +6030,7 @@ export class PlannerBridge {
 
     // Single reviewee with winner decision — treat like approve.
     if (typeof reviews === "string") {
-      this.handleReviewApprove(reviewTask, normalized, board, orchestratorSessionId);
+      await this.handleReviewApprove(reviewTask, normalized, board, orchestratorSessionId);
       return;
     }
 
@@ -5931,7 +6040,7 @@ export class PlannerBridge {
     if (winnerId && byId.has(winnerId)) {
       const winnerTask = byId.get(winnerId)!;
 
-      this.finishReview({
+      await this.finishReview({
         reviewedTask: winnerTask,
         reviewTask,
         board,
@@ -6024,7 +6133,7 @@ export class PlannerBridge {
     return byId.get(firstId);
   }
 
-  private finishReview(opts: FinishReviewOpts): void {
+  private async finishReview(opts: FinishReviewOpts): Promise<void> {
     const { reviewedTask, reviewTask, board, orchestratorSessionId, mergeArtifacts, logMessage, eventMessage, eventTag, extraEventProps, reviewedStatus = "done" } = opts;
 
     if (mergeArtifacts) {
@@ -6058,6 +6167,21 @@ export class PlannerBridge {
     }
 
     saveBoard(board, orchestratorSessionId);
+
+    // Land the reviewed task's workspace only once it's genuinely
+    // approved ("done") — never on "pending" (retasking; the same or a
+    // fresh worker still has to run) or "failed" (rejected past max
+    // attempts; that work is being abandoned, not landed). Awaited so a
+    // dependent's spawn (via the caller's scheduleEligibleTasks) never
+    // forks before this lands. The reviewed task's worker may already be
+    // cold by this point (handleTaskComplete closes it at the
+    // awaiting_review transition unless onReject.strategy is
+    // "continue") — sendWorkspaceCommand's attachAsClient transparently
+    // resurrects it, same as any other cold-session attach.
+    if (reviewedStatus === "done") {
+      await this.mergeTaskWorkspace(reviewedTask);
+      saveBoard(board, orchestratorSessionId);
+    }
 
     log.info(logMessage);
     this.emitPlanUpdate(orchestratorSessionId, board);
@@ -6314,7 +6438,7 @@ export class PlannerBridge {
         const failureArtifacts: Record<string, unknown> = { summary: "reject", review_decision: "reject", notes: `orchestrator review failed: ${(err as Error).message}` };
         reviewTask.artifacts = failureArtifacts as typeof reviewTask.artifacts;
         const failureResult: NormalizedResult = { artifacts: failureArtifacts as TaskArtifacts, warnings: [] };
-        this.handleReviewComplete(reviewTask, board, orchestratorSessionId, failureResult);
+        await this.handleReviewComplete(reviewTask, board, orchestratorSessionId, failureResult);
         void this.scheduleEligibleTasks(orchestratorSessionId, board);
         return;
       }
@@ -6352,10 +6476,10 @@ export class PlannerBridge {
       reviewTask.artifacts = parseFailureArtifacts as typeof reviewTask.artifacts;
       effectiveResult = { artifacts: parseFailureArtifacts as TaskArtifacts, warnings: [] };
     } else {
-      this.markTaskDone(reviewTask, result.artifacts, board, orchestratorSessionId, "orchestrator");
+      await this.markTaskDone(reviewTask, result.artifacts, board, orchestratorSessionId, "orchestrator");
     }
 
-    this.handleReviewComplete(reviewTask, board, orchestratorSessionId, effectiveResult);
+    await this.handleReviewComplete(reviewTask, board, orchestratorSessionId, effectiveResult);
     void this.scheduleEligibleTasks(orchestratorSessionId, board);
   }
 
@@ -6419,11 +6543,21 @@ export class PlannerBridge {
       return;
     }
     if (note.method === "session/update") {
-      const params = (note.params ?? {}) as { sessionId?: string };
+      const params = (note.params ?? {}) as { sessionId?: string; update?: unknown };
       const sessionId = params.sessionId;
-      if (typeof sessionId === "string" && getWorkerState(sessionId)) {
-        this.handleWorkerSessionUpdate(sessionId, note.params);
-        return;
+      if (typeof sessionId === "string") {
+        const pendingWorkspaceReply = pendingWorkspaceReplies.get(sessionId);
+        if (pendingWorkspaceReply) {
+          const text = extractSyntheticReplyText(params.update);
+          if (text !== undefined) {
+            pendingWorkspaceReply(text);
+            return;
+          }
+        }
+        if (getWorkerState(sessionId)) {
+          this.handleWorkerSessionUpdate(sessionId, note.params);
+          return;
+        }
       }
     }
 
@@ -6598,6 +6732,77 @@ export class PlannerBridge {
         `inject /hydra planner continue (head) failed for …${sessionId.slice(-8)}: ${(err as Error).message}`,
       );
     }
+  }
+
+  // Send a `/hydra workspace <verb>` command into a worker session and
+  // wait for its reply. Modeled on injectContinueAtHead, but the reply
+  // isn't the session/prompt RPC's return value — the daemon delivers it
+  // as a session/update notification (see extractSyntheticReplyText) — so
+  // this registers a one-shot listener in pendingWorkspaceReplies before
+  // sending. Attaches lazily via attachAsClient, the same call every
+  // worker already gets at spawn time; harmless (idempotent) to repeat
+  // here, and necessary after a daemon restart where the in-memory
+  // attachedSessions set has reset. Returns undefined on any failure to
+  // attach, send, or hear back in time — callers must treat that the
+  // same as an unrecognized reply, never as success.
+  private async sendWorkspaceCommand(
+    workerSessionId: string,
+    verb: "merge" | "discard",
+    timeoutMs = 15_000,
+  ): Promise<string | undefined> {
+    await this.attachAsClient(workerSessionId);
+    const replyPromise = new Promise<string | undefined>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingWorkspaceReplies.delete(workerSessionId);
+        resolve(undefined);
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+      pendingWorkspaceReplies.set(workerSessionId, (text) => {
+        clearTimeout(timer);
+        resolve(text);
+      });
+    });
+    try {
+      await this.client.request("session/prompt", {
+        sessionId: workerSessionId,
+        prompt: [{ type: "text", text: `/hydra workspace ${verb}` }],
+        _meta: { "hydra-acp": { queuePosition: "head" } },
+      });
+    } catch (err) {
+      pendingWorkspaceReplies.delete(workerSessionId);
+      log.warn(
+        `/hydra workspace ${verb} send failed for …${workerSessionId.slice(-8)}: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
+    return replyPromise;
+  }
+
+  // Land a task's workspace into the shared source tree once the task
+  // has finished (and, if reviewed, been approved) — see
+  // docs/worktree-isolation-planner.md for why this is immediate rather
+  // than deferred to project end. No-ops (status "skipped") when the
+  // task never had a workspace. Never marks the task done-as-if-merged
+  // on an unrecognized reply — see classifyMergeReply.
+  private async mergeTaskWorkspace(task: Task): Promise<void> {
+    if (!task.workspace) {
+      task.workspaceLanding = { status: "skipped", at: nowIso() };
+      return;
+    }
+    const workerSessionId = task.workerSessions?.at(-1);
+    if (!workerSessionId) {
+      log.warn(
+        `task ${task.id}: has a workspace but no recorded worker session to merge from`,
+      );
+      task.workspaceLanding = {
+        status: "unknown",
+        detail: "no recorded worker session",
+        at: nowIso(),
+      };
+      return;
+    }
+    const reply = await this.sendWorkspaceCommand(workerSessionId, "merge");
+    task.workspaceLanding = classifyMergeReply(reply);
   }
 
   // Synthetic progress messages get wrapped with leading + trailing
