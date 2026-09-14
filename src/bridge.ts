@@ -386,6 +386,38 @@ const workerForwarders = new Map<string, WorkerForwarder>();
 // is typically already cleared.
 const pendingWorkspaceReplies = new Map<string, (text: string) => void>();
 
+// Serializes everything that touches one project's integration tree:
+// landings, discards, and the workspace CREATIONS that fork from it.
+//
+// The daemon is explicit that two landings into one source tree are
+// hazardous ("both reset --hard the same directory. Serialize merges
+// yourself" — cli/src/core/workspace/refs.ts). Creation has to share the
+// same queue rather than get its own: landing hard-resets the tree a
+// fork reads from, so a creation interleaved with one captures a torn
+// state. Guarding landings only against each other is half a fix.
+//
+// Keyed by projectId, because that is what identifies the integration
+// tree a set of tasks shares.
+const integrationTreeQueues = new Map<string, Promise<unknown>>();
+
+function enqueueOnIntegrationTree<T>(
+  projectId: string,
+  op: () => Promise<T>,
+): Promise<T> {
+  const prior = integrationTreeQueues.get(projectId) ?? Promise.resolve();
+  // Chained off the tail regardless of how the tail settled: one
+  // failed landing must not wedge every later one.
+  const next = prior.then(op, op);
+  integrationTreeQueues.set(
+    projectId,
+    next.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return next;
+}
+
 // How many times an isolated worker is reminded to commit before the
 // task is recorded as not landed. Mirrors the bounded-retry posture of
 // review rejection: recoverable, but not indefinitely.
@@ -4814,13 +4846,23 @@ export class PlannerBridge {
           );
         }
       }
-      const spawnResult = await this.client.request<{
+      type SpawnResult = {
         childSessionId: string;
         _meta?: { "hydra-acp"?: { workspaceInfo?: Task["workspace"]; workspaceError?: string } };
-      }>(
-        "hydra-acp/child_session/spawn",
-        spawnParams,
-      );
+      };
+      const doSpawn = () =>
+        this.client.request<SpawnResult>("hydra-acp/child_session/spawn", spawnParams);
+      // A spawn that provisions a workspace FORKS the integration tree,
+      // and a landing running at the same time is mid-`reset --hard` on
+      // it — so creation shares the landing queue rather than getting
+      // its own. Spawns that ask for no workspace (or adopt an existing
+      // one) read nothing from that tree and stay off the queue, so an
+      // unisolated plan keeps spawning exactly as fast as it does today.
+      const forksIntegrationTree =
+        workspaceRequest !== undefined && workspaceRequest.adopt !== true;
+      const spawnResult = forksIntegrationTree
+        ? await enqueueOnIntegrationTree(board.projectId, doSpawn)
+        : await doSpawn();
       childSessionId = spawnResult.childSessionId;
       if (workspaceRequest) {
         const spawnedWorkspaceMeta = spawnResult._meta?.["hydra-acp"];
@@ -5487,7 +5529,7 @@ export class PlannerBridge {
       // Awaited so a dependent's spawn (scheduleEligibleTasks, called by
       // every caller right after this) never forks its workspace before
       // this task's edits have actually landed in the source tree.
-      await this.mergeTaskWorkspace(task);
+      await this.mergeTaskWorkspace(board, orchestratorSessionId, task);
       saveBoard(board, orchestratorSessionId);
       // A worker whose landing didn't confirm stays open AND keeps its
       // bookkeeping — its workspace still holds the only copy of the
@@ -6019,7 +6061,7 @@ export class PlannerBridge {
       // even though its job here is to read and report, not edit. Land
       // it the same as any other "done" task — a no-op fast-forward if
       // it made no edits, a real merge if it did.
-      await this.mergeTaskWorkspace(distillTask);
+      await this.mergeTaskWorkspace(board, orchestratorSessionId, distillTask);
       saveBoard(board, orchestratorSessionId);
       return;
     }
@@ -6094,13 +6136,13 @@ export class PlannerBridge {
           `${id} superseded by ${appliedWinner}`,
           { event: "task-superseded", taskId: id },
         );
-        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId);
+        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId, board.projectId);
       }
       // finishReview already merged winnerTask's workspace and set
       // distillTask.status = "done" (it's the "reviewTask" in that
       // call). It does NOT merge the reviewTask's own workspace — that's
       // this line's job, same as every other "done" task.
-      await this.mergeTaskWorkspace(distillTask);
+      await this.mergeTaskWorkspace(board, orchestratorSessionId, distillTask);
       saveBoard(board, orchestratorSessionId);
       this.emitPlanUpdate(orchestratorSessionId, board);
       return;
@@ -6133,7 +6175,7 @@ export class PlannerBridge {
           `${id} superseded by ${distillTask.id} ${recommended}`,
           { event: "task-superseded", taskId: id },
         );
-        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId);
+        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId, board.projectId);
       }
 
       const newWorkId = `${distillTask.id}w`;
@@ -6171,7 +6213,7 @@ export class PlannerBridge {
       distillTask.status = "done";
       distillTask.finishedAt = nowIso();
       distillTask.assignedTo = null;
-      await this.mergeTaskWorkspace(distillTask);
+      await this.mergeTaskWorkspace(board, orchestratorSessionId, distillTask);
       saveBoard(board, orchestratorSessionId);
       this.emitPlanUpdate(orchestratorSessionId, board);
 
@@ -6334,7 +6376,7 @@ export class PlannerBridge {
         // candidate's tree rather than just leaving it to rot. A task
         // with no workspace (unisolated competition, today's unchanged
         // behavior) is left exactly as before: superseded, worker open.
-        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId);
+        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId, board.projectId);
       }
     } else {
       // No valid winner ID — treat all reviewees as failed.
@@ -6449,7 +6491,7 @@ export class PlannerBridge {
         reviewTask.workspace?.path === reviewedTask.workspace.path
           ? reviewTask.workerSessions?.at(-1)
           : undefined;
-      await this.mergeTaskWorkspace(reviewedTask, landFrom);
+      await this.mergeTaskWorkspace(board, orchestratorSessionId, reviewedTask, landFrom);
       saveBoard(board, orchestratorSessionId);
     }
 
@@ -7055,6 +7097,8 @@ export class PlannerBridge {
   // task never had a workspace. Never marks the task done-as-if-merged
   // on an unrecognized reply — see classifyMergeReply.
   private async mergeTaskWorkspace(
+    board: Board,
+    orchestratorSessionId: string,
     task: Task,
     // A session that also holds this workspace and is known to be live —
     // in practice the reviewer that adopted it. Preferred over the task's
@@ -7067,6 +7111,44 @@ export class PlannerBridge {
       task.workspaceLanding = { status: "skipped", at: nowIso() };
       return;
     }
+    // Serialized against every other landing, discard, and workspace
+    // creation on this project's integration tree. Note this queues the
+    // WHOLE operation, including the status probe: reading a tree that
+    // another landing is mid-reset on would answer about a state that
+    // exists only for an instant.
+    await enqueueOnIntegrationTree(board.projectId, async () => {
+      // Checked here rather than before queueing: by the time our turn
+      // comes the board may have been cancelled, and landing into the
+      // user's tree after they asked to stop is exactly the surprise
+      // isolation is supposed to prevent. An already-running landing is
+      // never interrupted — the queue drains, it does not abort — but a
+      // not-yet-started one does not begin.
+      if (
+        board.state === "stopped" ||
+        board.state === "failed" ||
+        board.state === "done"
+      ) {
+        log.info(
+          `task ${task.id}: skipping landing — board is "${board.state}"; its workspace is retained`,
+        );
+        task.workspaceLanding = {
+          status: "unknown",
+          detail: `not attempted: the project was ${board.state} before this task's work could land`,
+          at: nowIso(),
+        };
+        return;
+      }
+      await this.landTaskWorkspace(task, preferSessionId);
+    });
+    this.haltIfLandingUnconfirmed(board, orchestratorSessionId, task);
+  }
+
+  // The landing itself. Split out so the queue above wraps one call and
+  // cannot be bypassed by a future caller reaching past it.
+  private async landTaskWorkspace(
+    task: Task,
+    preferSessionId?: string,
+  ): Promise<void> {
     const workerSessionId = preferSessionId ?? task.workerSessions?.at(-1);
     if (!workerSessionId) {
       log.warn(
@@ -7113,6 +7195,44 @@ export class PlannerBridge {
       return;
     }
     task.workspaceLanding = landing;
+  }
+
+  // Hold the project when a task's work did not verifiably reach the
+  // integration tree.
+  //
+  // Without this, a dependent forks a tree that is missing the very work
+  // it depends on and produces something plausible and wrong — the
+  // failure mode this whole design exists to avoid. Pausing rather than
+  // failing the task is deliberate: the work EXISTS, in a workspace we
+  // deliberately keep, so this is a "come look at it" and not a loss.
+  private haltIfLandingUnconfirmed(
+    board: Board,
+    orchestratorSessionId: string,
+    task: Task,
+  ): void {
+    const status = task.workspaceLanding?.status;
+    if (status !== "declined" && status !== "unknown") return;
+    // Dependents are stopped by pausing: scheduleEligibleTasks already
+    // refuses to dispatch on a paused board, so this needs no new
+    // scheduler state.
+    if (board.state === "running") {
+      setBoardState(board, "paused");
+      saveBoard(board, orchestratorSessionId);
+      this.emitPlanUpdate(orchestratorSessionId, board);
+    }
+    const where = task.workspace?.path ?? "its workspace";
+    const session = task.workerSessions?.at(-1);
+    log.warn(
+      `project ${shortProjectId(board.projectId)} paused: ${task.id}'s work did not confirm landing`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `Paused: ${task.id}'s work did not confirm landing into the integration tree, so anything depending on it would build on a tree missing that work.\n\n` +
+        `The work is not lost — it is still in ${where}${session ? ` (session ${shortSessionId(session)})` : ""}.\n` +
+        `${task.workspaceLanding?.detail ?? ""}\n\n` +
+        `Check it, land it by hand if it is sound, then resume. \`get_findings\` has the details.`,
+      { event: "project-paused-unlanded", taskId: task.id },
+    );
   }
 
   // Ask a worker's workspace what it has, so the answer is evidence
@@ -7213,9 +7333,15 @@ export class PlannerBridge {
   private async discardSupersededTaskWorkspace(
     task: Task,
     orchestratorSessionId: string,
+    projectId: string,
   ): Promise<void> {
     if (!task.workspace) return;
-    await this.discardTaskWorkspace(task, orchestratorSessionId);
+    // Same queue as landings and creations: a discard removes a tree and
+    // its branch, which is not safe to interleave with a landing that is
+    // mid-reset on the shared source.
+    await enqueueOnIntegrationTree(projectId, () =>
+      this.discardTaskWorkspace(task, orchestratorSessionId),
+    );
     const workerSessionId = task.workerSessions?.at(-1);
     if (!workerSessionId) return;
     this.endWorkerForward(workerSessionId, { flush: true });

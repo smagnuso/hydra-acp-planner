@@ -376,7 +376,9 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       }));
 
       dispatch(mkInvoke(13, "start", {}));
-      await settle(10);
+      // Isolated creations serialize on the integration-tree queue, so a
+      // second spawn is several promise hops behind the first.
+      await settle(30);
 
       const spawns = client.requestsFor("hydra-acp/child_session/spawn");
       assert.equal(spawns.length, 2, "both independent tasks should have spawned");
@@ -482,7 +484,7 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       }));
 
       dispatch(mkInvoke(15, "start", {}));
-      await settle(10);
+      await settle(30);
 
       const spawns = client.requestsFor("hydra-acp/child_session/spawn");
       assert.equal(spawns.length, 2, "both competition candidates should have spawned");

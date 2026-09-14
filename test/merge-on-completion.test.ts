@@ -697,3 +697,66 @@ describe("merge-on-completion — the commit contract (Phase C)", () => {
     assert.equal(task.workspaceLanding?.status, "unknown");
   });
 });
+
+describe("landing safety — serialization and dependent gating", () => {
+  const COMMITTED = "  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.";
+
+  it("pauses the project when a landing does not confirm", async () => {
+    // A dependent forking a tree that is missing its dependency's work
+    // is the silent-garbage failure the whole design exists to avoid.
+    // Pausing, not failing: the work still exists in its workspace.
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did it"}\n```');
+    client.statusReplyFor = () => COMMITTED;
+    client.workspaceReplyFor = () =>
+      "Workspace merge failed: not a fast-forward; run /hydra workspace sync first";
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(board.state, "paused", "dependents must not be allowed to run");
+    assert.equal(task.status, "done", "the task itself is done; only its landing is not");
+    const note = client.requestsFor("hydra-acp/message/emit").find((r) =>
+      JSON.stringify(r.params).includes("did not confirm landing"),
+    );
+    assert.ok(note, "the user must be told why the project stopped");
+  });
+
+  it("does not pause on a clean landing", async () => {
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did it"}\n```');
+    client.statusReplyFor = () => COMMITTED;
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+
+    await complete(board, task);
+    await settle();
+
+    // Not "running": a single-task project legitimately finishes here.
+    // The claim is only that a clean landing does not HOLD the project.
+    assert.notEqual(board.state, "paused");
+    assert.equal(task.workspaceLanding?.status, "landed");
+  });
+
+  it("does not start a landing once the project has been stopped", async () => {
+    // Landing into the user's tree after they asked to stop is exactly
+    // the surprise isolation is meant to prevent. The workspace is kept,
+    // so nothing is lost by declining to land.
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did it"}\n```');
+    client.statusReplyFor = () => COMMITTED;
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    board.state = "stopped";
+
+    await complete(board, task);
+    await settle();
+
+    const merges = client.requestsFor("session/prompt").filter((r) => {
+      const p = r.params as { prompt?: Array<{ text?: string }> };
+      return p.prompt?.[0]?.text === "/hydra workspace merge";
+    });
+    assert.equal(merges.length, 0, "no landing may begin on a stopped board");
+  });
+});
