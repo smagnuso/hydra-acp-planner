@@ -23,11 +23,30 @@ describe("classifyMergeReply", () => {
     assert.ok(result.at);
   });
 
-  it("still classifies as landed when warnings are appended after the Merged line", () => {
-    const reply = "Merged hydra/T3 into ~/repo\n  WARNING: nested tree sub was NOT reconciled: conflict.";
+  it("does NOT classify as landed when a WARNING is appended after the Merged line", () => {
+    // This asserted the opposite until it was understood what those
+    // warnings mean. The daemon head-lines `Merged …` even when the
+    // replay of the workspace's uncommitted work failed — and since an
+    // agent that never commits has nothing BUT uncommitted work, that
+    // reply can mean the entire payload was lost. Reporting `landed`
+    // there is a false positive on total loss, which is strictly worse
+    // than an unconfirmed result the user is told to go check.
+    const reply =
+      "Merged hydra/T3 into ~/repo\n  WARNING: the workspace's uncommitted changes could not be replayed; they remain reachable from hydra/T3.";
     const result = classifyMergeReply(reply);
-    assert.equal(result.status, "landed");
-    assert.equal(result.detail, reply);
+    assert.equal(result.status, "unknown");
+    assert.equal(result.detail, reply, "the warning text must survive into the finding");
+  });
+
+  it("does not classify as landed when the user's own work was displaced", () => {
+    const reply =
+      "Merged hydra/T3 into ~/repo\n  WARNING: this workspace started clean, so your uncommitted work was never copied in; it is preserved at refs/hydra/landing/abc.";
+    assert.equal(classifyMergeReply(reply).status, "unknown");
+  });
+
+  it("still classifies a clean Merged reply as landed", () => {
+    const reply = "Merged hydra/T3 into ~/repo; still working in ~/.hydra-acp/workspaces/ab/T3.";
+    assert.equal(classifyMergeReply(reply).status, "landed");
   });
 
   it("classifies a failed merge as declined, stripping the daemon's fixed prefix from detail", () => {

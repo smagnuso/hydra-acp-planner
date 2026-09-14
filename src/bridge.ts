@@ -418,6 +418,18 @@ export function classifyMergeReply(
     return { status: "unknown", detail: "no reply received", at };
   }
   if (reply.startsWith("Merged ")) {
+    // A `Merged …` head line is NOT sufficient. The daemon appends
+    // `WARNING:` lines under it for outcomes that mean the agent's work
+    // did not fully come across — most importantly "the workspace's
+    // uncommitted changes could not be replayed", and "this workspace
+    // started clean, so your uncommitted work was never copied in …
+    // preserved at <ref>". For an agent that never commits, its
+    // uncommitted work IS the whole payload, so treating those as
+    // success reports a landing on total loss. Anything carrying a
+    // warning is therefore unconfirmed, not landed.
+    if (/^\s*WARNING:/m.test(reply)) {
+      return { status: "unknown", detail: reply, at };
+    }
     return { status: "landed", detail: reply, at };
   }
   if (reply.startsWith("Workspace merge failed: ")) {
@@ -7539,7 +7551,16 @@ export class PlannerBridge {
     // Parse isolation from tool args. Delegated to parseIsolationFromObject
     // (board.ts) so the lenient-parsing posture matches fleetDefaults/
     // reviewPolicy and stays unit-testable without the bridge.
-    const boardIsolation = parseIsolationFromObject(args.isolation);
+    const requestedIsolation = parseIsolationFromObject(args.isolation);
+    // GUARDRAIL: "per-task" is not safe to run yet — the shipped
+    // implementation races concurrent landings on one tree, reports
+    // `landed` on replies that mean nothing landed, and hands reviewers a
+    // workspace that lacks the code they are reviewing. See
+    // docs/worktree-isolation-v2.md. Accept the plan (an optional field
+    // should not fail an otherwise good DAG) but force it off and SAY SO,
+    // rather than honoring a setting that would quietly corrupt the run.
+    const isolationRefused = requestedIsolation?.mode === "per-task";
+    const boardIsolation = isolationRefused ? undefined : requestedIsolation;
 
     const contractBriefRaw = args.contractBrief;
     const contractBrief =
@@ -7610,7 +7631,10 @@ export class PlannerBridge {
     const reviewBlurb = reviewCount > 0
       ? ` + ${reviewCount} auto-synthesized review${reviewCount === 1 ? "" : "s"}`
       : "";
-    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.`;
+    const isolationNotice = isolationRefused
+      ? ` NOTE: isolation.mode="per-task" was requested and has been IGNORED — per-task workspace isolation is not safe to run yet, so this plan runs in the session's own working tree. Tell the user their tasks are NOT isolated.`
+      : "";
+    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.${isolationNotice}`;
     this.replyMcpResult(reqId, summary, {
       projectId: board.projectId,
       replacedReadyProjectId: replacedReadyId,
@@ -7618,6 +7642,7 @@ export class PlannerBridge {
       reviewTaskCount: reviewCount,
       concurrencyCap: board.concurrencyCap,
       warnings: normalized.warnings,
+      ...(isolationRefused ? { isolationRefused: true } : {}),
     });
   }
 

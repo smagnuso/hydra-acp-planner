@@ -191,13 +191,13 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         isolation: {
           type: "object",
           description:
-            "Optional, plan-level only (no per-task override). Runs each task's worker in its own isolated workspace instead of the shared checkout, merging its work back automatically once the task completes and is reviewed. Off by default — every existing plan behaves unchanged. Turn on when the user asks for isolated/parallel-safe workers. A merge that can't land cleanly (the source moved on) does NOT fail the task — it's surfaced via get_findings with instructions to resolve by hand, and the worker session is kept open until then.",
+            "Optional, plan-level only. NOT CURRENTLY AVAILABLE: 'per-task' is accepted but ignored, and the plan runs in the session's own working tree as usual — do not offer isolation to the user as a working feature. Leave this unset. (Per-task workspace isolation is being redesigned; the shipped implementation raced concurrent landings, could report success when nothing landed, and gave reviewers a tree without the code under review.)",
           properties: {
             mode: {
               type: "string",
               enum: ["off", "per-task"],
               description:
-                "'off' (default): no isolation, today's shared-tree behavior. 'per-task': every task's worker gets its own workspace.",
+                "'off' (default): no isolation, today's shared-tree behavior. 'per-task': IGNORED for now — see the parent description.",
             },
             required: {
               type: "boolean",
