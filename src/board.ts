@@ -226,6 +226,19 @@ export interface Task {
     label: string;
     provider: string;
   };
+  // True when `workspace` was ADOPTED from another task rather than
+  // provisioned for this one: a review (or distill) joins its
+  // reviewee's tree so it can see the code under review. The two tasks
+  // then carry byte-identical `workspace` records, and nothing else
+  // distinguishes the borrower from the owner.
+  //
+  // Load-bearing at landing time. The work in an adopted workspace
+  // belongs to the task that produced it, and THAT task's landing
+  // carries it; a second landing driven by the borrower re-lands the
+  // same branch into a source that has since moved on, which answers
+  // neither "merged" nor "failed" and reads as an unconfirmed landing.
+  // The project then pauses over work that did land.
+  workspaceAdopted?: boolean;
   // Set instead of (or alongside a fallback without) `workspace` when
   // isolation was requested but the daemon could not honor it and fell
   // back to the shared tree (isolation.required unset/false). When

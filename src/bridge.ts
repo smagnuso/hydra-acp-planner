@@ -4867,6 +4867,13 @@ export class PlannerBridge {
       if (workspaceRequest) {
         const spawnedWorkspaceMeta = spawnResult._meta?.["hydra-acp"];
         task.workspace = spawnedWorkspaceMeta?.workspaceInfo;
+        // Recorded, not inferred later: an adopted record is identical
+        // to the owner's, so by landing time there is nothing left to
+        // tell them apart. See Task.workspaceAdopted.
+        task.workspaceAdopted =
+          workspaceRequest.adopt === true && task.workspace !== undefined
+            ? true
+            : undefined;
         task.workspaceError = spawnedWorkspaceMeta?.workspaceError;
         if (task.workspaceError) {
           log.warn(
@@ -5526,10 +5533,32 @@ export class PlannerBridge {
     }
 
     if (!isOrchestratorLane) {
-      // Awaited so a dependent's spawn (scheduleEligibleTasks, called by
-      // every caller right after this) never forks its workspace before
-      // this task's edits have actually landed in the source tree.
-      await this.mergeTaskWorkspace(board, orchestratorSessionId, task);
+      // A borrower does not land. The work in an adopted workspace
+      // belongs to the task that produced it, and finishReview lands it
+      // from there (passing this reviewer as the live holder of the
+      // binding). Landing it here as well re-lands the same branch a
+      // second time, into a source that the sibling tasks have since
+      // moved on — the daemon answers that with neither "merged" nor
+      // "failed" but with "the source has moved on, sync first", which
+      // reads as an unconfirmed landing and pauses a project whose work
+      // did in fact land.
+      //
+      // Deliberately not pushed down into mergeTaskWorkspace: the
+      // distill call sites ask for a specific task's work to land and
+      // mean it, including when that task is working in a tree it
+      // adopted.
+      if (task.workspaceAdopted) {
+        task.workspaceLanding = {
+          status: "skipped",
+          detail: `workspace ${task.workspace?.label ?? "(unknown)"} is adopted; its owner lands it`,
+          at: nowIso(),
+        };
+      } else {
+        // Awaited so a dependent's spawn (scheduleEligibleTasks, called by
+        // every caller right after this) never forks its workspace before
+        // this task's edits have actually landed in the source tree.
+        await this.mergeTaskWorkspace(board, orchestratorSessionId, task);
+      }
       saveBoard(board, orchestratorSessionId);
       // A worker whose landing didn't confirm stays open AND keeps its
       // bookkeeping — its workspace still holds the only copy of the
@@ -5539,9 +5568,14 @@ export class PlannerBridge {
       // registration while leaving the session itself open would be an
       // inconsistent half-close; closing it here would strand that work
       // with no live session left to run `/hydra workspace merge` in.
+      //
+      // A borrower is held open for a second reason: it is the live
+      // holder of a binding its OWNER still has to land through, and a
+      // session that is closing refuses new prompts outright (-32014).
+      // finishReview closes it once that landing has run.
       const landingUnconfirmed =
         task.workspaceLanding?.status === "declined" || task.workspaceLanding?.status === "unknown";
-      if (!landingUnconfirmed) {
+      if (!landingUnconfirmed && !task.workspaceAdopted) {
         this.endWorkerForward(workerSessionId, { flush: true });
         clearWorkerState(workerSessionId);
         unregisterWorker(workerSessionId);
@@ -6493,6 +6527,28 @@ export class PlannerBridge {
           : undefined;
       await this.mergeTaskWorkspace(board, orchestratorSessionId, reviewedTask, landFrom);
       saveBoard(board, orchestratorSessionId);
+    }
+
+    // markTaskDone deliberately leaves a reviewer that ADOPTED its
+    // reviewee's workspace open, because the landing above had to be
+    // sent through it. Close it now that it has served that purpose —
+    // including on a reject, where no landing ran at all and nothing
+    // else would ever close it.
+    //
+    // Except when the landing did not confirm: then the same rule that
+    // keeps an owner's worker open applies here, since this session is
+    // the one the user would attach to in order to land it by hand.
+    const adoptedReviewer = reviewTask.workspaceAdopted
+      ? reviewTask.workerSessions?.at(-1)
+      : undefined;
+    const reviewedLandingUnconfirmed =
+      reviewedTask.workspaceLanding?.status === "declined" ||
+      reviewedTask.workspaceLanding?.status === "unknown";
+    if (adoptedReviewer !== undefined && !reviewedLandingUnconfirmed) {
+      this.endWorkerForward(adoptedReviewer, { flush: true });
+      clearWorkerState(adoptedReviewer);
+      unregisterWorker(adoptedReviewer);
+      void this.closeWorker(adoptedReviewer);
     }
 
     log.info(logMessage);

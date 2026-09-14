@@ -228,6 +228,62 @@ describe("merge-on-completion — handleTaskComplete → markTaskDone → mergeT
     assert.ok(getWorkerState(WORKER), "worker state should be preserved when landing is unconfirmed");
   });
 
+  it("adopted: a task working in a borrowed workspace never lands it itself", async () => {
+    // Regression. A review adopts its reviewee's tree so it can see the
+    // code under review, which leaves the two tasks holding identical
+    // workspace records. When the reviewer also landed on completion,
+    // the same branch was merged twice: the second attempt met a source
+    // its siblings had already moved on, and the daemon answers that
+    // with neither "merged" nor "failed" but with "the source has moved
+    // on, sync first" — classified `unknown`, which paused the project
+    // over work that had in fact landed.
+    const reviewed = workTaskWithWorkspace("T1", { status: "awaiting_review" });
+    const task = workTaskWithWorkspace("R1", {
+      kind: "review",
+      reviews: "T1",
+      // Identical to the reviewee's record, which is the whole problem:
+      // only this flag tells the borrower from the owner.
+      workspace: reviewed.workspace,
+      workspaceAdopted: true,
+    });
+    const board = makeBoard([reviewed, task]);
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+
+    // markTaskDone directly: the guard lives there, and driving a review
+    // through handleTaskComplete would exercise the review result parser
+    // rather than the landing decision under test.
+    await (bridge as unknown as {
+      markTaskDone: (
+        t: Task,
+        a: Record<string, unknown>,
+        b: Board,
+        orch: string,
+        worker: string,
+      ) => Promise<void>;
+    }).markTaskDone(task, { summary: "approve" }, board, ORCH, WORKER);
+    await settle();
+
+    assert.equal(task.workspaceLanding?.status, "skipped");
+    const merges = client.requestsFor("session/prompt").filter((r) => {
+      const p = r.params as { sessionId?: string; prompt?: Array<{ text?: string }> };
+      return p.prompt?.[0]?.text === "/hydra workspace merge";
+    });
+    assert.equal(merges.length, 0, "a borrower must not land the workspace it adopted");
+
+    // And it must still be OPEN. The owner's landing is sent through
+    // this very session (it holds the binding), and a session that is
+    // closing rejects new prompts with -32014, which surfaces as the
+    // same false "did not confirm landing" pause. finishReview closes
+    // it afterwards.
+    const closes = client.requestsFor("hydra-acp/child_session/close");
+    assert.equal(
+      closes.filter((r) => (r.params as { childSessionId?: string }).childSessionId === WORKER)
+        .length,
+      0,
+      "a borrower must stay open until its owner has landed through it",
+    );
+  });
+
   it("skipped: a task with no workspace never sends a merge command", async () => {
     const task = workTaskWithWorkspace("T1", { workspace: undefined });
     const board = makeBoard([task]);
