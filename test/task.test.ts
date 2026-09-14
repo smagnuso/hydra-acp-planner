@@ -1122,3 +1122,59 @@ describe("work prompt — the commit contract", () => {
     );
   });
 });
+
+describe("review prompt — scoping the change under review", () => {
+  const WS = {
+    path: "/tmp/ws/p-T1",
+    sourceCwd: "/tmp/repo",
+    label: "p-T1",
+    provider: "git",
+  };
+
+  function reviewOf(reviewed: Task): { review: Task; b: Board } {
+    const review = task("R1", { kind: "review", reviews: "T1", deps: ["T1"] });
+    return { review, b: board([reviewed, review]) };
+  }
+
+  it("names the exact commits under review and disclaims inherited history", () => {
+    // The reviewed task's workspace forked AFTER its own dependencies
+    // landed, so its history contains upstream commits too. Without this
+    // the reviewer has no way to tell where the work it is judging
+    // begins — and REVIEW_SYSTEM primes it to treat code it cannot
+    // account for as fabricated.
+    const reviewed = task("T1", {
+      status: "done",
+      workspace: WS,
+      artifacts: { summary: "did it", commits: ["aaa111", "bbb222"] },
+    });
+    const { review, b } = reviewOf(reviewed);
+    const prompt = promptsFor("review").buildPrompt(review, b);
+
+    assert.match(prompt, /aaa111/);
+    assert.match(prompt, /bbb222/);
+    assert.match(prompt, /inherited base/i);
+    assert.match(prompt, /git show/);
+  });
+
+  it("says nothing when the reviewed task is not isolated", () => {
+    // An unisolated review must read exactly as it did before.
+    const reviewed = task("T1", {
+      status: "done",
+      artifacts: { summary: "did it", commits: ["aaa111"] },
+    });
+    const { review, b } = reviewOf(reviewed);
+    const prompt = promptsFor("review").buildPrompt(review, b);
+    assert.ok(!/under review is exactly/i.test(prompt));
+  });
+
+  it("says nothing when the isolated task recorded no commits", () => {
+    const reviewed = task("T1", {
+      status: "done",
+      workspace: WS,
+      artifacts: { summary: "changed nothing" },
+    });
+    const { review, b } = reviewOf(reviewed);
+    const prompt = promptsFor("review").buildPrompt(review, b);
+    assert.ok(!/What is under review/.test(prompt));
+  });
+});

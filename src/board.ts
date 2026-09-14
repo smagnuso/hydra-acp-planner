@@ -372,6 +372,10 @@ export function resolveRunOn(task: Task, fleetDefaults: FleetDefaults): "orchest
 //
 // Returns: { lane, reason } so callers can log/explain the routing.
 export type LaneReason =
+  // The reviewed task runs in its own workspace, so the reviewer must be
+  // a spawned session that can be placed in it. Outranks every other
+  // rule, including an explicit runOn.
+  | "isolated-reviewee"
   | "explicit-task"
   | "explicit-fleet"
   | "configured-agent"
@@ -401,9 +405,25 @@ export function resolveTaskLane(
 
 function resolveTaskLaneInner(
   task: Task,
-  board: { fleetDefaults: FleetDefaults; orchestratorAgent?: string | null; orchestratorModel?: string | null },
+  board: {
+    fleetDefaults: FleetDefaults;
+    orchestratorAgent?: string | null;
+    orchestratorModel?: string | null;
+    tasks?: Task[];
+  },
   kind: "review" | "distill",
 ): { lane: "orchestrator" | "worker"; reason: LaneReason } {
+  // A review of an ISOLATED task must run on the worker lane, ahead of
+  // every other rule including an explicit runOn. The reviewer has to be
+  // inside that task's workspace to see the change it is judging, and
+  // only a spawned session can be placed in one — the orchestrator's cwd
+  // is fixed when its session is created. An orchestrator-lane review
+  // here would be reviewing a tree that does not contain the work, and
+  // REVIEW_SYSTEM tells it to treat code it cannot find as fabricated,
+  // so it would reject confidently and wrongly.
+  if (kind === "review" && board.tasks !== undefined && reviewsIsolatedTask(task, board.tasks)) {
+    return { lane: "worker", reason: "isolated-reviewee" };
+  }
   if (task.runOn) {
     return { lane: task.runOn, reason: "explicit-task" };
   }
@@ -1085,6 +1105,16 @@ export function inFlightCount(board: Board): number {
 // against siblings"). Both existed open-coded in several places and the
 // two are easy to mistake for each other, which is why they are named
 // for the side they answer for.
+// Does this review judge a task that is running in its own workspace?
+function reviewsIsolatedTask(review: Task, tasks: Task[]): boolean {
+  const targets = Array.isArray(review.reviews)
+    ? review.reviews
+    : review.reviews
+      ? [review.reviews]
+      : [];
+  return targets.some((id) => tasks.find((t) => t.id === id)?.workspace !== undefined);
+}
+
 export function isCompetitionReview(task: Task): boolean {
   return Array.isArray(task.reviews) && task.reviews.length > 1;
 }

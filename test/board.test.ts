@@ -2018,3 +2018,52 @@ describe("isInfrastructureFailure", () => {
     assert.equal(isInfrastructureFailure("agent threw: tool 'bash' denied"), false);
   });
 });
+
+describe("review lane under isolation", () => {
+  function boardWith(reviewee: Partial<Task>, review: Partial<Task>): Board {
+    const b = newBoard({ description: "lane" });
+    b.tasks = [
+      { id: "T1", title: "one", deps: [], status: "awaiting_review", attemptCount: 0, ...reviewee },
+      {
+        id: "R1",
+        title: "review",
+        deps: ["T1"],
+        status: "pending",
+        attemptCount: 0,
+        kind: "review",
+        reviews: "T1",
+        ...review,
+      },
+    ] as Task[];
+    return b;
+  }
+  const WS = {
+    path: "/tmp/ws/p-T1",
+    sourceCwd: "/tmp/repo",
+    label: "p-T1",
+    provider: "git",
+  };
+
+  it("forces the worker lane when the reviewed task is isolated", () => {
+    const b = boardWith({ workspace: WS }, {});
+    const { lane, reason } = resolveReviewLane(b.tasks[1]!, b);
+    assert.equal(lane, "worker");
+    assert.equal(reason, "isolated-reviewee");
+  });
+
+  it("outranks an explicit runOn=orchestrator", () => {
+    // Not a preference that can be overridden: the orchestrator's cwd is
+    // fixed at session creation, so an orchestrator-lane reviewer simply
+    // cannot be placed in the reviewee's workspace, and would review a
+    // tree that does not contain the change.
+    const b = boardWith({ workspace: WS }, { runOn: "orchestrator" });
+    assert.equal(resolveReviewLane(b.tasks[1]!, b).lane, "worker");
+  });
+
+  it("leaves an unisolated review exactly as it was", () => {
+    const b = boardWith({}, {});
+    assert.equal(resolveReviewLane(b.tasks[1]!, b).lane, "orchestrator");
+    const pinned = boardWith({}, { runOn: "orchestrator" });
+    assert.equal(resolveReviewLane(pinned.tasks[1]!, pinned).reason, "explicit-task");
+  });
+});

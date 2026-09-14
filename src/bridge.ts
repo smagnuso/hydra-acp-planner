@@ -4739,33 +4739,52 @@ export class PlannerBridge {
       // awaiting mergeTaskWorkspace before scheduling dependents (see
       // handleTaskComplete/finishReview) is what keeps that current
       // state meaning "this task's deps already landed."
-      // Scoped by DAG shape, not applied to every task: isolation buys
-      // exactly one thing — keeping concurrent writers off each other —
-      // so a plan that cannot produce two simultaneous writers gets no
-      // workspaces at all and behaves precisely as it does unisolated.
-      // needsIsolatedWorkspace also excludes reviews and distills, which
-      // never get a tree of their own.
+      // Three ways a task can end up in a workspace, in precedence
+      // order:
       //
-      // Competition candidates additionally request required:true,
-      // regardless of board.isolation.required — a silent fallback would
-      // put every candidate back in one shared tree, exactly the
-      // interleaving-edits soundness bug isolation exists to fix here.
+      //  1. REJOIN — this task already has one (a retry, or an
+      //     infra-failure respawn). Adopt it, so the previous attempt's
+      //     work and history are still there. Asking for the same label
+      //     WITHOUT adopt would silently hand back a suffixed, empty
+      //     workspace and strand the earlier attempt.
+      //  2. REVIEW — join the tree of the task under review, so the
+      //     reviewer can actually read and test the change it is judging
+      //     rather than a workspace that does not contain it.
+      //  3. FRESH — first spawn of a task the DAG says can overlap
+      //     another writer.
       //
-      // The label is project-scoped because a `hydra/<label>` branch
-      // outlives its checkout, so a bare task id collides across two
-      // plans in one repo that both have a T1 — and the collision is
-      // SILENT, handing back an empty suffixed workspace (see the
-      // requested-vs-returned check after the spawn).
-      const wantsIsolation = needsIsolatedWorkspace(board, task.id);
-      const workspaceLabel = `${shortProjectId(board.projectId)}-${task.id}`;
-      const workspaceRequest = wantsIsolation
-        ? {
-            label: workspaceLabel,
-            ...(isCompetitionCandidate(board, task.id) || board.isolation?.required
-              ? { required: true }
-              : {}),
-          }
-        : undefined;
+      // A competition judge is deliberately excluded from (2): it cannot
+      // join N workspaces at once, so it reads the candidates by path
+      // instead (see the judge prompt).
+      const reviewedWorkspace = ((): Task["workspace"] => {
+        if ((task.kind ?? "work") !== "review") return undefined;
+        const targets = Array.isArray(task.reviews)
+          ? task.reviews
+          : task.reviews
+            ? [task.reviews]
+            : [];
+        if (targets.length !== 1) return undefined;
+        return board.tasks.find((t) => t.id === targets[0])?.workspace;
+      })();
+      const adoptLabel = task.workspace?.label ?? reviewedWorkspace?.label;
+
+      const freshLabel = `${shortProjectId(board.projectId)}-${task.id}`;
+      const requestedLabel = adoptLabel ?? freshLabel;
+      const workspaceRequest =
+        adoptLabel !== undefined
+          ? // Adopt never falls back: the daemon errors on a miss even
+            // under required:false, because landing a task in a tree
+            // that merely resembles the intended one is the failure this
+            // whole mechanism exists to prevent.
+            { label: adoptLabel, adopt: true, required: true }
+          : needsIsolatedWorkspace(board, task.id)
+            ? {
+                label: freshLabel,
+                ...(isCompetitionCandidate(board, task.id) || board.isolation?.required
+                  ? { required: true }
+                  : {}),
+              }
+            : undefined;
       const spawnParams: Record<string, unknown> = {
         parentSessionId: orchestratorSessionId,
         // cwd omitted → inherits from parent
@@ -4819,14 +4838,14 @@ export class PlannerBridge {
         // we believed about the label namespace is wrong, and the tree
         // this task is about to work in is not the one we think.
         const assignedLabel = task.workspace?.label;
-        if (assignedLabel !== undefined && assignedLabel !== workspaceLabel) {
+        if (assignedLabel !== undefined && assignedLabel !== requestedLabel) {
           log.error(
-            `task ${task.id}: asked for workspace "${workspaceLabel}" but got "${assignedLabel}" — ` +
+            `task ${task.id}: asked for workspace "${requestedLabel}" but got "${assignedLabel}" — ` +
               `the label was already taken, so this worker is in a DIFFERENT tree than intended`,
           );
           void this.emitSyntheticMessage(
             orchestratorSessionId,
-            `${task.id}: workspace label "${workspaceLabel}" was already taken; the daemon assigned "${assignedLabel}" instead. This worker is not in the tree the plan expected — stop and investigate before trusting its output.`,
+            `${task.id}: workspace label "${requestedLabel}" was already taken; the daemon assigned "${assignedLabel}" instead. This worker is not in the tree the plan expected — stop and investigate before trusting its output.`,
             { event: "task-workspace-label-collision", taskId: task.id },
           );
         }
@@ -5810,10 +5829,20 @@ export class PlannerBridge {
     // reviews leave canApplyFixes unset on purpose so this derivation
     // runs against whatever lane resolveReviewLane picks at dispatch time.
     const hostBlocked = getDeferredMcpReply(orchestratorSessionId) != null;
+    // One honest rule: a fix is allowed when the reviewer shares the
+    // reviewee's tree, because that is the only case where its edits land
+    // where the work is. That is true unisolated on the orchestrator lane
+    // (one shared checkout) and true under isolation when the reviewer
+    // adopted the reviewee's workspace — which is why the two cases,
+    // which used to need different handling, now collapse into one.
+    const sharesRevieweeTree =
+      reviewedTask.workspace !== undefined &&
+      reviewTask.workspace?.path === reviewedTask.workspace.path;
     const fixAllowed =
       reviewTask.canApplyFixes !== undefined
         ? reviewTask.canApplyFixes
-        : resolveReviewLane(reviewTask, board, hostBlocked).lane === "orchestrator";
+        : sharesRevieweeTree ||
+          resolveReviewLane(reviewTask, board, hostBlocked).lane === "orchestrator";
     if (!fixAllowed) {
       log.info(
         `review ${reviewTask.id}: fix not allowed for this lane (canApplyFixes=${reviewTask.canApplyFixes ?? "derived:false"}), treating as reject`,
@@ -6412,7 +6441,15 @@ export class PlannerBridge {
     // "continue") — sendWorkspaceCommand's attachAsClient transparently
     // resurrects it, same as any other cold-session attach.
     if (reviewedStatus === "done") {
-      await this.mergeTaskWorkspace(reviewedTask);
+      // The reviewer adopted this workspace, so it is the live holder of
+      // the binding and can land it without resurrecting the (by now
+      // closed) worker that produced the work.
+      const landFrom =
+        reviewedTask.workspace !== undefined &&
+        reviewTask.workspace?.path === reviewedTask.workspace.path
+          ? reviewTask.workerSessions?.at(-1)
+          : undefined;
+      await this.mergeTaskWorkspace(reviewedTask, landFrom);
       saveBoard(board, orchestratorSessionId);
     }
 
@@ -7017,12 +7054,20 @@ export class PlannerBridge {
   // than deferred to project end. No-ops (status "skipped") when the
   // task never had a workspace. Never marks the task done-as-if-merged
   // on an unrecognized reply — see classifyMergeReply.
-  private async mergeTaskWorkspace(task: Task): Promise<void> {
+  private async mergeTaskWorkspace(
+    task: Task,
+    // A session that also holds this workspace and is known to be live —
+    // in practice the reviewer that adopted it. Preferred over the task's
+    // own worker, which by landing time is usually closed: sending there
+    // would resurrect it, and would leave two sessions bound to one
+    // workspace, which some workspace verbs refuse outright.
+    preferSessionId?: string,
+  ): Promise<void> {
     if (!task.workspace) {
       task.workspaceLanding = { status: "skipped", at: nowIso() };
       return;
     }
-    const workerSessionId = task.workerSessions?.at(-1);
+    const workerSessionId = preferSessionId ?? task.workerSessions?.at(-1);
     if (!workerSessionId) {
       log.warn(
         `task ${task.id}: has a workspace but no recorded worker session to merge from`,

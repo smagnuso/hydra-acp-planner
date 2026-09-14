@@ -230,6 +230,44 @@ function formatWorkspaceCommitContract(task: Task): string {
   ].join("\n");
 }
 
+// Tell a reviewer exactly which commits are the change under review.
+//
+// This matters specifically because of how isolation forks: the reviewed
+// task's workspace was branched from the integration tree AFTER its own
+// dependencies landed, so its history legitimately contains upstream
+// tasks' commits too. A reviewer running `git log` there sees a mix and
+// has nothing marking where the work under review begins. Combined with
+// REVIEW_SYSTEM's instruction to treat code it cannot account for as
+// fabricated, an unscoped reviewer will confidently attribute inherited
+// code to the task — or review it as if the task wrote it.
+//
+// Returns "" when there is nothing useful to say, so an unisolated
+// review reads exactly as it does today.
+function formatReviewScope(review: Task, board: Board): string {
+  const targets = Array.isArray(review.reviews)
+    ? review.reviews
+    : review.reviews
+      ? [review.reviews]
+      : [];
+  if (targets.length !== 1) return "";
+  const reviewed = board.tasks.find((t) => t.id === targets[0]);
+  const commits = reviewed?.artifacts?.commits;
+  if (!reviewed?.workspace || !commits || commits.length === 0) return "";
+  return [
+    "## What is under review",
+    "",
+    `You are in ${reviewed.id}'s own workspace (\`${reviewed.workspace.path}\`), so you can`,
+    "read, build, and test the code directly here.",
+    "",
+    `**The change under review is exactly ${commits.length === 1 ? "this commit" : "these commits"}:**`,
+    ...commits.map((c) => `- \`${c}\``),
+    "",
+    "Everything earlier in this workspace's history is inherited base from upstream",
+    "tasks — it is NOT this task's work, and defects in it are not this task's to",
+    `answer for. Use \`git show <sha>\` on the ${commits.length === 1 ? "sha" : "shas"} above to see precisely what changed.`,
+  ].join("\n");
+}
+
 function formatAttachments(board: Board): string {
   if (!board.attachments || board.attachments.length === 0) return "";
   const parts: string[] = [];
@@ -609,6 +647,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         parts.push("");
         parts.push(REVIEW_RESULT_INSTRUCTIONS_COMPETITION);
         return parts.join("\n");
+      }
+      const scope = formatReviewScope(task, board);
+      if (scope) {
+        parts.push(scope);
+        parts.push("");
       }
       parts.push(
         `## Review instructions`,

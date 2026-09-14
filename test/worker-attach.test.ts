@@ -395,10 +395,12 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
   );
 
   it(
-    "spawnTaskOnNewWorker: never isolates a review task",
+    "spawnTaskOnNewWorker: a review of an UNISOLATED task gets no workspace of its own",
     async () => {
-      // A review has no tree of its own to write in; under the redesign
-      // it joins the tree of the task it is reviewing.
+      // A review never provisions a tree of its own. When the task it
+      // reviews is isolated it joins THAT tree (covered separately);
+      // when the reviewee is unisolated, as here, there is nothing to
+      // join and the review runs where everything else does.
       const board = seedBoard("hydra_session_test", {
         state: "ready",
         cap: 3,
@@ -490,6 +492,103 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
         })._meta?.["hydra-acp"];
         assert.equal(meta?.workspace?.required, true, "candidates must fail closed");
       }
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: a RETRY rejoins its own workspace instead of orphaning it",
+    async () => {
+      // Asking for the same label without adopt would hand back a
+      // suffixed, EMPTY workspace and strand the first attempt's work —
+      // silently, since the daemon suffixes rather than failing.
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        cap: 2,
+        tasks: [
+          { id: "T1", title: "one", status: "pending", deps: [] },
+          { id: "T2", title: "two", status: "pending", deps: [] },
+        ],
+      });
+      board.isolation = { mode: "per-task" };
+      // As if a previous attempt already ran.
+      board.tasks[0]!.workspace = {
+        path: "/tmp/ws/p-T1",
+        sourceCwd: "/tmp/repo",
+        label: "p-T1",
+        provider: "git",
+      };
+      saveBoard(board, "hydra_session_test");
+      let n = 0;
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId: `hydra_session_worker_retry_${n++}`,
+      }));
+
+      dispatch(mkInvoke(17, "start", {}));
+      await settle(10);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      const t1Spawn = spawns.find((sp) => {
+        const meta = (sp.params as { _meta?: { "hydra-acp"?: { title?: string } } })._meta?.[
+          "hydra-acp"
+        ];
+        return meta?.title?.startsWith("T1");
+      });
+      assert.ok(t1Spawn, "T1 should have spawned");
+      const ws = (t1Spawn!.params as {
+        _meta?: { "hydra-acp"?: { workspace?: Record<string, unknown> } };
+      })._meta?.["hydra-acp"]?.workspace;
+      assert.equal(ws?.label, "p-T1", "must rejoin the existing label");
+      assert.equal(ws?.adopt, true, "must adopt, not create");
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: a REVIEW joins the workspace of the task it reviews",
+    async () => {
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        cap: 3,
+        tasks: [
+          { id: "T1", title: "one", status: "awaiting_review", deps: [] },
+          {
+            id: "R1",
+            title: "review T1",
+            status: "pending",
+            deps: ["T1"],
+            kind: "review",
+            reviews: "T1",
+          },
+        ],
+      });
+      board.isolation = { mode: "per-task" };
+      board.tasks[0]!.workspace = {
+        path: "/tmp/ws/p-T1",
+        sourceCwd: "/tmp/repo",
+        label: "p-T1",
+        provider: "git",
+      };
+      saveBoard(board, "hydra_session_test");
+      let n = 0;
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId: `hydra_session_worker_rev2_${n++}`,
+      }));
+
+      dispatch(mkInvoke(18, "start", {}));
+      await settle(10);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      const r1 = spawns.find((sp) => {
+        const meta = (sp.params as { _meta?: { "hydra-acp"?: { title?: string } } })._meta?.[
+          "hydra-acp"
+        ];
+        return meta?.title?.startsWith("R1");
+      });
+      assert.ok(r1, "the review should have spawned (forced onto the worker lane)");
+      const ws = (r1!.params as {
+        _meta?: { "hydra-acp"?: { workspace?: Record<string, unknown> } };
+      })._meta?.["hydra-acp"]?.workspace;
+      assert.equal(ws?.label, "p-T1", "the reviewer must be in the reviewee's tree");
+      assert.equal(ws?.adopt, true);
     },
   );
 
