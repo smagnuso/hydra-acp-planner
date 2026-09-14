@@ -8,7 +8,7 @@
 import { readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnHydraAcp } from "./windows-spawn.js";
 import {
   canonicalProjectId,
   listProjects,
@@ -229,7 +229,7 @@ function orchestratorPointerFor(projectId: string): string | undefined {
 // holding the board in memory), and conflating them keeps the offline
 // path, which is the reason this CLI reads from disk at all, working.
 function daemonKnowsSession(sessionId: string): boolean {
-  const res = spawnSync("hydra-acp", ["session", "list", "--all", "--json"], {
+  const res = spawnHydraAcp(["session", "list", "--all", "--json"], {
     encoding: "utf8",
   });
   if (res.status !== 0 || !res.stdout) {
@@ -258,11 +258,9 @@ function daemonKnowsSession(sessionId: string): boolean {
 // BEFORE the session is removed, because afterwards the binding is gone
 // and there is nothing left to name the workspace by.
 function removeWorkerWorkspace(workerId: string): string | undefined {
-  const res = spawnSync(
-    "hydra-acp",
-    ["workspace", "remove", workerId, "--force"],
-    { encoding: "utf8" },
-  );
+  const res = spawnHydraAcp(["workspace", "remove", workerId, "--force"], {
+    encoding: "utf8",
+  });
   const out = `${res.stdout ?? ""}${res.stderr ?? ""}`;
   // "no such workspace" is the normal answer for an unisolated worker.
   const kept = out
@@ -309,7 +307,7 @@ function runRemove(projectId: string | undefined): void {
     if (kept !== undefined) {
       notes.push(`${shortSessionId(workerId)}: ${kept}`);
     }
-    spawnSync("hydra-acp", ["session", "remove", workerId], {
+    spawnHydraAcp(["session", "remove", workerId], {
       stdio: ["ignore", "ignore", "ignore"],
     });
   }
