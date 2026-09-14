@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resolve, join } from "node:path";
+import { resolve, join, delimiter } from "node:path";
 import { mkdirSync, writeFileSync, rmSync, chmodSync, existsSync, readFileSync } from "node:fs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -157,24 +157,45 @@ describe("hydra-acp-planner info: findings on terminal-state boards", () => {
 
 // `remove` shells out to `hydra-acp`, so these tests shadow it on PATH
 // with a recorder. Without that they would drive the user's real daemon.
+//
+// The recorder's own logic lives in one Node script so it behaves
+// identically on every OS; only the launcher differs. A bare
+// extensionless file with a `#!/bin/sh` shebang isn't executable on
+// Windows (no shell honors it, and CreateProcess won't run a non-PE
+// file), and Windows only matches a PATH entry against `hydra-acp.<ext>`
+// for an extension in PATHEXT, never the bare name, so this needs a
+// `.cmd` shim there, alongside the POSIX shell wrapper everywhere else.
 function fakeHydraBin(dir: string, sessionsJson: string): string {
   const binDir = join(dir, "bin");
   mkdirSync(binDir, { recursive: true });
   writeFileSync(join(dir, "sessions.json"), sessionsJson);
   writeFileSync(
-    join(binDir, "hydra-acp"),
+    join(binDir, "hydra-acp.js"),
     [
-      "#!/bin/sh",
-      `echo "$@" >> "${join(dir, "calls.log")}"`,
-      'if [ "$1" = "session" ] && [ "$2" = "list" ]; then',
-      `  cat "${join(dir, "sessions.json")}"`,
-      'elif [ "$1" = "workspace" ] && [ "$2" = "remove" ]; then',
-      '  echo "removed ~/.hydra-acp/workspaces/h/$3 (branch hydra/$3 kept: it has 2 commit(s) not in the source)"',
-      "fi",
-      "exit 0",
+      'const fs = require("fs");',
+      'const path = require("path");',
+      "const dir = process.env.HYDRA_ACP_FAKE_DIR;",
+      "const args = process.argv.slice(2);",
+      'fs.appendFileSync(path.join(dir, "calls.log"), args.join(" ") + "\\n");',
+      'if (args[0] === "session" && args[1] === "list") {',
+      '  process.stdout.write(fs.readFileSync(path.join(dir, "sessions.json"), "utf8"));',
+      '} else if (args[0] === "workspace" && args[1] === "remove") {',
+      "  process.stdout.write(",
+      '    `removed ~/.hydra-acp/workspaces/h/${args[2]} (branch hydra/${args[2]} kept: it has 2 commit(s) not in the source)\\n`,',
+      "  );",
+      "}",
+      "process.exit(0);",
     ].join("\n"),
   );
-  chmodSync(join(binDir, "hydra-acp"), 0o755);
+  if (process.platform === "win32") {
+    writeFileSync(join(binDir, "hydra-acp.cmd"), '@node "%~dp0hydra-acp.js" %*\r\n');
+  } else {
+    writeFileSync(
+      join(binDir, "hydra-acp"),
+      '#!/bin/sh\nexec node "$(dirname "$0")/hydra-acp.js" "$@"\n',
+    );
+    chmodSync(join(binDir, "hydra-acp"), 0o755);
+  }
   return binDir;
 }
 
@@ -185,7 +206,8 @@ function runRemoveCli(home: string, projId: string, binDir: string) {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
-      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      HYDRA_ACP_FAKE_DIR: home,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
     },
   });
 }
