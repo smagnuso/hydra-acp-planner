@@ -72,6 +72,12 @@ export interface WorkerState {
   // handleTaskComplete fires without a parseable block. Cap of 1
   // reprompt before we hand off to handleTaskFailure.
   repromptCount: number;
+  // Number of times we've nudged this worker to commit its work in its
+  // isolated workspace. Deliberately a SEPARATE budget from
+  // repromptCount: a worker that needed a nudge for a missing result
+  // block should not thereby lose its chances to be told to commit,
+  // since the two failures are unrelated and both are recoverable.
+  commitRepromptCount?: number;
   // Tool call ids the worker has emitted that we recognized as
   // TodoWrite-shaped (input contained a `todos` array). The initial
   // `tool_call` envelope is suppressed and routed to the orchestrator

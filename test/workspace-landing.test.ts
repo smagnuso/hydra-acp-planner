@@ -107,13 +107,25 @@ describe("classifyDiscardReply", () => {
 });
 
 describe("classifyWorkspaceStatusReply", () => {
-  it("reads a clean workspace as committed", () => {
+  it("reads clean + commits recorded here as committed", () => {
     const reply = [
-      "In workspace feature-x (git) at ~/.hydra-acp/workspaces/ab/feature-x",
+      "In workspace p-T1 (git) at ~/.hydra-acp/workspaces/ab/p-T1",
       "  no uncommitted changes",
-      "Use `/hydra workspace stop` to merge and return.",
+      "  2 commit(s) recorded here and not landed yet.",
     ].join("\n");
     assert.equal(classifyWorkspaceStatusReply(reply), "committed");
+  });
+
+  it("reads clean + in-sync as nothing-here, NOT as committed", () => {
+    // A no-op task and a task that committed look the same if you only
+    // check dirtiness. They are not the same, and conflating them either
+    // nags an honest no-op or silently blesses work that never landed.
+    const reply = [
+      "In workspace p-T1 (git)",
+      "  no uncommitted changes",
+      "  in sync with ~/repo",
+    ].join("\n");
+    assert.equal(classifyWorkspaceStatusReply(reply), "nothing-here");
   });
 
   it("reads staged/unstaged/untracked counts as uncommitted", () => {
@@ -123,10 +135,21 @@ describe("classifyWorkspaceStatusReply", () => {
     }
   });
 
+  it("treats dirty as uncommitted even when commits are also recorded", () => {
+    // Partial compliance: some work committed, some left loose. The
+    // loose part still cannot reach dependents.
+    const reply = [
+      "  1 unstaged:",
+      "    M src/b.ts",
+      "  1 commit(s) recorded here and not landed yet.",
+    ].join("\n");
+    assert.equal(classifyWorkspaceStatusReply(reply), "uncommitted");
+  });
+
   it("reads a failed probe as unknown, NOT as committed", () => {
-    // The provider prints neither line when its git query fails, on the
-    // grounds that wrongly reporting a clean tree is what makes somebody
-    // discard work. Absence must therefore never read as clean.
+    // The provider prints neither its clean nor its dirty line when its
+    // git query fails, on the grounds that wrongly reporting a clean
+    // tree is what makes somebody discard work.
     const reply = "In workspace T1 (git) at ~/ws/T1\nUse `/hydra workspace stop` to merge and return.";
     assert.equal(classifyWorkspaceStatusReply(reply), "unknown");
   });

@@ -33,6 +33,7 @@ containing a JSON object with these fields (all optional except \`summary\`):
 \`\`\`hydra-result
 {
   "summary":       "one-line description of what you accomplished",
+  "commits":       ["sha of each commit you made (isolated workspaces only)"],
   "files_changed": ["path/to/file", "..."],
   "decisions":     ["any architectural choices worth recording for later tasks"],
   "assumptions":   ["assumptions you had to make due to ambiguity in the task"],
@@ -213,12 +214,19 @@ function formatWorkspaceCommitContract(task: Task): string {
     "## Before you finish: commit",
     "",
     `You are working in an isolated workspace (\`${task.workspace.path}\`), not the`,
-    "main checkout. **Commit your changes here before emitting the result block** —",
-    "for example `git add -A && git commit -m \"<what you did>\"`.",
+    "main checkout. **Commit your work here before emitting the result block** — for",
+    "example `git add -A && git commit -m \"<what you did>\"` — and list the resulting",
+    "sha(s) in the result block's `commits` field.",
+    "",
+    "Several commits are fine and often better than one: split the work however it",
+    "reads most clearly in history. List each sha you create.",
     "",
     "This is not bookkeeping. Your work reaches the rest of the project by having",
     "this workspace's branch merged, and a merge can only carry commits. Anything",
     "you leave uncommitted will not be visible to the tasks that depend on yours.",
+    "",
+    "If you genuinely changed nothing, say so in `summary` and leave `commits` out;",
+    "that is a valid outcome and is not the same as forgetting to commit.",
   ].join("\n");
 }
 
@@ -474,6 +482,22 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       };
 
       const artifacts: TaskArtifacts = { summary };
+      // Self-reported, and treated as a claim rather than proof: the
+      // evidence that work was actually committed is the workspace's own
+      // ahead-count at completion, not these strings. Accepts either a
+      // list or a single sha, because agents write both no matter which
+      // one the schema asks for.
+      const commits =
+        typeof obj.commits === "string"
+          ? [obj.commits]
+          : stringArray("commits", obj.commits)
+            ?? (typeof obj.commit === "string" ? [obj.commit] : undefined);
+      const cleanedCommits = commits
+        ?.map((c) => c.trim())
+        .filter((c) => c.length > 0);
+      if (cleanedCommits && cleanedCommits.length > 0) {
+        artifacts.commits = cleanedCommits;
+      }
       const filesChanged = stringArray("files_changed", obj.files_changed);
       if (filesChanged) artifacts.files_changed = filesChanged;
       const decisions = stringArray("decisions", obj.decisions);
@@ -1030,6 +1054,35 @@ export function promptsFor(kind: TaskKind): PromptRegistryEntry {
     throw new Error(`No prompt registry entry for kind=${kind}`);
   }
   return entry;
+}
+
+// Nudge an isolated worker that finished without committing.
+//
+// Bounded and countdown-bearing, like a review retry: an agent told how
+// many chances remain treats the last one differently from the first.
+// Deliberately narrow — it must not re-run the task, only commit what is
+// already there — because the work exists and only its durability is in
+// question.
+export function buildCommitRepromptPrompt(task: Task, attemptsLeft: number): string {
+  return [
+    `STOP. ${task.id} still has uncommitted changes in its workspace, so the work cannot be handed to the tasks that depend on it.`,
+    ``,
+    `Do NOT redo the task and do NOT keep working. Commit what is already there:`,
+    ``,
+    "```",
+    `git add -A && git commit -m "${task.id}: ${task.title}"`,
+    "```",
+    ``,
+    `Then reply with exactly one fenced block and nothing else, listing the sha(s) you just created in \`commits\`:`,
+    ``,
+    "```hydra-result",
+    `{"summary":"<what you did>","commits":["<sha>"],"files_changed":[],"decisions":[],"assumptions":[],"follow_ups":[]}`,
+    "```",
+    ``,
+    attemptsLeft > 1
+      ? `You have ${attemptsLeft} attempts left before this task is recorded as not landed.`
+      : `This is your LAST attempt. If the workspace is still dirty after this, the task is recorded as not landed and its dependents will be held back.`,
+  ].join("\n");
 }
 
 // ── Legacy top-level exports (thin wrappers) ─────────────────────────────

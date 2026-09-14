@@ -50,7 +50,8 @@ class FakeClient extends EventEmitter implements BridgeClient {
       const text = p.prompt?.[0]?.text ?? "";
       if (text.startsWith("/hydra workspace ")) {
         const reply = text.includes("status")
-          ? (this.statusReplyFor?.(p.sessionId) ?? "  no uncommitted changes")
+          ? (this.statusReplyFor?.(p.sessionId) ??
+              "  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.")
           : this.workspaceReplyFor(p.sessionId);
         if (reply !== undefined) {
           queueMicrotask(() => {
@@ -595,22 +596,45 @@ describe("merge-on-completion — distill task's own workspace (follow-up #1)", 
 });
 
 describe("merge-on-completion — the commit contract (Phase C)", () => {
-  it("records the landing as unconfirmed when the worker left work uncommitted", async () => {
-    // A landing fast-forwards the branch, so uncommitted work has no
-    // commit to carry: it is replayed as loose edits, and the NEXT task's
-    // workspace is forked clean from HEAD and will not contain them. The
-    // merge still reports success, so without this check the board would
-    // record a landing that dependents cannot actually build on.
+  const DIRTY = "  2 unstaged:\n    M src/a.ts";
+  const COMMITTED = "  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.";
+  const NOTHING = "  no uncommitted changes\n  in sync with ~/repo";
+
+  function commitReminders() {
+    return client.requestsFor("hydra-acp/message/emit").filter((r) =>
+      JSON.stringify(r.params).includes("still has uncommitted changes"),
+    );
+  }
+
+  it("reminds a worker that finished with uncommitted work, instead of landing it", async () => {
+    // The nudge happens while the session is still live and its context
+    // still holds what it did, which is the only moment it is cheap.
     const task = workTaskWithWorkspace("T1");
     const board = makeBoard([task]);
-    primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing","files_changed":["a.ts"]}\n```');
     client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
-    client.statusReplyFor = () => "  2 unstaged:\n    M src/a.ts";
+    client.statusReplyFor = () => DIRTY;
 
     await complete(board, task);
     await settle();
 
-    assert.equal(task.status, "done");
+    assert.equal(commitReminders().length, 1, "expected one commit reminder");
+    assert.notEqual(task.status, "done", "the task must not complete while its work is uncommitted");
+  });
+
+  it("gives up after a bounded number of reminders and records it as not landed", async () => {
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing","files_changed":["a.ts"]}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.statusReplyFor = () => DIRTY;
+    // Pretend the reminders already happened.
+    getWorkerState(WORKER)!.commitRepromptCount = 2;
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(task.status, "done", "the work itself is done; only its durability is not");
     assert.equal(task.workspaceLanding?.status, "unknown");
     assert.match(task.workspaceLanding?.detail ?? "", /uncommitted/);
   });
@@ -618,14 +642,46 @@ describe("merge-on-completion — the commit contract (Phase C)", () => {
   it("records a real landing when the worker committed", async () => {
     const task = workTaskWithWorkspace("T1");
     const board = makeBoard([task]);
-    primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing","commits":["abc123"]}\n```');
     client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
-    client.statusReplyFor = () => "  no uncommitted changes";
+    client.statusReplyFor = () => COMMITTED;
 
     await complete(board, task);
     await settle();
 
     assert.equal(task.workspaceLanding?.status, "landed");
+    assert.deepEqual(task.artifacts?.commits, ["abc123"]);
+    assert.equal(commitReminders().length, 0);
+  });
+
+  it("does not nag a task that genuinely changed nothing", async () => {
+    // Clean and in sync means nothing was committed — which is the
+    // CORRECT outcome for a no-op task, and must not be confused with
+    // forgetting to commit.
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"nothing needed changing"}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.statusReplyFor = () => NOTHING;
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(commitReminders().length, 0, "a no-op task must not be nagged");
+    assert.equal(task.workspaceLanding?.status, "landed");
+  });
+
+  it("DOES chase a task that claims file changes but committed nothing", async () => {
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did it","files_changed":["a.ts"]}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.statusReplyFor = () => NOTHING;
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(commitReminders().length, 1, "claimed changes with no commit is a contradiction");
   });
 
   it("does not assume committed when the commit state cannot be read", async () => {

@@ -101,6 +101,15 @@ export type BoardState =
 
 export interface TaskArtifacts {
   files_changed?: string[];
+  // Commit shas an isolated worker reports for the work it committed in
+  // its workspace. Plural because splitting a task into several logical
+  // commits is normal and worth encouraging, and because the evidence
+  // side counts them the same way ("N commit(s) recorded here").
+  // Self-reported, like files_changed — the independent evidence is the
+  // workspace's own ahead-count (see classifyWorkspaceStatusReply).
+  // Absent for unisolated tasks, and legitimately absent for an isolated
+  // task that changed nothing.
+  commits?: string[];
   summary?: string;
   decisions?: string[];
   assumptions?: string[];

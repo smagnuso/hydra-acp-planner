@@ -144,7 +144,7 @@ import {
   sweepLineConcurrencyCap,
 } from "./decomposition.js";
 import type { NormalizedResult } from "./task.js";
-import { promptsFor } from "./task.js";
+import { buildCommitRepromptPrompt, promptsFor } from "./task.js";
 import {
   clearOrchestratorState,
   clearWorkerState,
@@ -386,6 +386,11 @@ const workerForwarders = new Map<string, WorkerForwarder>();
 // is typically already cleared.
 const pendingWorkspaceReplies = new Map<string, (text: string) => void>();
 
+// How many times an isolated worker is reminded to commit before the
+// task is recorded as not landed. Mirrors the bounded-retry posture of
+// review rejection: recoverable, but not indefinitely.
+const COMMIT_REPROMPT_LIMIT = 2;
+
 // Pull the text out of a session/update notification IF it's a
 // hydra-emitted synthetic reply (emitExtensionReply on the daemon side —
 // used for every `/hydra ...` slash-command reply, not just workspace
@@ -441,22 +446,46 @@ export function classifyMergeReply(
   return { status: "unknown", detail: reply, at };
 }
 
-// Read a `/hydra workspace status` reply for whether the agent left
-// anything uncommitted.
+// Read a `/hydra workspace status` reply for what the workspace says
+// about the agent's work.
 //
-// Three outcomes, not two. The git provider prints "no uncommitted
-// changes" when clean and an "N staged, M unstaged, K untracked:" line
-// when not — but when its probe FAILS it deliberately prints neither,
-// because (in its own words) "no uncommitted changes is the one wrong
-// answer that would make somebody discard work." So absence of the dirty
-// line cannot be read as clean; that case is "unknown" and callers must
-// not act on it as if the tree were committed.
+// Four outcomes, because two of them are easy to conflate and the
+// difference matters:
+//
+//   committed        clean tree AND commits recorded here — the work is
+//                    durable and a landing can carry it.
+//   uncommitted      the tree is dirty; a landing would replay loose
+//                    edits that the next clean fork cannot see.
+//   nothing-here     clean tree and in sync with the source — nothing
+//                    was committed. LEGITIMATE for a task that genuinely
+//                    changed nothing, and a silent disaster for one that
+//                    thinks it did work, so the caller has to decide
+//                    using what the task claims it changed.
+//   unknown          the provider could not say. It prints neither its
+//                    clean line nor its dirty line when its git probe
+//                    fails, precisely because (in its own words) "no
+//                    uncommitted changes is the one wrong answer that
+//                    would make somebody discard work". Absence is
+//                    therefore never read as clean.
+export type WorkspaceCommitState =
+  | "committed"
+  | "uncommitted"
+  | "nothing-here"
+  | "unknown";
+
 export function classifyWorkspaceStatusReply(
   reply: string | undefined,
-): "committed" | "uncommitted" | "unknown" {
+): WorkspaceCommitState {
   if (reply === undefined) return "unknown";
+  // Dirty wins over everything: a tree with uncommitted changes is not
+  // durable regardless of what else it has recorded.
   if (/^\s*\d+ (staged|unstaged|untracked)/m.test(reply)) return "uncommitted";
-  if (reply.includes("no uncommitted changes")) return "committed";
+  if (!reply.includes("no uncommitted changes")) return "unknown";
+  // Clean. Now: did anything actually get committed HERE?
+  if (/^\s*\d+ commit\(s\) recorded here and not landed yet/m.test(reply)) {
+    return "committed";
+  }
+  if (reply.includes("in sync with")) return "nothing-here";
   return "unknown";
 }
 
@@ -5247,6 +5276,41 @@ export class PlannerBridge {
       await this.auditTaskDiff(task, result.artifacts, workerSessionId, orchestratorSessionId);
     }
 
+    // Commit gate for isolated work. A landing fast-forwards the branch,
+    // so uncommitted work has no commit to carry: it is replayed loose
+    // and the next task's clean fork cannot see it. Nudge the worker
+    // while its session is still live and its context still holds what
+    // it did — a bounded countdown, like a review retry, because an
+    // agent told how many chances remain treats the last one
+    // differently from the first.
+    if (task.workspace && workerSessionId !== "orchestrator" && (task.kind ?? "work") === "work") {
+      const committed = await this.verifyWorkspaceCommitted(workerSessionId);
+      const claimsChanges = (result.artifacts.files_changed?.length ?? 0) > 0;
+      // "nothing-here" is only a problem when the task thinks it did
+      // something. A task that genuinely changed nothing is a valid
+      // outcome and must not be nagged into inventing a commit.
+      const needsCommit =
+        committed === "uncommitted" || (committed === "nothing-here" && claimsChanges);
+      if (needsCommit) {
+        const used = workerState.commitRepromptCount ?? 0;
+        if (used < COMMIT_REPROMPT_LIMIT) {
+          workerState.commitRepromptCount = used + 1;
+          workerState.resultAccumulator = "";
+          this.repromptForCommit(
+            orchestratorSessionId,
+            workerSessionId,
+            board,
+            task,
+            COMMIT_REPROMPT_LIMIT - used,
+          );
+          return;
+        }
+        log.warn(
+          `task ${task.id}: still uncommitted after ${COMMIT_REPROMPT_LIMIT} reminder(s); its work will not reach dependents`,
+        );
+      }
+    }
+
     const taskKind = task.kind ?? 'work';
 
     if (taskKind === 'review') {
@@ -6977,13 +7041,20 @@ export class PlannerBridge {
     // will not contain them. The merge still happens (withholding the
     // work entirely would be worse), but the outcome is NOT a landing
     // any dependent can build on, and must not be recorded as one.
-    const statusReply = await this.sendWorkspaceCommand(workerSessionId, "status");
-    const committed = classifyWorkspaceStatusReply(statusReply);
+    const committed = await this.verifyWorkspaceCommitted(workerSessionId);
 
     const reply = await this.sendWorkspaceCommand(workerSessionId, "merge");
     const landing = classifyMergeReply(reply);
 
-    if (landing.status === "landed" && committed !== "committed") {
+    // "nothing-here" is a clean pass: the task committed nothing because
+    // it changed nothing, and a landing that carries nothing is exactly
+    // right. Only genuinely-uncommitted work, or a state we could not
+    // read, undercuts a reported success.
+    if (
+      landing.status === "landed" &&
+      committed !== "committed" &&
+      committed !== "nothing-here"
+    ) {
       const why =
         committed === "uncommitted"
           ? "the worker left changes uncommitted in its workspace, so they were replayed as loose edits rather than landed as commits — tasks depending on this one would not see them"
@@ -6997,6 +7068,69 @@ export class PlannerBridge {
       return;
     }
     task.workspaceLanding = landing;
+  }
+
+  // Ask a worker's workspace what it has, so the answer is evidence
+  // rather than the agent's own account of itself.
+  private async verifyWorkspaceCommitted(
+    workerSessionId: string,
+  ): Promise<WorkspaceCommitState> {
+    const reply = await this.sendWorkspaceCommand(workerSessionId, "status");
+    return classifyWorkspaceStatusReply(reply);
+  }
+
+  // Nudge an isolated worker that finished without committing. Same
+  // shape as repromptForResultBlock: emit a turn, then re-enter
+  // handleTaskComplete when it finishes, with a separate budget so a
+  // worker that needed a result-block nudge has not thereby spent its
+  // commit reminders.
+  private repromptForCommit(
+    orchestratorSessionId: string,
+    workerSessionId: string,
+    board: Board,
+    task: Task,
+    attemptsLeft: number,
+  ): void {
+    log.info(
+      `reminding worker …${workerSessionId.slice(-8)} to commit ${task.id} (${attemptsLeft} attempt(s) left)`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${task.id} finished with uncommitted work in its workspace; asking ${shortSessionId(workerSessionId)} to commit (${attemptsLeft} attempt(s) left)`,
+      { event: "task-commit-reprompt", taskId: task.id },
+    );
+    void (async () => {
+      try {
+        await this.client.request("hydra-acp/message/emit", {
+          sessionId: workerSessionId,
+          method: "session/prompt",
+          envelope: buildTextPromptEnvelope({
+            sessionId: workerSessionId,
+            text: buildCommitRepromptPrompt(task, attemptsLeft),
+            ancillary: true,
+          }),
+          route: "queue",
+        });
+      } catch (err) {
+        if (this.isShutdownError(err)) {
+          log.info(`commit reminder for ${task.id} aborted (shutdown)`);
+          return;
+        }
+        log.error(
+          `commit reminder for ${task.id} on worker ${workerSessionId} failed: ${(err as Error).message}`,
+        );
+        this.handleTaskFailure(
+          orchestratorSessionId,
+          workerSessionId,
+          board,
+          task,
+          `commit reminder turn failed: ${(err as Error).message}`,
+        );
+        return;
+      }
+      if (this.shuttingDown) return;
+      await this.handleTaskComplete(orchestratorSessionId, workerSessionId, board, task);
+    })();
   }
 
   // Discard a superseded task's workspace (a competition loser, or a
