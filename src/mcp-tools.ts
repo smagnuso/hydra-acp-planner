@@ -188,6 +188,24 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
             },
           },
         },
+        isolation: {
+          type: "object",
+          description:
+            "Optional, plan-level only (no per-task override). Runs each task's worker in its own isolated workspace instead of the shared checkout, merging its work back automatically once the task completes and is reviewed. Off by default — every existing plan behaves unchanged. Turn on when the user asks for isolated/parallel-safe workers. A merge that can't land cleanly (the source moved on) does NOT fail the task — it's surfaced via get_findings with instructions to resolve by hand, and the worker session is kept open until then.",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["off", "per-task"],
+              description:
+                "'off' (default): no isolation, today's shared-tree behavior. 'per-task': every task's worker gets its own workspace.",
+            },
+            required: {
+              type: "boolean",
+              description:
+                "Optional, defaults to false (fail-open: isolation failure falls back to the shared tree). Set true to fail the spawn outright instead of silently falling back to one shared tree.",
+            },
+          },
+        },
         contractBrief: {
           type: "string",
           description:

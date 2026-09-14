@@ -100,6 +100,7 @@ import {
   newBoard,
   nowIso,
   parseFleetDefaultsFromObject,
+  parseIsolationFromObject,
   pickEligible,
   resolveAgent,
   resolveModel,
@@ -7229,6 +7230,11 @@ export class PlannerBridge {
       boardReviewPolicy = undefined;
     }
 
+    // Parse isolation from tool args. Delegated to parseIsolationFromObject
+    // (board.ts) so the lenient-parsing posture matches fleetDefaults/
+    // reviewPolicy and stays unit-testable without the bridge.
+    const boardIsolation = parseIsolationFromObject(args.isolation);
+
     const contractBriefRaw = args.contractBrief;
     const contractBrief =
       typeof contractBriefRaw === "string" && contractBriefRaw.trim().length > 0
@@ -7247,6 +7253,9 @@ export class PlannerBridge {
     await this.seedOrchestratorIdentity(board, sessionId);
     if (boardReviewPolicy) {
       board.reviewPolicy = boardReviewPolicy;
+    }
+    if (boardIsolation) {
+      board.isolation = boardIsolation;
     }
     board.pendingExecute = false; // ready, awaiting start
     boards.set(sessionId, board);

@@ -16,6 +16,7 @@ import {
   newBoard,
   newProjectId,
   parseFleetDefaultsFromObject,
+  parseIsolationFromObject,
   pickEligible,
   resolveAgent,
   resolveModel,
@@ -598,8 +599,8 @@ describe("listProjects", () => {
 });
 
 describe("BOARD_SCHEMA_VERSION", () => {
-  it("is 4 after workerSessions history addition", () => {
-    assert.equal(BOARD_SCHEMA_VERSION, 4);
+  it("is 5 after workspace isolation fields", () => {
+    assert.equal(BOARD_SCHEMA_VERSION, 5);
   });
 });
 
@@ -682,6 +683,20 @@ describe("schema migration v1 → v2", () => {
     assert.deepEqual(loaded!.tasks[0]!.workerSessions, []);
   });
 
+  it("v4 → v5 loads with isolation/workspace absent and behaves as isolation off", () => {
+    const b = makeV1Board();
+    b.version = 4;
+    b.tasks[0]!.workerSessions = [];
+    saveBoard(b, "s_mig_v5");
+    const loaded = loadBoard(b.projectId);
+    assert.ok(loaded);
+    assert.equal(loaded!.version, BOARD_SCHEMA_VERSION);
+    assert.equal(loaded!.isolation, undefined);
+    assert.equal(loaded!.tasks[0]!.workspace, undefined);
+    assert.equal(loaded!.tasks[0]!.workspaceError, undefined);
+    assert.equal(loaded!.tasks[0]!.workspaceLanding, undefined);
+  });
+
   it("does not re-migrate a board already at current version", () => {
     const b = newBoard({ description: "vN" });
     saveBoard(b, "s_mig_vN");
@@ -692,6 +707,44 @@ describe("schema migration v1 → v2", () => {
     loaded = loadBoard(b.projectId);
     assert.ok(loaded);
     assert.equal(loaded!.version, BOARD_SCHEMA_VERSION);
+  });
+});
+
+describe("parseIsolationFromObject", () => {
+  it("returns undefined for undefined/non-object/malformed input", () => {
+    assert.equal(parseIsolationFromObject(undefined), undefined);
+    assert.equal(parseIsolationFromObject("per-task"), undefined);
+    assert.equal(parseIsolationFromObject([]), undefined);
+    assert.equal(parseIsolationFromObject({ mode: "bogus" }), undefined);
+    assert.equal(parseIsolationFromObject({}), undefined);
+  });
+
+  it("parses mode without required", () => {
+    assert.deepEqual(parseIsolationFromObject({ mode: "off" }), { mode: "off" });
+    assert.deepEqual(parseIsolationFromObject({ mode: "per-task" }), { mode: "per-task" });
+  });
+
+  it("parses required only when explicitly true; drops non-boolean junk", () => {
+    assert.deepEqual(
+      parseIsolationFromObject({ mode: "per-task", required: true }),
+      { mode: "per-task", required: true },
+    );
+    assert.deepEqual(
+      parseIsolationFromObject({ mode: "per-task", required: false }),
+      { mode: "per-task" },
+    );
+    assert.deepEqual(
+      parseIsolationFromObject({ mode: "per-task", required: "yes" }),
+      { mode: "per-task" },
+    );
+  });
+
+  it("set_plan public config surface routes isolation onto the board and survives forkBoard", () => {
+    const isolation = parseIsolationFromObject({ mode: "per-task", required: true });
+    const board = newBoard({ description: "isolation config surface" });
+    board.isolation = isolation;
+    const forked = forkBoard({ source: board });
+    assert.deepEqual(forked.isolation, { mode: "per-task", required: true });
   });
 });
 

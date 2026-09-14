@@ -8,7 +8,7 @@ import {
   projectsDir,
 } from "./paths.js";
 
-export const BOARD_SCHEMA_VERSION = 4;
+export const BOARD_SCHEMA_VERSION = 5;
 
 export type TaskStatus =
   | "pending"
@@ -205,6 +205,35 @@ export interface Task {
   // relevant for orchestrator-lane reviews where the host session can
   // patch artifacts without spawning a new worker.
   canApplyFixes?: boolean;
+  // Set when the task's worker was spawned with isolation
+  // (board.isolation.mode === "per-task") and the daemon reported a
+  // workspace back on hydra-acp/child_session/spawn's response
+  // (_meta.workspaceInfo). Absent means the task ran directly in the
+  // shared source tree — either isolation was off for this board, or
+  // the daemon fell back (fail-open; see workspaceError below).
+  workspace?: {
+    path: string;
+    sourceCwd: string;
+    label: string;
+    provider: string;
+  };
+  // Set instead of (or alongside a fallback without) `workspace` when
+  // isolation was requested but the daemon could not honor it and fell
+  // back to the shared tree (isolation.required unset/false). When
+  // isolation.required is true, a failure instead fails the spawn
+  // outright, so this field is the fail-open counterpart of that.
+  workspaceError?: string;
+  // Outcome of the merge-on-completion attempt for this task's
+  // workspace. Absent until a merge is attempted. "skipped" covers
+  // tasks that never had a workspace to merge (isolation off, or
+  // fail-open with no workspace). "declined"/"unknown" mean the task's
+  // work may still be sitting only in the (still-open) worker's
+  // workspace — see get_findings.
+  workspaceLanding?: {
+    status: "landed" | "declined" | "unknown" | "skipped";
+    detail?: string;
+    at: string;
+  };
 }
 
 // A single entry in a worker's internal todolist as observed by the
@@ -440,6 +469,19 @@ export interface Board {
     overrideHint?: boolean;
     maxAttempts?: number;
   };
+  // Opt-in per-task workspace isolation (see docs/worktree-isolation-planner.md,
+  // superseded by the workspace-isolation implementation plan). Absent
+  // means "off" — old boards have this absent and behave unchanged.
+  // `required` mirrors the daemon's own WorkspaceRequestMeta.required:
+  // false (default) is fail-open, so isolation failure falls back to
+  // the shared tree instead of failing the spawn. Plan-level only —
+  // deliberately no per-task override (propagating one through a task's
+  // transitive downstream closure is the mistake an earlier draft of
+  // the isolation design made and rejected).
+  isolation?: {
+    mode: "off" | "per-task";
+    required?: boolean;
+  };
   tasks: Task[];
   workers: Record<string, {
     currentTaskId: string | null;
@@ -656,9 +698,9 @@ export function findTaskById(board: Board, taskId: string): Task | undefined {
 // user reviews and explicitly issues `/hydra planner start`.
 //
 // `concurrencyCap` and `concurrencyCapLocked` carry over. Review
-// policy, fleet defaults, contract brief, and attachments are
-// preserved. orchestratorAgent/Model are dropped — they'll be re-
-// seeded from the new owning session.
+// policy, isolation policy, fleet defaults, contract brief, and
+// attachments are preserved. orchestratorAgent/Model are dropped —
+// they'll be re-seeded from the new owning session.
 export function forkBoard(opts: {
   source: Board;
   description?: string;
@@ -682,6 +724,7 @@ export function forkBoard(opts: {
       ...(src.fleetDefaults.distill ? { distill: { ...src.fleetDefaults.distill } } : {}),
     },
     reviewPolicy: src.reviewPolicy ? { ...src.reviewPolicy } : undefined,
+    isolation: src.isolation ? { ...src.isolation } : undefined,
     tasks: src.tasks.map((t) => ({
       id: t.id,
       title: t.title,
@@ -767,6 +810,23 @@ export function parseFleetDefaultsFromObject(raw: unknown): FleetDefaults {
   return fd;
 }
 
+// Parse an isolation blob from the public config surface (MCP set_plan
+// tool args). Same lenient posture as parseFleetDefaultsFromObject:
+// unknown keys and bad types are dropped rather than rejected.
+// Returns undefined for anything that isn't a well-formed request for
+// isolation, which set_plan treats the same as "not provided" (mode
+// "off", the pre-isolation default).
+export function parseIsolationFromObject(
+  raw: unknown,
+): Board["isolation"] | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.mode !== "off" && r.mode !== "per-task") return undefined;
+  const isolation: NonNullable<Board["isolation"]> = { mode: r.mode };
+  if (r.required === true) isolation.required = true;
+  return isolation;
+}
+
 export function newBoard(opts: {
   description: string;
   fleetDefaults?: FleetDefaults;
@@ -831,6 +891,14 @@ function migrateBoard(b: Board): void {
       }
     }
     b.version = 4;
+  }
+  // v4 → v5: introduce opt-in per-task workspace isolation
+  // (board.isolation, Task.workspace/workspaceError/workspaceLanding).
+  // Purely additive — every new field is optional and `isolation`
+  // absent means "off", which is exactly today's shared-tree behavior.
+  // Nothing to backfill.
+  if (b.version < 5) {
+    b.version = 5;
   }
 }
 
