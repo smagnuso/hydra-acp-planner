@@ -149,6 +149,8 @@ function seedBoard(
       ...(t.artifacts !== undefined ? { artifacts: t.artifacts } : {}),
       ...(t.startedAt !== undefined ? { startedAt: t.startedAt } : {}),
       ...(t.finishedAt !== undefined ? { finishedAt: t.finishedAt } : {}),
+      ...(t.kind !== undefined ? { kind: t.kind } : {}),
+      ...(t.reviews !== undefined ? { reviews: t.reviews } : {}),
     }),
   );
   boards.set(sessionId, b);
@@ -406,6 +408,50 @@ describe("worker attach — no transformer/attach for spawned workers", () => {
       const task1 = boards.get("hydra_session_test")!.tasks.find((t) => t.id === "T1")!;
       assert.equal(task1.workspace, undefined);
       assert.equal(task1.workspaceError, "not a git repository");
+    },
+  );
+
+  it(
+    "spawnTaskOnNewWorker: competition candidates always request required:true, even when board.isolation.required is unset",
+    async () => {
+      const board = seedBoard("hydra_session_test", {
+        state: "ready",
+        cap: 2,
+        tasks: [
+          { id: "T1", title: "candidate 1", status: "pending", deps: [] },
+          { id: "T2", title: "candidate 2", status: "pending", deps: [] },
+          {
+            id: "R1",
+            title: "competition review",
+            status: "pending",
+            deps: ["T1", "T2"],
+            kind: "review",
+            reviews: ["T1", "T2"],
+          },
+        ],
+      });
+      board.isolation = { mode: "per-task" }; // required left unset (defaults false for ordinary tasks)
+      saveBoard(board, "hydra_session_test");
+
+      let n = 0;
+      client.responders.set("hydra-acp/child_session/spawn", () => ({
+        childSessionId: `hydra_session_worker_comp_${n++}`,
+      }));
+
+      dispatch(mkInvoke(16, "start", {}));
+      await settle(7);
+
+      const spawns = client.requestsFor("hydra-acp/child_session/spawn");
+      assert.equal(spawns.length, 2, "both competition candidates should have spawned");
+      for (const s of spawns) {
+        const meta = (s.params as { _meta?: { "hydra-acp"?: { workspace?: Record<string, unknown> } } })
+          ._meta?.["hydra-acp"];
+        assert.equal(meta?.workspace?.required, true, "competition candidate must request required:true");
+        assert.ok(
+          meta?.workspace?.label === "T1" || meta?.workspace?.label === "T2",
+          "workspace label should be the candidate's own task id",
+        );
+      }
     },
   );
 });

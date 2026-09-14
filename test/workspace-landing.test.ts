@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { classifyMergeReply } from "../src/bridge.ts";
+import { classifyMergeReply, classifyDiscardReply } from "../src/bridge.ts";
 
 // Unit tests for classifyMergeReply against the exact, hardcoded reply
 // prefixes the daemon emits for `/hydra workspace merge`:
@@ -59,5 +59,26 @@ describe("classifyMergeReply", () => {
     // positive risk this function deliberately refuses to take.
     const result = classifyMergeReply("The worker merged some files earlier in the turn.");
     assert.equal(result.status, "unknown");
+  });
+});
+
+describe("classifyDiscardReply", () => {
+  it("classifies a successful discard as ok, keeping the full reply as detail", () => {
+    const reply = "Discarded ~/.hydra-acp/workspaces/abc/T2 and its branch hydra/T2";
+    const result = classifyDiscardReply(reply);
+    assert.equal(result.ok, true);
+    assert.equal(result.detail, reply);
+  });
+
+  it("classifies a failed discard as not ok, stripping the daemon's fixed prefix from detail", () => {
+    const result = classifyDiscardReply("Workspace discard failed: workspace is shared with another session");
+    assert.equal(result.ok, false);
+    assert.equal(result.detail, "workspace is shared with another session");
+  });
+
+  it("classifies an unrecognized reply or no reply as not ok", () => {
+    assert.equal(classifyDiscardReply("some unrelated text").ok, false);
+    assert.equal(classifyDiscardReply(undefined).ok, false);
+    assert.equal(classifyDiscardReply(undefined).detail, "no reply received");
   });
 });

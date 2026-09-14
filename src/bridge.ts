@@ -426,6 +426,27 @@ export function classifyMergeReply(
   return { status: "unknown", detail: reply, at };
 }
 
+// Classify a `/hydra workspace discard` reply (competition losers).
+// Same hardcoded-prefix posture as classifyMergeReply, but discard
+// failure is cosmetic (leftover disk, not lost work — see the discard
+// branch of runWorkspaceAction in cli/src/core/session-manager.ts), so
+// callers should log-and-continue on a non-`ok` result rather than
+// treat it as blocking.
+export function classifyDiscardReply(
+  reply: string | undefined,
+): { ok: boolean; detail: string } {
+  if (reply === undefined) {
+    return { ok: false, detail: "no reply received" };
+  }
+  if (reply.startsWith("Discarded ")) {
+    return { ok: true, detail: reply };
+  }
+  if (reply.startsWith("Workspace discard failed: ")) {
+    return { ok: false, detail: reply.slice("Workspace discard failed: ".length) };
+  }
+  return { ok: false, detail: reply };
+}
+
 // Tracks in-flight commands/invoke dispatches keyed by the daemon-
 // assigned messageId. Set when handleCommandsInvoke receives the
 // request, cleared when it finishes. The `cancelled` flag is set by
@@ -4601,11 +4622,23 @@ export class PlannerBridge {
       // awaiting mergeTaskWorkspace before scheduling dependents (see
       // handleTaskComplete/finishReview) is what keeps that current
       // state meaning "this task's deps already landed."
+      // Competition candidates always request required:true, regardless
+      // of board.isolation.required — a silent fallback would put every
+      // candidate back in one shared tree, exactly the interleaving-edits
+      // soundness bug isolation exists to fix for this lane (see
+      // docs/worktree-isolation-planner.md's motivating bug).
+      // findReviewedTask finds the review even though it's still
+      // "pending" at spawn time (its deps — the candidates — aren't
+      // done yet); reviews is only an array (vs. a bare string) for a
+      // multi-candidate competition review.
+      const competitionReview = this.findReviewedTask(task.id, board);
+      const isCompetitionCandidate =
+        Array.isArray(competitionReview?.reviews) && competitionReview.reviews.length > 1;
       const workspaceRequest =
         board.isolation?.mode === "per-task"
           ? {
               label: task.id,
-              ...(board.isolation.required ? { required: true } : {}),
+              ...(isCompetitionCandidate || board.isolation.required ? { required: true } : {}),
             }
           : undefined;
       const spawnParams: Record<string, unknown> = {
@@ -6074,6 +6107,21 @@ export class PlannerBridge {
           `${id} superseded by ${winnerId}`,
           { event: "task-superseded", taskId: id },
         );
+        // Discard the loser's isolated workspace (and close its worker)
+        // before moving on — this is what actually deletes the losing
+        // candidate's tree rather than just leaving it to rot. A task
+        // with no workspace (unisolated competition, today's unchanged
+        // behavior) is left exactly as before: superseded, worker open.
+        if (other.workspace) {
+          await this.discardTaskWorkspace(other, orchestratorSessionId);
+          const loserWorkerSessionId = other.workerSessions?.at(-1);
+          if (loserWorkerSessionId) {
+            this.endWorkerForward(loserWorkerSessionId, { flush: true });
+            clearWorkerState(loserWorkerSessionId);
+            unregisterWorker(loserWorkerSessionId);
+            void this.closeWorker(loserWorkerSessionId);
+          }
+        }
       }
     } else {
       // No valid winner ID — treat all reviewees as failed.
@@ -6804,6 +6852,31 @@ export class PlannerBridge {
     }
     const reply = await this.sendWorkspaceCommand(workerSessionId, "merge");
     task.workspaceLanding = classifyMergeReply(reply);
+  }
+
+  // Discard a competition loser's workspace once it's been superseded —
+  // this is what actually fixes the competition soundness bug (deleting
+  // the losers' trees, not just relocating the "N candidates share one
+  // tree" problem). No-op for a task with no workspace (nothing to
+  // discard — the ordinary, unisolated-competition case, unchanged by
+  // this). Discard failure is cosmetic (leftover disk, not lost work —
+  // the winner already merged independently), so this only logs and
+  // emits a synthetic note; it must never block or throw into the
+  // caller's supersede loop.
+  private async discardTaskWorkspace(task: Task, orchestratorSessionId: string): Promise<void> {
+    if (!task.workspace) return;
+    const workerSessionId = task.workerSessions?.at(-1);
+    if (!workerSessionId) return;
+    const reply = await this.sendWorkspaceCommand(workerSessionId, "discard");
+    const result = classifyDiscardReply(reply);
+    if (!result.ok) {
+      log.warn(`task ${task.id}: workspace discard did not confirm: ${result.detail}`);
+      void this.emitSyntheticMessage(
+        orchestratorSessionId,
+        `competition loser ${task.id}'s workspace could not be discarded automatically (${result.detail}); it will be cleaned up the next time \`hydra workspace prune\` runs.`,
+        { event: "task-workspace-discard-failed", taskId: task.id },
+      );
+    }
   }
 
   // Synthetic progress messages get wrapped with leading + trailing

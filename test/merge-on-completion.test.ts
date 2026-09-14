@@ -242,6 +242,137 @@ describe("merge-on-completion — handleTaskComplete → markTaskDone → mergeT
   });
 });
 
+describe("merge-on-completion — competition winner/loser workspace cleanup (Phase 4)", () => {
+  const WINNER = "hydra_session_worker_winner";
+  const LOSER = "hydra_session_worker_loser";
+
+  function competitionBoard(): { board: Board; winnerTask: Task; loserTask: Task; reviewTask: Task } {
+    const winnerTask = workTaskWithWorkspace("T1", {
+      status: "awaiting_review",
+      assignedTo: WINNER,
+      workerSessions: [WINNER],
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/abc/T1",
+        sourceCwd: "/home/u/repo",
+        label: "T1",
+        provider: "git",
+      },
+    });
+    const loserTask = workTaskWithWorkspace("T2", {
+      status: "awaiting_review",
+      assignedTo: LOSER,
+      workerSessions: [LOSER],
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/abc/T2",
+        sourceCwd: "/home/u/repo",
+        label: "T2",
+        provider: "git",
+      },
+    });
+    const reviewTask: Task = {
+      id: "R1",
+      title: "competition review",
+      deps: ["T1", "T2"],
+      status: "assigned",
+      assignedTo: "orchestrator",
+      attemptCount: 0,
+      kind: "review",
+      reviews: ["T1", "T2"],
+    };
+    const board = newBoard({ description: "competition", concurrencyCap: 2 });
+    board.state = "running";
+    board.isolation = { mode: "per-task" };
+    board.tasks = [winnerTask, loserTask, reviewTask];
+    board.workers[WINNER] = { currentTaskId: "T1", tasksCompleted: [] };
+    board.workers[LOSER] = { currentTaskId: "T2", tasksCompleted: [] };
+    boards.set(ORCH, board);
+    saveBoard(board, ORCH);
+    return { board, winnerTask, loserTask, reviewTask };
+  }
+
+  it("winner's workspace lands, loser's workspace is discarded and its worker closed", async () => {
+    const { board, winnerTask, loserTask, reviewTask } = competitionBoard();
+    client.workspaceReplyFor = (sessionId) => {
+      if (sessionId === WINNER) return "Merged hydra/T1 into ~/repo";
+      if (sessionId === LOSER) return "Discarded ~/.hydra-acp/workspaces/abc/T2 and its branch hydra/T2";
+      return undefined;
+    };
+
+    await (bridge as unknown as {
+      handleReviewWinner: (
+        reviewTask: Task,
+        normalized: { artifacts: Record<string, unknown>; warnings: string[] },
+        notes: string,
+        board: Board,
+        orch: string,
+      ) => Promise<void>;
+    }).handleReviewWinner(
+      reviewTask,
+      { artifacts: { review_decision: "winner", winner: "T1", notes: "T1 wins" }, warnings: [] },
+      "T1 wins",
+      board,
+      ORCH,
+    );
+    await settle();
+
+    assert.equal(winnerTask.status, "done");
+    assert.equal(winnerTask.workspaceLanding?.status, "landed");
+    assert.equal(loserTask.status, "superseded");
+
+    const discardPrompt = client.requestsFor("session/prompt").find((r) => {
+      const p = r.params as { sessionId?: string; prompt?: Array<{ text?: string }> };
+      return p.sessionId === LOSER && p.prompt?.[0]?.text === "/hydra workspace discard";
+    });
+    assert.ok(discardPrompt, "expected a /hydra workspace discard sent to the loser's worker");
+
+    const closes = client.requestsFor("hydra-acp/child_session/close");
+    assert.ok(
+      closes.some((r) => (r.params as { childSessionId?: string }).childSessionId === LOSER),
+      "loser's worker should be closed after a confirmed discard",
+    );
+  });
+
+  it("a discard refusal is cosmetic — logs a synthetic note but does not block or throw", async () => {
+    const { board, winnerTask, loserTask, reviewTask } = competitionBoard();
+    client.workspaceReplyFor = (sessionId) => {
+      if (sessionId === WINNER) return "Merged hydra/T1 into ~/repo";
+      if (sessionId === LOSER) return "Workspace discard failed: workspace is shared with another session";
+      return undefined;
+    };
+
+    await (bridge as unknown as {
+      handleReviewWinner: (
+        reviewTask: Task,
+        normalized: { artifacts: Record<string, unknown>; warnings: string[] },
+        notes: string,
+        board: Board,
+        orch: string,
+      ) => Promise<void>;
+    }).handleReviewWinner(
+      reviewTask,
+      { artifacts: { review_decision: "winner", winner: "T1", notes: "T1 wins" }, warnings: [] },
+      "T1 wins",
+      board,
+      ORCH,
+    );
+    await settle();
+
+    // Winner still lands correctly — a loser's discard failure must
+    // never block the winner's own merge.
+    assert.equal(winnerTask.status, "done");
+    assert.equal(winnerTask.workspaceLanding?.status, "landed");
+    assert.equal(loserTask.status, "superseded");
+
+    // Discard was still attempted even though it failed.
+    assert.ok(
+      client.requestsFor("session/prompt").some((r) => {
+        const p = r.params as { sessionId?: string; prompt?: Array<{ text?: string }> };
+        return p.sessionId === LOSER && p.prompt?.[0]?.text === "/hydra workspace discard";
+      }),
+    );
+  });
+});
+
 describe("merge-on-completion — review approval path (finishReview)", () => {
   it("approve: lands the reviewed task's workspace via finishReview before the reviewed task is done", async () => {
     const reviewedTask = workTaskWithWorkspace("T1", { status: "awaiting_review" });
