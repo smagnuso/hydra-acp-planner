@@ -5807,6 +5807,13 @@ export class PlannerBridge {
         `${distillTask.id} distilled merge of [${reviewIdsStr}] (informational; reviewees untouched)`,
         { event: "task-distill-authored", taskId: distillTask.id },
       );
+      // The distill task itself can be isolated (spawnTaskOnNewWorker
+      // requests a workspace by board.isolation.mode, not by task kind),
+      // even though its job here is to read and report, not edit. Land
+      // it the same as any other "done" task — a no-op fast-forward if
+      // it made no edits, a real merge if it did.
+      await this.mergeTaskWorkspace(distillTask);
+      saveBoard(board, orchestratorSessionId);
       return;
     }
 
@@ -5880,7 +5887,13 @@ export class PlannerBridge {
           `${id} superseded by ${appliedWinner}`,
           { event: "task-superseded", taskId: id },
         );
+        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId);
       }
+      // finishReview already merged winnerTask's workspace and set
+      // distillTask.status = "done" (it's the "reviewTask" in that
+      // call). It does NOT merge the reviewTask's own workspace — that's
+      // this line's job, same as every other "done" task.
+      await this.mergeTaskWorkspace(distillTask);
       saveBoard(board, orchestratorSessionId);
       this.emitPlanUpdate(orchestratorSessionId, board);
       return;
@@ -5913,6 +5926,7 @@ export class PlannerBridge {
           `${id} superseded by ${distillTask.id} ${recommended}`,
           { event: "task-superseded", taskId: id },
         );
+        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId);
       }
 
       const newWorkId = `${distillTask.id}w`;
@@ -5950,6 +5964,7 @@ export class PlannerBridge {
       distillTask.status = "done";
       distillTask.finishedAt = nowIso();
       distillTask.assignedTo = null;
+      await this.mergeTaskWorkspace(distillTask);
       saveBoard(board, orchestratorSessionId);
       this.emitPlanUpdate(orchestratorSessionId, board);
 
@@ -6112,16 +6127,7 @@ export class PlannerBridge {
         // candidate's tree rather than just leaving it to rot. A task
         // with no workspace (unisolated competition, today's unchanged
         // behavior) is left exactly as before: superseded, worker open.
-        if (other.workspace) {
-          await this.discardTaskWorkspace(other, orchestratorSessionId);
-          const loserWorkerSessionId = other.workerSessions?.at(-1);
-          if (loserWorkerSessionId) {
-            this.endWorkerForward(loserWorkerSessionId, { flush: true });
-            clearWorkerState(loserWorkerSessionId);
-            unregisterWorker(loserWorkerSessionId);
-            void this.closeWorker(loserWorkerSessionId);
-          }
-        }
+        await this.discardSupersededTaskWorkspace(other, orchestratorSessionId);
       }
     } else {
       // No valid winner ID — treat all reviewees as failed.
@@ -6854,13 +6860,14 @@ export class PlannerBridge {
     task.workspaceLanding = classifyMergeReply(reply);
   }
 
-  // Discard a competition loser's workspace once it's been superseded —
+  // Discard a superseded task's workspace (a competition loser, or a
+  // reviewee superseded by a distill's rework/apply-winner decision) —
   // this is what actually fixes the competition soundness bug (deleting
-  // the losers' trees, not just relocating the "N candidates share one
+  // the loser's tree, not just relocating the "N candidates share one
   // tree" problem). No-op for a task with no workspace (nothing to
-  // discard — the ordinary, unisolated-competition case, unchanged by
-  // this). Discard failure is cosmetic (leftover disk, not lost work —
-  // the winner already merged independently), so this only logs and
+  // discard — the ordinary, unisolated case, unchanged by this). Discard
+  // failure is cosmetic (leftover disk, not lost work — the winning/
+  // surviving task already merged independently), so this only logs and
   // emits a synthetic note; it must never block or throw into the
   // caller's supersede loop.
   private async discardTaskWorkspace(task: Task, orchestratorSessionId: string): Promise<void> {
@@ -6873,10 +6880,30 @@ export class PlannerBridge {
       log.warn(`task ${task.id}: workspace discard did not confirm: ${result.detail}`);
       void this.emitSyntheticMessage(
         orchestratorSessionId,
-        `competition loser ${task.id}'s workspace could not be discarded automatically (${result.detail}); it will be cleaned up the next time \`hydra workspace prune\` runs.`,
+        `superseded task ${task.id}'s workspace could not be discarded automatically (${result.detail}); it will be cleaned up the next time \`hydra workspace prune\` runs.`,
         { event: "task-workspace-discard-failed", taskId: task.id },
       );
     }
+  }
+
+  // Shared by handleReviewWinner and handleDistillComplete's apply-winner/
+  // rework branches: once a reviewee is set to "superseded", discard its
+  // workspace (if any) and tear down its worker the same way a normal
+  // completed task's worker is torn down. No-op when the task never had
+  // a workspace — those callers keep their pre-isolation behavior
+  // (superseded, worker left open) exactly as before.
+  private async discardSupersededTaskWorkspace(
+    task: Task,
+    orchestratorSessionId: string,
+  ): Promise<void> {
+    if (!task.workspace) return;
+    await this.discardTaskWorkspace(task, orchestratorSessionId);
+    const workerSessionId = task.workerSessions?.at(-1);
+    if (!workerSessionId) return;
+    this.endWorkerForward(workerSessionId, { flush: true });
+    clearWorkerState(workerSessionId);
+    unregisterWorker(workerSessionId);
+    void this.closeWorker(workerSessionId);
   }
 
   // Synthetic progress messages get wrapped with leading + trailing

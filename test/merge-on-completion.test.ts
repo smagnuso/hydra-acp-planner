@@ -412,3 +412,179 @@ describe("merge-on-completion — review approval path (finishReview)", () => {
     assert.ok(mergePrompt, "expected a /hydra workspace merge sent to the reviewed task's worker");
   });
 });
+
+describe("merge-on-completion — distill task's own workspace (follow-up #1)", () => {
+  const DISTILL_WORKER = "hydra_session_worker_distill_own";
+  const WINNER_WORKER = "hydra_session_worker_distill_winner";
+  const LOSER_WORKER = "hydra_session_worker_distill_loser";
+
+  function distillTaskWithWorkspace(overrides: Partial<Task> = {}): Task {
+    return {
+      id: "R1d",
+      title: "distill R1",
+      deps: ["T1", "T2"],
+      status: "running",
+      assignedTo: DISTILL_WORKER,
+      workerSessions: [DISTILL_WORKER],
+      attemptCount: 1,
+      kind: "distill",
+      reviews: ["T1", "T2"],
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/abc/R1d",
+        sourceCwd: "/home/u/repo",
+        label: "R1d",
+        provider: "git",
+      },
+      ...overrides,
+    } as Task;
+  }
+
+  async function callHandleDistillComplete(
+    distillTask: Task,
+    board: Board,
+    normalized: { artifacts: Record<string, unknown>; warnings: string[] },
+  ) {
+    await (bridge as unknown as {
+      handleDistillComplete: (
+        distillTask: Task,
+        board: Board,
+        orch: string,
+        normalized: { artifacts: Record<string, unknown>; warnings: string[] },
+      ) => Promise<void>;
+    }).handleDistillComplete(distillTask, board, ORCH, normalized);
+  }
+
+  it("user-authored distill (no distillOf): lands the distill task's own workspace", async () => {
+    const distillTask = distillTaskWithWorkspace();
+    const board = makeBoard([distillTask]);
+    client.workspaceReplyFor = (sessionId) =>
+      sessionId === DISTILL_WORKER ? "Merged hydra/R1d into ~/repo" : undefined;
+
+    await callHandleDistillComplete(distillTask, board, {
+      artifacts: { summary: "merged angles", recommended_action: "apply T1" },
+      warnings: [],
+    });
+    await settle();
+
+    assert.equal(distillTask.status, "done");
+    assert.equal(distillTask.workspaceLanding?.status, "landed");
+  });
+
+  it("apply-winner branch: winner merges via finishReview, loser's workspace is discarded, AND the distill task's own workspace merges", async () => {
+    const distillTask = distillTaskWithWorkspace({ distillOf: "R1" });
+    const winnerTask = workTaskWithWorkspace("T1", {
+      status: "awaiting_review",
+      assignedTo: WINNER_WORKER,
+      workerSessions: [WINNER_WORKER],
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/abc/T1",
+        sourceCwd: "/home/u/repo",
+        label: "T1",
+        provider: "git",
+      },
+    });
+    const loserTask = workTaskWithWorkspace("T2", {
+      status: "awaiting_review",
+      assignedTo: LOSER_WORKER,
+      workerSessions: [LOSER_WORKER],
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/abc/T2",
+        sourceCwd: "/home/u/repo",
+        label: "T2",
+        provider: "git",
+      },
+    });
+    const originatingReview: Task = {
+      id: "R1",
+      title: "competition review",
+      deps: ["T1", "T2"],
+      status: "assigned",
+      assignedTo: "orchestrator",
+      attemptCount: 0,
+      kind: "review",
+      reviews: ["T1", "T2"],
+    };
+    const board = makeBoard([winnerTask, loserTask, originatingReview, distillTask]);
+    client.workspaceReplyFor = (sessionId) => {
+      if (sessionId === WINNER_WORKER) return "Merged hydra/T1 into ~/repo";
+      if (sessionId === LOSER_WORKER) return "Discarded ~/.hydra-acp/workspaces/abc/T2 and its branch hydra/T2";
+      if (sessionId === DISTILL_WORKER) return "Merged hydra/R1d into ~/repo";
+      return undefined;
+    };
+
+    await callHandleDistillComplete(distillTask, board, {
+      artifacts: { summary: "T1 strongest", applied_winner: "T1", recommended_action: "apply T1" },
+      warnings: [],
+    });
+    await settle();
+
+    assert.equal(winnerTask.status, "done");
+    assert.equal(winnerTask.workspaceLanding?.status, "landed");
+    assert.equal(loserTask.status, "superseded");
+    assert.equal(distillTask.status, "done");
+    assert.equal(distillTask.workspaceLanding?.status, "landed");
+
+    const discardPrompt = client.requestsFor("session/prompt").find((r) => {
+      const p = r.params as { sessionId?: string; prompt?: Array<{ text?: string }> };
+      return p.sessionId === LOSER_WORKER && p.prompt?.[0]?.text === "/hydra workspace discard";
+    });
+    assert.ok(discardPrompt, "expected the loser's workspace to be discarded");
+    assert.ok(
+      client
+        .requestsFor("hydra-acp/child_session/close")
+        .some((r) => (r.params as { childSessionId?: string }).childSessionId === LOSER_WORKER),
+      "loser's worker should be closed after a confirmed discard",
+    );
+  });
+
+  it("rework branch: superseded reviewee's workspace is discarded and the distill task's own workspace merges", async () => {
+    const distillTask = distillTaskWithWorkspace({ distillOf: "R1" });
+    const revieweeTask = workTaskWithWorkspace("T1", {
+      status: "awaiting_review",
+      assignedTo: LOSER_WORKER,
+      workerSessions: [LOSER_WORKER],
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/abc/T1",
+        sourceCwd: "/home/u/repo",
+        label: "T1",
+        provider: "git",
+      },
+    });
+    const originatingReview: Task = {
+      id: "R1",
+      title: "competition review",
+      deps: ["T1"],
+      status: "assigned",
+      assignedTo: "orchestrator",
+      attemptCount: 0,
+      kind: "review",
+      reviews: ["T1"],
+    };
+    const board = makeBoard([revieweeTask, originatingReview, distillTask]);
+    client.workspaceReplyFor = (sessionId) => {
+      if (sessionId === LOSER_WORKER) return "Discarded ~/.hydra-acp/workspaces/abc/T1 and its branch hydra/T1";
+      if (sessionId === DISTILL_WORKER) return "Merged hydra/R1d into ~/repo";
+      return undefined;
+    };
+
+    await callHandleDistillComplete(distillTask, board, {
+      artifacts: {
+        summary: "both miss the spec",
+        recommended_action: "rework",
+        rework_brief: "redo with streaming support",
+      },
+      warnings: [],
+    });
+    await settle();
+
+    assert.equal(revieweeTask.status, "superseded");
+    assert.equal(distillTask.status, "done");
+    assert.equal(distillTask.workspaceLanding?.status, "landed");
+
+    const discardPrompt = client.requestsFor("session/prompt").find((r) => {
+      const p = r.params as { sessionId?: string; prompt?: Array<{ text?: string }> };
+      return p.sessionId === LOSER_WORKER && p.prompt?.[0]?.text === "/hydra workspace discard";
+    });
+    assert.ok(discardPrompt, "expected the superseded reviewee's workspace to be discarded");
+  });
+});
