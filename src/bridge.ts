@@ -384,7 +384,36 @@ const workerForwarders = new Map<string, WorkerForwarder>();
 // workerState/resultAccumulator (the task-turn text accumulator): by the
 // time we send this, the task's own turn is already over and workerState
 // is typically already cleared.
-const pendingWorkspaceReplies = new Map<string, (text: string) => void>();
+// Keyed by worker session. The callback returns true when it CONSUMED
+// the text as its reply, false when the text was something else that
+// happened to arrive on the same session first — see
+// isReplyTo/sendWorkspaceCommand.
+const pendingWorkspaceReplies = new Map<string, (text: string) => boolean>();
+
+// Whether a synthetic agent chunk is the daemon's reply to `verb`,
+// rather than something else it pushed on its own.
+//
+// The daemon broadcasts unsolicited synthetic text onto a workspace-
+// bound session: noticeSourceDrift (cli session-manager.ts) fires at
+// every turn boundary once the source has moved on, which under
+// isolation is nearly always, because every sibling landing moves it.
+// Taking "the next synthetic chunk" as the reply therefore reads that
+// advisory as the answer to whatever we just asked, and both classifiers
+// then correctly report that they cannot make sense of it — pausing a
+// project over work that landed perfectly well.
+//
+// Matched on the same hardcoded prefixes the classifiers use, for the
+// same reason: this text is written for humans, and guessing loosely is
+// how a false "landed" gets reported.
+function isReplyTo(verb: "merge" | "discard" | "status", text: string): boolean {
+  if (verb === "status") {
+    return text.startsWith("Isolated in ") || text.startsWith("Not isolated.");
+  }
+  if (verb === "merge") {
+    return text.startsWith("Merged ") || text.startsWith("Workspace merge failed: ");
+  }
+  return text.startsWith("Discarded ") || text.startsWith("Workspace discard failed: ");
+}
 
 // Serializes everything that touches one project's integration tree:
 // landings, discards, and the workspace CREATIONS that fork from it.
@@ -6917,8 +6946,10 @@ export class PlannerBridge {
         const pendingWorkspaceReply = pendingWorkspaceReplies.get(sessionId);
         if (pendingWorkspaceReply) {
           const text = extractSyntheticReplyText(params.update);
-          if (text !== undefined) {
-            pendingWorkspaceReply(text);
+          // Only swallow it when it was actually taken as the reply.
+          // Anything else is the daemon talking on its own account and
+          // still belongs in the worker's transcript.
+          if (text !== undefined && pendingWorkspaceReply(text)) {
             return;
           }
         }
@@ -7126,8 +7157,15 @@ export class PlannerBridge {
       }, timeoutMs);
       if (typeof timer.unref === "function") timer.unref();
       pendingWorkspaceReplies.set(workerSessionId, (text) => {
+        if (!isReplyTo(verb, text)) {
+          // Not ours. Keep waiting: the real reply is still coming, and
+          // the timeout above is what bounds the wait.
+          return false;
+        }
         clearTimeout(timer);
+        pendingWorkspaceReplies.delete(workerSessionId);
         resolve(text);
+        return true;
       });
     });
     try {
@@ -7297,7 +7335,20 @@ export class PlannerBridge {
     workerSessionId: string,
   ): Promise<WorkspaceCommitState> {
     const reply = await this.sendWorkspaceCommand(workerSessionId, "status");
-    return classifyWorkspaceStatusReply(reply);
+    const state = classifyWorkspaceStatusReply(reply);
+    if (state === "unknown") {
+      // This is the one outcome that pauses a project over work that may
+      // well have landed, and the reply is the only thing that explains
+      // why. Logged verbatim (bounded) rather than described: the whole
+      // class of bug here is the daemon wording drifting from what the
+      // classifier matches, and a paraphrase would hide exactly that.
+      log.warn(
+        `workspace status on …${workerSessionId.slice(-8)} did not classify; raw reply: ${
+          reply === undefined ? "(none)" : JSON.stringify(reply.slice(0, 600))
+        }`,
+      );
+    }
+    return state;
   }
 
   // Nudge an isolated worker that finished without committing. Same

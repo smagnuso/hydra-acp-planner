@@ -30,6 +30,23 @@ interface RecordedRequest {
   params: unknown;
 }
 
+// The daemon's `/hydra workspace status` reply, header and all.
+//
+// The header is not decoration: sendWorkspaceCommand matches on it to
+// tell a reply apart from the unsolicited drift advisory the daemon
+// pushes at turn boundaries. Fixtures that started at the body silently
+// stopped resembling the daemon, which is how a real reply-routing bug
+// survived a green suite. Mirrors cli's workspace-reply-contract test.
+function statusReply(body: string): string {
+  return [
+    "Isolated in ~/.hydra-acp/workspaces/abc/T1",
+    "  source:   ~/repo",
+    "  provider: git (hydra/T1)",
+    body,
+    "Use `/hydra workspace stop` to merge and return, `discard` to throw the work away, `detach` to return and leave it here, or `clean` to wipe it and keep working here.",
+  ].join("\n");
+}
+
 class FakeClient extends EventEmitter implements BridgeClient {
   requests: RecordedRequest[] = [];
   responders = new Map<string, (params: unknown) => unknown>();
@@ -42,6 +59,10 @@ class FakeClient extends EventEmitter implements BridgeClient {
   // Separate hook for `status`, so a test can say "the worker committed"
   // (or didn't) independently of what the merge reply says.
   statusReplyFor: ((sessionId: string) => string | undefined) | null = null;
+  // Unsolicited synthetic text pushed onto the session immediately
+  // before the real reply, the way the daemon's noticeSourceDrift does
+  // at a turn boundary.
+  driftNoticeFor: ((sessionId: string) => string | undefined) | null = null;
 
   request<R = unknown>(method: string, params?: unknown): Promise<R> {
     this.requests.push({ method, params });
@@ -51,10 +72,10 @@ class FakeClient extends EventEmitter implements BridgeClient {
       if (text.startsWith("/hydra workspace ")) {
         const reply = text.includes("status")
           ? (this.statusReplyFor?.(p.sessionId) ??
-              "  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.")
+              statusReply("  no uncommitted changes\n  1 commit(s) recorded here and not landed yet."))
           : this.workspaceReplyFor(p.sessionId);
         if (reply !== undefined) {
-          queueMicrotask(() => {
+          const emit = (body: string) =>
             (bridge as unknown as { handleNotification: (n: unknown) => void }).handleNotification({
               jsonrpc: "2.0",
               method: "session/update",
@@ -62,11 +83,15 @@ class FakeClient extends EventEmitter implements BridgeClient {
                 sessionId: p.sessionId,
                 update: {
                   sessionUpdate: "agent_message_chunk",
-                  content: { type: "text", text: `\n${reply}\n` },
+                  content: { type: "text", text: `\n${body}\n` },
                   _meta: { "hydra-acp": { synthetic: true } },
                 },
               },
             });
+          const drift = this.driftNoticeFor?.(p.sessionId);
+          queueMicrotask(() => {
+            if (drift !== undefined) emit(drift);
+            emit(reply);
           });
         }
       }
@@ -226,6 +251,28 @@ describe("merge-on-completion — handleTaskComplete → markTaskDone → mergeT
     );
     // Worker state also should not have been torn down, for the same reason.
     assert.ok(getWorkerState(WORKER), "worker state should be preserved when landing is unconfirmed");
+  });
+
+  it("ignores the daemon's drift advisory and waits for the actual reply", async () => {
+    // Regression, and the one that survived a green suite longest. The
+    // daemon pushes this advisory unprompted at any turn boundary once
+    // the source has moved on (noticeSourceDrift), which under isolation
+    // is nearly always: every sibling landing moves the source. Taking
+    // "the next synthetic chunk" as the reply read the advisory as the
+    // answer to `status`, could-not-confirm followed, and the project
+    // paused over work that had landed perfectly well.
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.driftNoticeFor = () =>
+      "~/repo has moved on: 3 commit(s) are there and not in this workspace. " +
+      "Landing is fast-forward-only, so `/hydra workspace sync` now is what keeps `stop` from refusing later.";
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(task.workspaceLanding?.status, "landed");
   });
 
   it("adopted: a task working in a borrowed workspace never lands it itself", async () => {
@@ -652,9 +699,9 @@ describe("merge-on-completion — distill task's own workspace (follow-up #1)", 
 });
 
 describe("merge-on-completion — the commit contract (Phase C)", () => {
-  const DIRTY = "  2 unstaged:\n    M src/a.ts";
-  const COMMITTED = "  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.";
-  const NOTHING = "  no uncommitted changes\n  in sync with ~/repo";
+  const DIRTY = statusReply("  2 unstaged:\n    M src/a.ts");
+  const COMMITTED = statusReply("  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.");
+  const NOTHING = statusReply("  no uncommitted changes\n  in sync with ~/repo");
 
   function commitReminders() {
     return client.requestsFor("hydra-acp/message/emit").filter((r) =>
@@ -755,7 +802,7 @@ describe("merge-on-completion — the commit contract (Phase C)", () => {
 });
 
 describe("landing safety — serialization and dependent gating", () => {
-  const COMMITTED = "  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.";
+  const COMMITTED = statusReply("  no uncommitted changes\n  1 commit(s) recorded here and not landed yet.");
 
   it("pauses the project when a landing does not confirm", async () => {
     // A dependent forking a tree that is missing its dependency's work
