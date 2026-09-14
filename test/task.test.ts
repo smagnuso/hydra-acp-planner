@@ -54,6 +54,38 @@ describe("buildTaskPrompt", () => {
     assert.match(p, /Build the thing/);
   });
 
+  it("names the workspace boundary BEFORE the task, and the source as off-limits", () => {
+    // Placement is the point. The commit contract already names the
+    // workspace, but it renders last, and twice in end-to-end runs a
+    // worker's first edit went to an absolute path in the integration
+    // tree before it ever got there.
+    const t = task("T1", {
+      title: "x",
+      workspace: {
+        path: "/ws/proj-T1",
+        sourceCwd: "/repo",
+        label: "proj-T1",
+        provider: "git",
+      },
+    });
+    const p = buildTaskPrompt(t, board([t]));
+
+    assert.match(p, /\/ws\/proj-T1/);
+    assert.match(p, /\/repo/);
+    assert.ok(
+      p.indexOf("## Where to work") < p.indexOf("## Task"),
+      "the boundary must come before the task, not after it",
+    );
+  });
+
+  it("says nothing about a workspace boundary for an unisolated task", () => {
+    // An unisolated task runs in the user's own checkout; there is no
+    // other tree to warn it off, and the warning would be nonsense.
+    const t = task("T1", { title: "x" });
+    const p = buildTaskPrompt(t, board([t]));
+    assert.doesNotMatch(p, /## Where to work/);
+  });
+
   it("omits why/what/constraints lines when those fields are absent", () => {
     const t = task("T1", { title: "minimal" });
     const p = buildTaskPrompt(t, board([t]));

@@ -198,6 +198,40 @@ else.`;
 // The commit contract, for isolated tasks only.
 //
 // An isolated task works in its own workspace, and that workspace's
+// State the workspace boundary BEFORE the task, not after it.
+//
+// The commit contract already names the workspace, but it renders at the
+// very end of the prompt, and by the time an agent reads it, it has
+// already decided where to write. Observed twice in end-to-end runs: a
+// worker's FIRST edit targeted an absolute path into the integration
+// tree, which is the shared checkout another task is working in, and
+// exactly what isolation exists to prevent. One of the two then noticed,
+// redid the edit in its workspace, and left the stray one behind to
+// dirty the source anyway.
+//
+// The path is not hard for an agent to find, which is why saying nothing
+// does not work: `git rev-parse --show-toplevel` correctly answers with
+// the workspace, but the `.git` file is a one-line pointer AT the source,
+// and `--git-common-dir` names it outright.
+function formatWorkspaceBoundary(task: Task): string {
+  if (!task.workspace) return "";
+  return [
+    "## Where to work",
+    "",
+    `You are in an isolated workspace: \`${task.workspace.path}\``,
+    "",
+    "Every path you read or write must be inside it. Relative paths already are,",
+    "so prefer them, and resolve anything else against this directory.",
+    "",
+    `\`${task.workspace.sourceCwd}\` is a DIFFERENT checkout of the same repository.`,
+    "Git will name it if you ask (the `.git` file here points at it, and",
+    "`git rev-parse --git-common-dir` returns it) but it is not yours to touch:",
+    "another task may be working in it right now, and edits made there are outside",
+    "the workspace whose branch carries your work, so they reach the project as a",
+    "mess in somebody else's tree rather than as your result.",
+  ].join("\n");
+}
+
 // changes reach the shared tree by being LANDED. Landing fast-forwards
 // the branch: work the agent left uncommitted has no commit to carry, so
 // it is replayed as loose edits — and the next task's workspace is forked
@@ -413,6 +447,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
       const parts: string[] = [];
       parts.push(TASK_SYSTEM);
       parts.push("");
+      const boundary = formatWorkspaceBoundary(task);
+      if (boundary) {
+        parts.push(boundary);
+        parts.push("");
+      }
       parts.push("## Task");
       parts.push(`**${task.id} — ${task.title}**`);
       if (task.why) {
