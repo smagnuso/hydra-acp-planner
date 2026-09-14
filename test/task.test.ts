@@ -1087,3 +1087,38 @@ describe("normalizeDistill", () => {
     assert.deepEqual(rec.unresolved, ["does T1 handle expiry?"]);
   });
 });
+
+describe("work prompt — the commit contract", () => {
+  const isolated = () =>
+    task("T1", {
+      kind: "work",
+      workspace: {
+        path: "/home/u/.hydra-acp/workspaces/ab/p-T1",
+        sourceCwd: "/home/u/repo",
+        label: "p-T1",
+        provider: "git",
+      },
+    });
+
+  it("tells an ISOLATED worker to commit, and says why", () => {
+    const t = isolated();
+    const prompt = promptsFor("work").buildPrompt(t, board([t]));
+    assert.match(prompt, /commit/i);
+    assert.match(prompt, /workspaces\/ab\/p-T1/);
+    // The reason matters as much as the instruction: an agent that knows
+    // WHY is far likelier to comply than one handed a bare rule.
+    assert.match(prompt, /depend on yours/i);
+  });
+
+  it("does NOT tell an unisolated worker to commit", () => {
+    // This is the dangerous direction. An unisolated task runs directly
+    // in the user's own checkout, and committing there on their behalf
+    // would be an unasked-for mutation of their repository.
+    const t = task("T1", { kind: "work" });
+    const prompt = promptsFor("work").buildPrompt(t, board([t]));
+    assert.ok(
+      !/commit your changes/i.test(prompt),
+      "an unisolated worker must never be told to commit in the user's checkout",
+    );
+  });
+});

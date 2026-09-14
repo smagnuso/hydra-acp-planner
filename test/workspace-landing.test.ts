@@ -1,6 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { classifyMergeReply, classifyDiscardReply } from "../src/bridge.ts";
+import {
+  classifyMergeReply,
+  classifyDiscardReply,
+  classifyWorkspaceStatusReply,
+} from "../src/bridge.ts";
 
 // Unit tests for classifyMergeReply against the exact, hardcoded reply
 // prefixes the daemon emits for `/hydra workspace merge`:
@@ -99,5 +103,35 @@ describe("classifyDiscardReply", () => {
     assert.equal(classifyDiscardReply("some unrelated text").ok, false);
     assert.equal(classifyDiscardReply(undefined).ok, false);
     assert.equal(classifyDiscardReply(undefined).detail, "no reply received");
+  });
+});
+
+describe("classifyWorkspaceStatusReply", () => {
+  it("reads a clean workspace as committed", () => {
+    const reply = [
+      "In workspace feature-x (git) at ~/.hydra-acp/workspaces/ab/feature-x",
+      "  no uncommitted changes",
+      "Use `/hydra workspace stop` to merge and return.",
+    ].join("\n");
+    assert.equal(classifyWorkspaceStatusReply(reply), "committed");
+  });
+
+  it("reads staged/unstaged/untracked counts as uncommitted", () => {
+    for (const line of ["  2 staged, 1 unstaged:", "  3 untracked:", "  1 unstaged:"]) {
+      const reply = `In workspace T1 (git)\n${line}\n    M src/a.ts`;
+      assert.equal(classifyWorkspaceStatusReply(reply), "uncommitted", line);
+    }
+  });
+
+  it("reads a failed probe as unknown, NOT as committed", () => {
+    // The provider prints neither line when its git query fails, on the
+    // grounds that wrongly reporting a clean tree is what makes somebody
+    // discard work. Absence must therefore never read as clean.
+    const reply = "In workspace T1 (git) at ~/ws/T1\nUse `/hydra workspace stop` to merge and return.";
+    assert.equal(classifyWorkspaceStatusReply(reply), "unknown");
+  });
+
+  it("reads no reply at all as unknown", () => {
+    assert.equal(classifyWorkspaceStatusReply(undefined), "unknown");
   });
 });

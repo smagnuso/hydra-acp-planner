@@ -194,6 +194,34 @@ else.`;
 // attachments so callers can conditionally include the section
 // header. Inlined ahead of dependency context so spec/plan docs
 // frame the task before per-dependency artifacts narrow it down.
+// The commit contract, for isolated tasks only.
+//
+// An isolated task works in its own workspace, and that workspace's
+// changes reach the shared tree by being LANDED. Landing fast-forwards
+// the branch: work the agent left uncommitted has no commit to carry, so
+// it is replayed as loose edits — and the next task's workspace is forked
+// from HEAD, which does not include them. The dependent then cannot see
+// the work it depends on. Committing is what makes the handoff real.
+//
+// Deliberately absent for an unisolated task. Those run directly in the
+// user's own checkout, where committing on their behalf would be an
+// unasked-for mutation of their repository — the planner has never done
+// that and should not start.
+function formatWorkspaceCommitContract(task: Task): string {
+  if (!task.workspace) return "";
+  return [
+    "## Before you finish: commit",
+    "",
+    `You are working in an isolated workspace (\`${task.workspace.path}\`), not the`,
+    "main checkout. **Commit your changes here before emitting the result block** —",
+    "for example `git add -A && git commit -m \"<what you did>\"`.",
+    "",
+    "This is not bookkeeping. Your work reaches the rest of the project by having",
+    "this workspace's branch merged, and a merge can only carry commits. Anything",
+    "you leave uncommitted will not be visible to the tasks that depend on yours.",
+  ].join("\n");
+}
+
 function formatAttachments(board: Board): string {
   if (!board.attachments || board.attachments.length === 0) return "";
   const parts: string[] = [];
@@ -377,6 +405,11 @@ const PROMPTS: Partial<Record<TaskKind, PromptRegistryEntry>> = {
         for (const entry of task.reviewFeedback) {
           parts.push(`- ${entry}`);
         }
+        parts.push("");
+      }
+      const commitContract = formatWorkspaceCommitContract(task);
+      if (commitContract) {
+        parts.push(commitContract);
         parts.push("");
       }
       parts.push(RESULT_INSTRUCTIONS);

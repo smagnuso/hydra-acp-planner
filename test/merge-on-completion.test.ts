@@ -39,6 +39,9 @@ class FakeClient extends EventEmitter implements BridgeClient {
   // emitExtensionReply works (see extractSyntheticReplyText in bridge.ts)
   // — NOT as the session/prompt RPC's own return value.
   workspaceReplyFor: ((sessionId: string) => string | undefined) | null = null;
+  // Separate hook for `status`, so a test can say "the worker committed"
+  // (or didn't) independently of what the merge reply says.
+  statusReplyFor: ((sessionId: string) => string | undefined) | null = null;
 
   request<R = unknown>(method: string, params?: unknown): Promise<R> {
     this.requests.push({ method, params });
@@ -46,7 +49,9 @@ class FakeClient extends EventEmitter implements BridgeClient {
       const p = params as { sessionId: string; prompt: Array<{ text?: string }> };
       const text = p.prompt?.[0]?.text ?? "";
       if (text.startsWith("/hydra workspace ")) {
-        const reply = this.workspaceReplyFor(p.sessionId);
+        const reply = text.includes("status")
+          ? (this.statusReplyFor?.(p.sessionId) ?? "  no uncommitted changes")
+          : this.workspaceReplyFor(p.sessionId);
         if (reply !== undefined) {
           queueMicrotask(() => {
             (bridge as unknown as { handleNotification: (n: unknown) => void }).handleNotification({
@@ -586,5 +591,53 @@ describe("merge-on-completion — distill task's own workspace (follow-up #1)", 
       return p.sessionId === LOSER_WORKER && p.prompt?.[0]?.text === "/hydra workspace discard";
     });
     assert.ok(discardPrompt, "expected the superseded reviewee's workspace to be discarded");
+  });
+});
+
+describe("merge-on-completion — the commit contract (Phase C)", () => {
+  it("records the landing as unconfirmed when the worker left work uncommitted", async () => {
+    // A landing fast-forwards the branch, so uncommitted work has no
+    // commit to carry: it is replayed as loose edits, and the NEXT task's
+    // workspace is forked clean from HEAD and will not contain them. The
+    // merge still reports success, so without this check the board would
+    // record a landing that dependents cannot actually build on.
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.statusReplyFor = () => "  2 unstaged:\n    M src/a.ts";
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(task.status, "done");
+    assert.equal(task.workspaceLanding?.status, "unknown");
+    assert.match(task.workspaceLanding?.detail ?? "", /uncommitted/);
+  });
+
+  it("records a real landing when the worker committed", async () => {
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.statusReplyFor = () => "  no uncommitted changes";
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(task.workspaceLanding?.status, "landed");
+  });
+
+  it("does not assume committed when the commit state cannot be read", async () => {
+    const task = workTaskWithWorkspace("T1");
+    const board = makeBoard([task]);
+    primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
+    client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
+    client.statusReplyFor = () => "In workspace T1 (git) at ~/ws/T1";
+
+    await complete(board, task);
+    await settle();
+
+    assert.equal(task.workspaceLanding?.status, "unknown");
   });
 });

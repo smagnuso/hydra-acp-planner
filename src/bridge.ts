@@ -441,6 +441,25 @@ export function classifyMergeReply(
   return { status: "unknown", detail: reply, at };
 }
 
+// Read a `/hydra workspace status` reply for whether the agent left
+// anything uncommitted.
+//
+// Three outcomes, not two. The git provider prints "no uncommitted
+// changes" when clean and an "N staged, M unstaged, K untracked:" line
+// when not — but when its probe FAILS it deliberately prints neither,
+// because (in its own words) "no uncommitted changes is the one wrong
+// answer that would make somebody discard work." So absence of the dirty
+// line cannot be read as clean; that case is "unknown" and callers must
+// not act on it as if the tree were committed.
+export function classifyWorkspaceStatusReply(
+  reply: string | undefined,
+): "committed" | "uncommitted" | "unknown" {
+  if (reply === undefined) return "unknown";
+  if (/^\s*\d+ (staged|unstaged|untracked)/m.test(reply)) return "uncommitted";
+  if (reply.includes("no uncommitted changes")) return "committed";
+  return "unknown";
+}
+
 // Classify a `/hydra workspace discard` reply (competition losers).
 // Same hardcoded-prefix posture as classifyMergeReply, but discard
 // failure is cosmetic (leftover disk, not lost work — see the discard
@@ -6897,7 +6916,7 @@ export class PlannerBridge {
   // same as an unrecognized reply, never as success.
   private async sendWorkspaceCommand(
     workerSessionId: string,
-    verb: "merge" | "discard",
+    verb: "merge" | "discard" | "status",
     timeoutMs = 15_000,
   ): Promise<string | undefined> {
     await this.attachAsClient(workerSessionId);
@@ -6951,8 +6970,33 @@ export class PlannerBridge {
       };
       return;
     }
+    // Check the agent actually committed before landing. A landing
+    // fast-forwards the branch, so uncommitted work has no commit to
+    // carry: the daemon replays it as loose edits into the integration
+    // tree, and the next task's workspace — forked clean from HEAD —
+    // will not contain them. The merge still happens (withholding the
+    // work entirely would be worse), but the outcome is NOT a landing
+    // any dependent can build on, and must not be recorded as one.
+    const statusReply = await this.sendWorkspaceCommand(workerSessionId, "status");
+    const committed = classifyWorkspaceStatusReply(statusReply);
+
     const reply = await this.sendWorkspaceCommand(workerSessionId, "merge");
-    task.workspaceLanding = classifyMergeReply(reply);
+    const landing = classifyMergeReply(reply);
+
+    if (landing.status === "landed" && committed !== "committed") {
+      const why =
+        committed === "uncommitted"
+          ? "the worker left changes uncommitted in its workspace, so they were replayed as loose edits rather than landed as commits — tasks depending on this one would not see them"
+          : "the workspace's commit state could not be confirmed, so it is not safe to assume dependents will see this work";
+      log.warn(`task ${task.id}: merge reported success but ${why}`);
+      task.workspaceLanding = {
+        status: "unknown",
+        detail: `${landing.detail ?? "merged"} — but ${why}.`,
+        at: nowIso(),
+      };
+      return;
+    }
+    task.workspaceLanding = landing;
   }
 
   // Discard a superseded task's workspace (a competition loser, or a
