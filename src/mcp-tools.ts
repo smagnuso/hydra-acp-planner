@@ -191,13 +191,13 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
         isolation: {
           type: "object",
           description:
-            "Optional, plan-level only. NOT CURRENTLY AVAILABLE: 'per-task' is accepted but ignored, and the plan runs in the session's own working tree as usual — do not offer isolation to the user as a working feature. Leave this unset. (Per-task workspace isolation is being redesigned; the shipped implementation raced concurrent landings, could report success when nothing landed, and gave reviewers a tree without the code under review.)",
+            "Optional, plan-level only. Give tasks that can run at the same time their own git worktree instead of sharing this session's working tree, so two workers editing the same repo cannot trample each other mid-edit. Off by default. Worth setting when the plan has genuinely parallel tasks over one codebase; not worth setting for a linear plan, where it does nothing. Isolation is scoped by the shape of the DAG, not by task: a task provisions a workspace only when some other task could be writing at the same time (the two are incomparable in the dependency closure, and the concurrency cap is above 1), so a plan with no possible overlap runs exactly as it would with isolation off. Isolated workers are required to commit their work, and the planner verifies the commits exist before landing anything. Landings are serialized, one at a time per project, and a landing that cannot be confirmed pauses the project with the work kept in its workspace rather than reporting a success that did not happen.",
           properties: {
             mode: {
               type: "string",
               enum: ["off", "per-task"],
               description:
-                "'off' (default): no isolation, today's shared-tree behavior. 'per-task': IGNORED for now — see the parent description.",
+                "'off' (default): every task runs in this session's working tree. 'per-task': tasks that can overlap another writer get their own workspace; the rest, including every review (a review adopts its reviewee's tree so it can see the code it is reviewing), do not.",
             },
             required: {
               type: "boolean",

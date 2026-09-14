@@ -7983,16 +7983,7 @@ export class PlannerBridge {
     // Parse isolation from tool args. Delegated to parseIsolationFromObject
     // (board.ts) so the lenient-parsing posture matches fleetDefaults/
     // reviewPolicy and stays unit-testable without the bridge.
-    const requestedIsolation = parseIsolationFromObject(args.isolation);
-    // GUARDRAIL: "per-task" is not safe to run yet — the shipped
-    // implementation races concurrent landings on one tree, reports
-    // `landed` on replies that mean nothing landed, and hands reviewers a
-    // workspace that lacks the code they are reviewing. See
-    // docs/worktree-isolation-v2.md. Accept the plan (an optional field
-    // should not fail an otherwise good DAG) but force it off and SAY SO,
-    // rather than honoring a setting that would quietly corrupt the run.
-    const isolationRefused = requestedIsolation?.mode === "per-task";
-    const boardIsolation = isolationRefused ? undefined : requestedIsolation;
+    const boardIsolation = parseIsolationFromObject(args.isolation);
 
     const contractBriefRaw = args.contractBrief;
     const contractBrief =
@@ -8063,10 +8054,7 @@ export class PlannerBridge {
     const reviewBlurb = reviewCount > 0
       ? ` + ${reviewCount} auto-synthesized review${reviewCount === 1 ? "" : "s"}`
       : "";
-    const isolationNotice = isolationRefused
-      ? ` NOTE: isolation.mode="per-task" was requested and has been IGNORED — per-task workspace isolation is not safe to run yet, so this plan runs in the session's own working tree. Tell the user their tasks are NOT isolated.`
-      : "";
-    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.${isolationNotice}`;
+    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.`;
     this.replyMcpResult(reqId, summary, {
       projectId: board.projectId,
       replacedReadyProjectId: replacedReadyId,
@@ -8074,7 +8062,6 @@ export class PlannerBridge {
       reviewTaskCount: reviewCount,
       concurrencyCap: board.concurrencyCap,
       warnings: normalized.warnings,
-      ...(isolationRefused ? { isolationRefused: true } : {}),
     });
   }
 

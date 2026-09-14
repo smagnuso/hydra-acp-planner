@@ -1890,14 +1890,12 @@ describe("requireInteractive guard", () => {
     assert.notEqual(result.isError, true, "expected no error for interactive session");
   });
 
-  it("set_plan accepts a plan requesting isolation but forces it off and says so", async () => {
-    // Guardrail: per-task isolation is not safe to run yet (races
-    // concurrent landings, can report success on total loss, hands
-    // reviewers a tree without the code under review). An optional field
-    // should not fail an otherwise good DAG, so the plan lands — but
-    // honoring the setting quietly would corrupt the run, and ignoring
-    // it quietly would leave the agent telling the user their tasks are
-    // isolated when they are not.
+  it("set_plan records a requested isolation mode on the board", async () => {
+    // The agent is told in the tool schema that asking for isolation
+    // gets it, so a plan that asks and then runs unisolated would be the
+    // orchestrator lying to the user about where its workers are. What
+    // the setting actually means per task is decided later, by DAG
+    // shape; this only pins that the request survives set_plan.
     const sid = `guard_iso_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const isoClient = new FakeClient();
     const isoBridge = new PlannerBridge({
@@ -1929,13 +1927,12 @@ describe("requireInteractive guard", () => {
       structuredContent: { isolationRefused?: boolean };
     };
     assert.notEqual(result.isError, true, "the plan itself must still be accepted");
-    assert.equal(result.structuredContent.isolationRefused, true);
-    assert.match(result.content[0]!.text, /IGNORED/);
     assert.equal(
-      boards.get(sid)?.isolation,
+      result.structuredContent.isolationRefused,
       undefined,
-      "isolation must not be recorded on the board",
+      "nothing refuses isolation any more",
     );
+    assert.deepEqual(boards.get(sid)?.isolation, { mode: "per-task" });
   });
 
   it("set_plan is refused when interactive is undefined (fail-closed)", async () => {
