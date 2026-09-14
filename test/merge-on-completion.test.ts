@@ -792,7 +792,7 @@ describe("merge-on-completion — the commit contract (Phase C)", () => {
     const board = makeBoard([task]);
     primeWorker("T1", '```hydra-result\n{"summary":"did the thing"}\n```');
     client.workspaceReplyFor = () => "Merged hydra/T1 into ~/repo";
-    client.statusReplyFor = () => "In workspace T1 (git) at ~/ws/T1";
+    client.statusReplyFor = () => "Isolated in ~/.hydra-acp/workspaces/abc/T1\nIn workspace T1 (git) at ~/ws/T1";
 
     await complete(board, task);
     await settle();
