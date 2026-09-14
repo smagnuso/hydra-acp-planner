@@ -211,6 +211,67 @@ function runInfo(projectId: string | undefined, argv: readonly string[]): void {
   }
 }
 
+// The session the daemon would have this project's board loaded under,
+// or undefined when the pointer is missing.
+function orchestratorPointerFor(projectId: string): string | undefined {
+  try {
+    const id = readFileSync(orchestratorPointerPath(projectId), "utf8").trim();
+    return id.length > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Whether a reachable daemon still knows that session.
+//
+// Returns false both when the daemon is down and when it is up but has
+// no such session — the two are equivalent for our purposes (nothing is
+// holding the board in memory), and conflating them keeps the offline
+// path, which is the reason this CLI reads from disk at all, working.
+function daemonKnowsSession(sessionId: string): boolean {
+  const res = spawnSync("hydra-acp", ["session", "list", "--all", "--json"], {
+    encoding: "utf8",
+  });
+  if (res.status !== 0 || !res.stdout) {
+    return false;
+  }
+  try {
+    const rows = JSON.parse(res.stdout) as Array<{ sessionId?: string }>;
+    return rows.some((r) => r.sessionId === sessionId);
+  } catch {
+    return false;
+  }
+}
+
+// Tear a worker's workspace down before its session goes away, and
+// report any branch that had to be kept.
+//
+// `session remove` alone is not enough: it removes the checkout but
+// NEVER the branch (the daemon's releaseWorkspace says so in as many
+// words), so removing a project used to leave one `hydra/<label>` ref
+// per isolated worker in the user's repo, forever.
+//
+// `workspace remove` is the verb that knows the difference. It reclaims
+// a branch holding nothing the source lacks, and KEEPS one that still
+// holds unlanded commits — which for a project being thrown away is the
+// last copy of that work, so it is reported rather than deleted. Run
+// BEFORE the session is removed, because afterwards the binding is gone
+// and there is nothing left to name the workspace by.
+function removeWorkerWorkspace(workerId: string): string | undefined {
+  const res = spawnSync(
+    "hydra-acp",
+    ["workspace", "remove", workerId, "--force"],
+    { encoding: "utf8" },
+  );
+  const out = `${res.stdout ?? ""}${res.stderr ?? ""}`;
+  // "no such workspace" is the normal answer for an unisolated worker.
+  const kept = out
+    .split("\n")
+    .filter((l) => l.includes("kept") || l.includes("if you want it back"))
+    .map((l) => l.trim());
+  return kept.length > 0 ? kept.join("\n  ") : undefined;
+}
+
 function runRemove(projectId: string | undefined): void {
   if (!projectId) {
     process.stderr.write("hydra-acp-planner remove: requires a projectId\n");
@@ -222,14 +283,45 @@ function runRemove(projectId: string | undefined): void {
     process.stderr.write(`hydra-acp-planner remove: no project '${projectId}'\n`);
     process.exit(1);
   }
-  // Close each worker session via the daemon CLI. Best-effort —
-  // if a worker is already gone we still want to drop the planner record.
+  // Refuse rather than half-work. A running daemon holds this board in
+  // memory and re-persists it on the next mutation, so deleting the
+  // directory from out here removes the workers and then watches the
+  // record come back — the user is told it worked and `list` still
+  // shows the project. The in-daemon handler drops the in-memory copy
+  // too, which is the only way for the removal to stick.
+  const orchestrator = orchestratorPointerFor(canonical);
+  if (orchestrator !== undefined && daemonKnowsSession(orchestrator)) {
+    process.stderr.write(
+      `hydra-acp-planner remove: project ${shortProjectId(canonical)} is live in the running daemon ` +
+        `(orchestrator session ${shortSessionId(orchestrator)}).\n` +
+        `Removing it from here would be undone the next time the daemon persists its copy.\n` +
+        `Run \`/hydra planner remove ${shortProjectId(canonical)}\` from any hydra session instead, ` +
+        `or stop the daemon first.\n`,
+    );
+    process.exit(1);
+  }
+  // Workspace first, then the session: see removeWorkerWorkspace.
+  // Best-effort throughout — a worker that is already gone should not
+  // block dropping the planner record.
+  const notes: string[] = [];
   for (const workerId of Object.keys(board.workers)) {
+    const kept = removeWorkerWorkspace(workerId);
+    if (kept !== undefined) {
+      notes.push(`${shortSessionId(workerId)}: ${kept}`);
+    }
     spawnSync("hydra-acp", ["session", "remove", workerId], {
       stdio: ["ignore", "ignore", "ignore"],
     });
   }
   rmSync(projectDir(canonical), { recursive: true, force: true });
+  process.stdout.write(`Removed project ${shortProjectId(canonical)}.\n`);
+  if (notes.length > 0) {
+    // Named, not silently left behind: these refs are the only remaining
+    // copy of work that never landed.
+    process.stdout.write(
+      `\nKept, because they still hold work the source does not:\n  ${notes.join("\n  ")}\n`,
+    );
+  }
 }
 
 export function runCli(argv: readonly string[]): void {

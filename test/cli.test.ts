@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, chmodSync, existsSync, readFileSync } from "node:fs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const bin = resolve(here, "..", "dist", "index.js");
@@ -151,6 +151,99 @@ describe("hydra-acp-planner info: findings on terminal-state boards", () => {
     assert.equal(parsed.state, "done");
     assert.doesNotMatch(r.stdout, /\/hydra planner findings/);
     assert.doesNotMatch(r.stdout, /No findings/);
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+// `remove` shells out to `hydra-acp`, so these tests shadow it on PATH
+// with a recorder. Without that they would drive the user's real daemon.
+function fakeHydraBin(dir: string, sessionsJson: string): string {
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(join(dir, "sessions.json"), sessionsJson);
+  writeFileSync(
+    join(binDir, "hydra-acp"),
+    [
+      "#!/bin/sh",
+      `echo "$@" >> "${join(dir, "calls.log")}"`,
+      'if [ "$1" = "session" ] && [ "$2" = "list" ]; then',
+      `  cat "${join(dir, "sessions.json")}"`,
+      'elif [ "$1" = "workspace" ] && [ "$2" = "remove" ]; then',
+      '  echo "removed ~/.hydra-acp/workspaces/h/$3 (branch hydra/$3 kept: it has 2 commit(s) not in the source)"',
+      "fi",
+      "exit 0",
+    ].join("\n"),
+  );
+  chmodSync(join(binDir, "hydra-acp"), 0o755);
+  return binDir;
+}
+
+function runRemoveCli(home: string, projId: string, binDir: string) {
+  return spawnSync("node", [bin, "remove", projId], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    },
+  });
+}
+
+function setupRemovableBoard(label: string, workers: string[]) {
+  const home = `/tmp/planner-cli-rm-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const projId = `hydra_plan_${label}`;
+  const projDir = join(home, ".hydra-acp", "planner", "projects", projId);
+  mkdirSync(projDir, { recursive: true });
+  const board = makeBoard(projId, { state: "running" }) as Record<string, unknown>;
+  board.workers = Object.fromEntries(
+    workers.map((w) => [w, { currentTaskId: null, tasksCompleted: [] }]),
+  );
+  writeFileSync(join(projDir, "board.json"), JSON.stringify(board));
+  writeFileSync(join(projDir, "orchestrator"), "hydra_session_orch_live\n");
+  return { home, projId, projDir };
+}
+
+describe("hydra-acp-planner remove", () => {
+  it("refuses while a running daemon still holds the board", () => {
+    // Deleting the directory out here does not stick: the daemon has the
+    // board in memory and re-persists it on the next mutation, so the
+    // user is told it worked and `list` still shows the project.
+    const { home, projId, projDir } = setupRemovableBoard("live", ["hydra_session_w1"]);
+    const binDir = fakeHydraBin(home, JSON.stringify([{ sessionId: "hydra_session_orch_live" }]));
+
+    const res = runRemoveCli(home, projId, binDir);
+
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /live in the running daemon/);
+    assert.match(res.stderr, /\/hydra planner remove/);
+    assert.ok(existsSync(projDir), "the board must survive a refused removal");
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("removes each worker's workspace before its session, and reports kept branches", () => {
+    // Order matters: `workspace remove` names the workspace by session,
+    // so after `session remove` there is nothing left to name it by, and
+    // the branch is orphaned in the user's repo forever.
+    const { home, projId, projDir } = setupRemovableBoard("dead", [
+      "hydra_session_w1",
+      "hydra_session_w2",
+    ]);
+    // Daemon up, but it has never heard of this orchestrator.
+    const binDir = fakeHydraBin(home, JSON.stringify([{ sessionId: "hydra_session_other" }]));
+
+    const res = runRemoveCli(home, projId, binDir);
+
+    assert.equal(res.status, 0, res.stderr);
+    const calls = readFileSync(join(home, "calls.log"), "utf8").trim().split("\n");
+    const wsIdx = calls.indexOf("workspace remove hydra_session_w1 --force");
+    const rmIdx = calls.indexOf("session remove hydra_session_w1");
+    assert.ok(wsIdx >= 0, `expected a workspace removal, got: ${calls.join(" | ")}`);
+    assert.ok(rmIdx >= 0, "expected the session removal");
+    assert.ok(wsIdx < rmIdx, "the workspace must be torn down before the session goes away");
+    assert.match(res.stdout, /Kept, because they still hold work the source does not/);
+    assert.match(res.stdout, /hydra\/hydra_session_w1 kept/);
+    assert.ok(!existsSync(projDir), "the board record should be gone");
     rmSync(home, { recursive: true, force: true });
   });
 });
