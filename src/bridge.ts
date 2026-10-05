@@ -4603,8 +4603,11 @@ export class PlannerBridge {
         : `Project ${shortProjectId(board.projectId)} complete — ${board.tasks.length} task${board.tasks.length === 1 ? "" : "s"} done.`;
       const statusDump = formatStatus(board, attachedSessions.has(orchestratorSessionId), orchestratorSessionId);
       const links = formatSessionLinksFooter(board, orchestratorSessionId);
-      const statusWithLinks = links ? `${statusDump}\n\n${links}` : statusDump;
-      const findings = formatCompletionFindings(board);
+      // Fenced so markdown clients keep the column alignment; the links
+      // go below it so they stay clickable.
+      const fencedStatus = `\`\`\`\n${statusDump}\n\`\`\``;
+      const statusWithLinks = links ? `${fencedStatus}\n\n${links}` : fencedStatus;
+      const findings = formatCompletionFindings(board, { markdown: true });
       const pointer = findings
         ? `\n\n(Run \`/hydra planner findings\` for a human-readable summary, or \`/hydra planner findings <taskId>\` to drill into one.)`
         : "";

@@ -572,6 +572,38 @@ describe("formatSessionsTable", () => {
   });
 });
 
+describe("formatCompletionFindings markdown mode", () => {
+  const b = board({
+    tasks: [
+      task("T8", {
+        title: "Final code review",
+        status: "done",
+        artifacts: {
+          summary: "2 failures found",
+          notes: "line one\nline two",
+          follow_ups: ["first thing", "second thing"],
+        },
+      }),
+    ],
+  });
+
+  it("renders each finding as a nested markdown list", () => {
+    const out = formatCompletionFindings(b, { markdown: true });
+    const lines = out.split("\n");
+    assert.equal(lines[0], "Findings:");
+    assert.match(lines[1]!, /^- \[x\] T8 {2}Final code review/);
+    assert.ok(lines.slice(2).every((l) => l.startsWith("  - ")));
+    assert.ok(lines.includes("  - first thing"));
+    assert.ok(lines.includes("  - second thing"));
+  });
+
+  it("leaves the default layout unchanged", () => {
+    const out = formatCompletionFindings(b);
+    assert.match(out, /^ {3}\[x\] T8/m);
+    assert.match(out, /^ {7}• first thing/m);
+  });
+});
+
 describe("formatCompletionFindings", () => {
   it("returns empty string when nothing to surface", () => {
     const out = formatCompletionFindings(

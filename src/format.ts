@@ -898,7 +898,10 @@ export function formatFindingsBullets(findings: Finding[]): string {
     .join("\n");
 }
 
-export function formatCompletionFindings(board: Board): string {
+export function formatCompletionFindings(
+  board: Board,
+  opts: { markdown?: boolean } = {},
+): string {
   const findings = collectFindings(board);
   if (findings.length === 0) return "";
   const truncate = truncateNotes;
@@ -955,7 +958,26 @@ export function formatCompletionFindings(board: Board): string {
     for (const fu of f.followUps) {
       lines.push(`       • ${fu}`);
     }
-    sections.push(lines.join("\n"));
+    sections.push(opts.markdown ? findingAsMarkdown(lines) : lines.join("\n"));
   }
   return `Findings:\n${sections.join("\n")}`;
+}
+
+// The plain layout above relies on runs of spaces and single newlines,
+// which markdown clients collapse. Re-render the same lines as a nested
+// list: the head line is the item, every detail line a sub-bullet.
+function findingAsMarkdown(lines: string[]): string {
+  const [head, ...rest] = lines;
+  const details = rest
+    .map((l) =>
+      l
+        .split("\n")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+        .join(" ")
+        .replace(/^[•?]\s*/, ""),
+    )
+    .filter((l) => l.length > 0)
+    .map((l) => `  - ${l}`);
+  return [`- ${head!.trim()}`, ...details].join("\n");
 }
