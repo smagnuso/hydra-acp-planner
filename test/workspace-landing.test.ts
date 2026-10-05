@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   classifyMergeReply,
+  isConflictDecline,
   classifyDiscardReply,
   classifyWorkspaceStatusReply,
 } from "../src/bridge.ts";
@@ -156,5 +157,33 @@ describe("classifyWorkspaceStatusReply", () => {
 
   it("reads no reply at all as unknown", () => {
     assert.equal(classifyWorkspaceStatusReply(undefined), "unknown");
+  });
+});
+
+describe("isConflictDecline", () => {
+  const at = "2026-01-01T00:00:00.000Z";
+
+  it("is true for a declined landing whose sync hit conflicts", () => {
+    assert.equal(
+      isConflictDecline({
+        status: "declined",
+        detail: "A sync was attempted first and could not complete: 2 file(s) conflict",
+        at,
+      }),
+      true,
+    );
+  });
+
+  it("is true when the source has moved on", () => {
+    assert.equal(
+      isConflictDecline({ status: "declined", detail: "The source has moved on since this workspace was created.", at }),
+      true,
+    );
+  });
+
+  it("is false for other declines and for non-declined outcomes", () => {
+    assert.equal(isConflictDecline({ status: "declined", detail: "not a git tree", at }), false);
+    assert.equal(isConflictDecline({ status: "unknown", detail: "conflict", at }), false);
+    assert.equal(isConflictDecline({ status: "landed", at }), false);
   });
 });

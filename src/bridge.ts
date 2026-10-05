@@ -144,7 +144,7 @@ import {
   sweepLineConcurrencyCap,
 } from "./decomposition.js";
 import type { NormalizedResult } from "./task.js";
-import { buildCommitRepromptPrompt, promptsFor } from "./task.js";
+import { buildCommitRepromptPrompt, buildConflictResolutionPrompt, promptsFor } from "./task.js";
 import {
   clearOrchestratorState,
   clearWorkerState,
@@ -526,6 +526,21 @@ export function classifyMergeReply(
   }
   return { status: "unknown", detail: reply, at };
 }
+
+// A declined landing worth handing to an agent: the daemon refused
+// because the source moved and a sync could not merge cleanly. Other
+// declines (no workspace, not a git tree, ...) are not something an agent
+// in the workspace can fix, so they still pause the project.
+export function isConflictDecline(
+  landing: NonNullable<Task["workspaceLanding"]>,
+): boolean {
+  return (
+    landing.status === "declined" &&
+    /conflict|has moved on/i.test(landing.detail ?? "")
+  );
+}
+
+const MAX_CONFLICT_RESOLUTIONS = 2;
 
 // Read a `/hydra workspace status` reply for what the workspace says
 // about the agent's work.
@@ -7230,31 +7245,107 @@ export class PlannerBridge {
     // WHOLE operation, including the status probe: reading a tree that
     // another landing is mid-reset on would answer about a state that
     // exists only for an instant.
-    await enqueueOnIntegrationTree(board.projectId, async () => {
-      // Checked here rather than before queueing: by the time our turn
-      // comes the board may have been cancelled, and landing into the
-      // user's tree after they asked to stop is exactly the surprise
-      // isolation is supposed to prevent. An already-running landing is
-      // never interrupted — the queue drains, it does not abort — but a
-      // not-yet-started one does not begin.
-      if (
-        board.state === "stopped" ||
-        board.state === "failed" ||
-        board.state === "done"
-      ) {
-        log.info(
-          `task ${task.id}: skipping landing — board is "${board.state}"; its workspace is retained`,
-        );
-        task.workspaceLanding = {
-          status: "unknown",
-          detail: `not attempted: the project was ${board.state} before this task's work could land`,
-          at: nowIso(),
-        };
-        return;
-      }
-      await this.landTaskWorkspace(task, preferSessionId);
-    });
+    const attemptLanding = () =>
+      enqueueOnIntegrationTree(board.projectId, async () => {
+        // Checked here rather than before queueing: by the time our turn
+        // comes the board may have been cancelled, and landing into the
+        // user's tree after they asked to stop is exactly the surprise
+        // isolation is supposed to prevent. An already-running landing is
+        // never interrupted — the queue drains, it does not abort — but a
+        // not-yet-started one does not begin.
+        if (
+          board.state === "stopped" ||
+          board.state === "failed" ||
+          board.state === "done"
+        ) {
+          log.info(
+            `task ${task.id}: skipping landing — board is "${board.state}"; its workspace is retained`,
+          );
+          task.workspaceLanding = {
+            status: "unknown",
+            detail: `not attempted: the project was ${board.state} before this task's work could land`,
+            at: nowIso(),
+          };
+          return;
+        }
+        await this.landTaskWorkspace(task, preferSessionId);
+      });
+    await attemptLanding();
+
+    // A conflict with work another task landed first is routine under
+    // isolation, and the session holding the workspace has the context to
+    // resolve it. The resolution turn runs OUTSIDE the integration-tree
+    // queue (only the retried landing goes back in) so a long agent turn
+    // does not block every other landing.
+    for (
+      let attempt = 1;
+      attempt <= MAX_CONFLICT_RESOLUTIONS &&
+      task.workspaceLanding !== undefined &&
+      isConflictDecline(task.workspaceLanding) &&
+      board.state === "running";
+      attempt++
+    ) {
+      const holder = preferSessionId ?? task.workerSessions?.at(-1);
+      if (!holder) break;
+      const ok = await this.resolveLandingConflict(
+        orchestratorSessionId,
+        holder,
+        board,
+        task,
+        task.workspaceLanding.detail ?? "",
+        MAX_CONFLICT_RESOLUTIONS - attempt + 1,
+      );
+      if (!ok) break;
+      await attemptLanding();
+    }
     this.haltIfLandingUnconfirmed(board, orchestratorSessionId, task);
+  }
+
+  // One resolution turn on the session that holds a declined workspace.
+  // Returns false when the turn itself could not run; the caller then
+  // falls through to the normal pause.
+  private async resolveLandingConflict(
+    orchestratorSessionId: string,
+    holderSessionId: string,
+    board: Board,
+    task: Task,
+    detail: string,
+    attemptsLeft: number,
+  ): Promise<boolean> {
+    log.info(
+      `task ${task.id}: landing conflicted; asking …${holderSessionId.slice(-8)} to resolve (${attemptsLeft} attempt(s) left)`,
+    );
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `${task.id} conflicts with work that landed first; asking ${shortSessionId(holderSessionId)} to resolve it (${attemptsLeft} attempt(s) left)`,
+      { event: "task-landing-conflict", taskId: task.id },
+    );
+    try {
+      await this.attachAsClient(holderSessionId);
+      await this.client.request("hydra-acp/message/emit", {
+        sessionId: holderSessionId,
+        method: "session/prompt",
+        envelope: buildTextPromptEnvelope({
+          sessionId: holderSessionId,
+          text: buildConflictResolutionPrompt(
+            task,
+            detail,
+            board.integrationTree,
+            attemptsLeft,
+          ),
+          ancillary: true,
+        }),
+        route: "queue",
+      });
+      return !this.shuttingDown;
+    } catch (err) {
+      if (!this.isShutdownError(err)) {
+        log.error(
+          `conflict resolution turn for ${task.id} on …${holderSessionId.slice(-8)} failed: ${(err as Error).message}`,
+        );
+      }
+      return false;
+    }
   }
 
   // The landing itself. Split out so the queue above wraps one call and

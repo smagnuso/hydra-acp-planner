@@ -1167,6 +1167,42 @@ export function buildCommitRepromptPrompt(task: Task, attemptsLeft: number): str
   ].join("\n");
 }
 
+// Hand a declined landing back to the session that holds the workspace.
+//
+// The daemon already tried a sync and named the conflicting paths, so the
+// agent gets the exact failure rather than a vague "integration failed".
+// Narrow like the commit reminder: resolve and commit, do not redo the task.
+export function buildConflictResolutionPrompt(
+  task: Task,
+  detail: string,
+  integrationTree: string | undefined,
+  attemptsLeft: number,
+): string {
+  const where = integrationTree ?? "the integration tree";
+  return [
+    `STOP. ${task.id} could not land: another task landed first and its changes conflict with yours.`,
+    ``,
+    `The daemon reported:`,
+    ``,
+    detail.trim(),
+    ``,
+    `Do NOT redo the task. Resolve the conflict inside THIS workspace:`,
+    ``,
+    `1. Find the branch the others landed on: \`git -C ${where} branch --show-current\` (read-only; never edit that tree).`,
+    `2. Merge it into this workspace's branch: \`git merge <that branch>\`.`,
+    `3. Resolve every conflict by keeping BOTH sides' intent. Never drop the other task's changes to make yours pass.`,
+    `4. For package-lock.json, resolve package.json first, then regenerate the lockfile with the package manager instead of hand-merging it. Keep registry URLs as they were in the other side.`,
+    `5. Re-run the project's checks (lint, build, test) and fix anything the merge broke.`,
+    `6. Commit the merge. The tree must be clean when you finish.`,
+    ``,
+    `Reply with one short sentence saying what you resolved. Do not push.`,
+    ``,
+    attemptsLeft > 1
+      ? `You have ${attemptsLeft} attempts left before this task is recorded as not landed.`
+      : `This is your LAST attempt. If it still cannot land, the project pauses and a human has to finish it.`,
+  ].join("\n");
+}
+
 // ── Legacy top-level exports (thin wrappers) ─────────────────────────────
 // These delegate to PROMPTS.work so that existing call sites in bridge.ts
 // and elsewhere keep compiling without changes.
