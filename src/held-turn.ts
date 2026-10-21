@@ -30,6 +30,10 @@ export type HeldTurnReason =
   | "cancelled"
   | "removed"
   | "failed"
+  // The project was paused (by the user or because nothing else can
+  // run). The turn ends so the session stops looking busy; resume
+  // re-opens the live view.
+  | "paused"
   // The held turn was released because the user submitted a non-slash
   // prompt while it was active — we step aside so they can chat with
   // the host agent. The project itself keeps running; workers continue

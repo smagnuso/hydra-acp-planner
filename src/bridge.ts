@@ -2734,9 +2734,9 @@ export class PlannerBridge {
     const tail = inFlight > 0
       ? ` ${inFlight} in-flight worker${inFlight === 1 ? "" : "s"} will run to completion; no new tasks will dispatch until resume.`
       : " No new tasks will dispatch until resume.";
-    this.client.reply(reqId, {
-      text: `Paused ${shortProjectId(board.projectId)}.${tail}`,
-    });
+    const pausedText = `Paused ${shortProjectId(board.projectId)}.${tail} Resume with \`/hydra planner resume\`.`;
+    this.releaseTurnForPause(sessionId, pausedText);
+    this.client.reply(reqId, { text: pausedText });
   }
 
   private handleResume(reqId: number | string, sessionId: string): void {
@@ -3877,6 +3877,15 @@ export class PlannerBridge {
     this.resolveDeferredMcpExecute(orchestratorSessionId, stoppedText);
    }
 
+  // End the live turn when the project pauses. Otherwise the session keeps
+  // looking busy while nothing is running. Returns whether anything was
+  // waiting on it.
+  private releaseTurnForPause(sessionId: string, text: string): boolean {
+    const held = resolveHeldTurn(sessionId, { reason: "paused", text });
+    const mcp = this.resolveDeferredMcpExecute(sessionId, text);
+    return held || mcp;
+  }
+
   // Nothing else can progress and some finished work never landed: pause
   // with the reason recorded, so the state explains itself wherever it is
   // shown. Resume re-verifies the landings before dispatching anything.
@@ -3895,12 +3904,14 @@ export class PlannerBridge {
     saveBoard(board, orchestratorSessionId);
     this.emitPlanUpdate(orchestratorSessionId, board);
     log.warn(`project ${shortProjectId(board.projectId)} paused: ${board.pausedReason}`);
-    void this.emitSyntheticMessage(
-      orchestratorSessionId,
+    const text =
       `Paused: nothing else can run until ${ids} lands. ${board.pausedReason}\n\n` +
-        `\`get_findings\` has the details; resume re-checks the landing first.`,
-      { event: "project-paused-unlanded" },
-    );
+      `\`get_findings\` has the details; resume re-checks the landing first.`;
+    if (!this.releaseTurnForPause(orchestratorSessionId, text)) {
+      void this.emitSyntheticMessage(orchestratorSessionId, text, {
+        event: "project-paused-unlanded",
+      });
+    }
   }
 
   // Surface "project stuck behind failed dependencies" by ending the
@@ -8837,10 +8848,9 @@ export class PlannerBridge {
     board.pausedReason = "paused by user";
     saveBoard(board, sessionId);
     const inFlight = inFlightCount(board);
-    this.replyMcpResult(
-      reqId,
-      `Paused ${shortProjectId(board.projectId)}.${inFlight > 0 ? ` ${inFlight} in-flight worker${inFlight === 1 ? "" : "s"} will run to completion.` : ""}`,
-    );
+    const pausedText = `Paused ${shortProjectId(board.projectId)}.${inFlight > 0 ? ` ${inFlight} in-flight worker${inFlight === 1 ? "" : "s"} will run to completion.` : ""}`;
+    this.releaseTurnForPause(sessionId, pausedText);
+    this.replyMcpResult(reqId, pausedText);
   }
 
   private toolResume(reqId: number | string, sessionId: string): void {

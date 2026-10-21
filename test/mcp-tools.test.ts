@@ -13,6 +13,7 @@ import {
 } from "../src/bridge.ts";
 import { newBoard, saveBoard, type Board } from "../src/board.ts";
 import { projectDir } from "../src/paths.ts";
+import { clearHeldTurn, createHeldTurn } from "../src/held-turn.ts";
 
 // Tests for the MCP tool surface implemented in bridge.ts. We
 // construct a PlannerBridge wired to a fake client so we never open
@@ -1780,6 +1781,23 @@ describe("pause", () => {
     dispatch(mkInvoke(82, "pause", {}));
     await settle();
     assert.equal(boards.get("hydra_session_test")!.state, "paused");
+  });
+
+  it("releases the held turn so the session stops looking busy", async () => {
+    const b = seedBoard("hydra_session_test", { state: "running" });
+    const held = createHeldTurn({
+      orchestratorSessionId: "hydra_session_test",
+      projectId: b.projectId,
+      commandsInvokeReqId: 1,
+      slashVerb: "start",
+    });
+    dispatch(mkInvoke(83, "pause", {}));
+    await settle();
+    const resolution = await held.promise;
+    assert.equal(resolution.reason, "paused");
+    assert.match(resolution.text, /Paused/);
+    assert.equal(boards.get("hydra_session_test")!.pausedReason, "paused by user");
+    clearHeldTurn("hydra_session_test");
   });
 });
 
