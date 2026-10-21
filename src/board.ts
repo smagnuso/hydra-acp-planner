@@ -565,6 +565,9 @@ export interface Board {
     lastActivityAt?: number;
   }>;
   concurrencyCap: number;
+  // Why the board is paused, shown wherever the state is. Cleared when
+  // the board leaves "paused".
+  pausedReason?: string;
   // When true, decomposition won't recompute concurrencyCap from the
   // DAG shape — the user pinned it explicitly via `--workers N`.
   concurrencyCapLocked?: boolean;
@@ -657,7 +660,17 @@ export function setBoardState(board: Board, next: BoardState): void {
   } else if (!isTerminal && wasTerminal) {
     board.orchestratorUsageAtCompletion = undefined;
   }
+  if (next !== "paused") {
+    board.pausedReason = undefined;
+  }
   board.state = next;
+}
+
+// A finished task whose work did not verifiably reach the integration
+// tree. Dependents must not fork a tree that is missing it.
+export function hasUnconfirmedLanding(task: Task): boolean {
+  const status = task.workspaceLanding?.status;
+  return status === "declined" || status === "unknown";
 }
 
 export const PROJECT_ID_PREFIX = "hydra_plan_";
@@ -1050,6 +1063,7 @@ export interface ProjectIndexEntry {
   orchestratorSessionId: string | undefined;
   description: string;
   state: BoardState;
+  pausedReason?: string;
   tasksTotal: number;
   tasksDone: number;
   createdAt: string;
@@ -1092,7 +1106,9 @@ export function pickEligible(board: Board): Task | undefined {
           )
         : null;
     return !task.deps.some((d) => {
-      const s = byId.get(d)?.status;
+      const dep = byId.get(d);
+      const s = dep?.status;
+      if (dep && s === "done" && hasUnconfirmedLanding(dep)) return true;
       if (s === "done" || s === "superseded") return false;
       if (s === "awaiting_review" && reviewsSet?.has(d)) return false;
       return true;
@@ -1321,6 +1337,7 @@ export function listProjects(): ProjectIndexEntry[] {
       orchestratorSessionId,
       description: board.description,
       state: board.state,
+      pausedReason: board.pausedReason,
       tasksTotal: board.tasks.length,
       tasksDone: board.tasks.filter((t) => t.status === "done").length,
       createdAt: board.createdAt,

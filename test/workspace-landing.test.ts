@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   classifyMergeReply,
   isConflictDecline,
+  isRetryableUnknown,
   classifyDiscardReply,
   classifyWorkspaceStatusReply,
 } from "../src/bridge.ts";
@@ -185,5 +186,24 @@ describe("isConflictDecline", () => {
     assert.equal(isConflictDecline({ status: "declined", detail: "not a git tree", at }), false);
     assert.equal(isConflictDecline({ status: "unknown", detail: "conflict", at }), false);
     assert.equal(isConflictDecline({ status: "landed", at }), false);
+  });
+});
+
+describe("isRetryableUnknown", () => {
+  it("retries unconfirmed landings that were attempted", () => {
+    assert.equal(isRetryableUnknown({ status: "unknown", detail: "no reply received", at: "" }), true);
+    assert.equal(
+      isRetryableUnknown({ status: "unknown", detail: "Merged x — but the worker left changes uncommitted", at: "" }),
+      true,
+    );
+  });
+
+  it("does not retry when nothing was attempted or there is no session", () => {
+    assert.equal(
+      isRetryableUnknown({ status: "unknown", detail: "not attempted: the project was stopped", at: "" }),
+      false,
+    );
+    assert.equal(isRetryableUnknown({ status: "unknown", detail: "no recorded worker session", at: "" }), false);
+    assert.equal(isRetryableUnknown({ status: "declined", detail: "conflict", at: "" }), false);
   });
 });

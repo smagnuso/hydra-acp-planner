@@ -104,6 +104,7 @@ import {
   isCompetitionCandidate,
   isCompetitionReview,
   needsIsolatedWorkspace,
+  hasUnconfirmedLanding,
   parseIsolationFromObject,
   parseReviewPolicyFromObject,
   pickEligible,
@@ -544,6 +545,18 @@ export function isConflictDecline(
 }
 
 const MAX_CONFLICT_RESOLUTIONS = 2;
+
+// An unconfirmed landing worth another try: the reply was missing,
+// unrecognized, or the work was uncommitted. Not the cases where nothing
+// was attempted or there is no session to land from.
+export function isRetryableUnknown(
+  landing: NonNullable<Task["workspaceLanding"]>,
+): boolean {
+  return (
+    landing.status === "unknown" &&
+    !/not attempted|no recorded worker session/i.test(landing.detail ?? "")
+  );
+}
 
 // Read a `/hydra workspace status` reply for what the workspace says
 // about the agent's work.
@@ -2274,6 +2287,36 @@ export class PlannerBridge {
     saveBoard(board, sessionId);
   }
 
+  // Finished tasks whose landing never confirmed hold their dependents
+  // back (see pickEligible). The user may have landed one by hand, so
+  // look again before dispatching: a workspace that is clean and in sync
+  // with the source has nothing left to land, anything else gets a fresh
+  // landing attempt.
+  private async reverifyLandings(sessionId: string, board: Board): Promise<void> {
+    let changed = false;
+    for (const task of board.tasks) {
+      if (task.status !== "done" || !hasUnconfirmedLanding(task) || !task.workspace) continue;
+      const holder = task.workerSessions?.at(-1);
+      if (!holder) continue;
+      const state = await enqueueOnIntegrationTree(board.projectId, () =>
+        this.verifyWorkspaceCommitted(holder),
+      );
+      if (state === "nothing-here") {
+        task.workspaceLanding = {
+          status: "landed",
+          detail: "re-verified on resume: the workspace is clean and in sync with the source tree",
+          at: nowIso(),
+        };
+      } else {
+        await this.mergeTaskWorkspace(board, sessionId, task);
+      }
+      changed = true;
+    }
+    if (changed) {
+      saveBoard(board, sessionId);
+    }
+  }
+
   private async resumeBoardToRunning(
     sessionId: string,
     board: Board,
@@ -2293,6 +2336,9 @@ export class PlannerBridge {
       );
     }
     await this.resolveIntegrationTree(sessionId, board);
+    if (board.tasks.some((t) => t.status === "done" && hasUnconfirmedLanding(t))) {
+      await this.reverifyLandings(sessionId, board);
+    }
     void this.scheduleEligibleTasks(sessionId, board);
     return { resumedFrom: prevState };
   }
@@ -2682,6 +2728,7 @@ export class PlannerBridge {
       return;
     }
     setBoardState(board, "paused");
+    board.pausedReason = "paused by user";
     saveBoard(board, sessionId);
     const inFlight = inFlightCount(board);
     const tail = inFlight > 0
@@ -2829,6 +2876,9 @@ export class PlannerBridge {
       lines.push(
         `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${sess}  ${desc}`,
       );
+      if (p.state === "paused" && p.pausedReason) {
+        lines.push(`${" ".repeat(idW + 2)}paused: ${p.pausedReason}`);
+      }
     }
     lines.push("");
     lines.push("Fork one into this session with `/hydra planner fork <projectId>`.");
@@ -3827,6 +3877,32 @@ export class PlannerBridge {
     this.resolveDeferredMcpExecute(orchestratorSessionId, stoppedText);
    }
 
+  // Nothing else can progress and some finished work never landed: pause
+  // with the reason recorded, so the state explains itself wherever it is
+  // shown. Resume re-verifies the landings before dispatching anything.
+  private pauseForUnlanded(
+    orchestratorSessionId: string,
+    board: Board,
+    unlanded: Task[],
+  ): void {
+    if (board.state !== "running") return;
+    const ids = unlanded.map((t) => t.id).join(", ");
+    const detail = (unlanded[0]?.workspaceLanding?.detail ?? "no reason given")
+      .replace(/\s+/g, " ")
+      .slice(0, 200);
+    setBoardState(board, "paused");
+    board.pausedReason = `${ids}: work did not land (${detail}). Land it by hand, then resume.`;
+    saveBoard(board, orchestratorSessionId);
+    this.emitPlanUpdate(orchestratorSessionId, board);
+    log.warn(`project ${shortProjectId(board.projectId)} paused: ${board.pausedReason}`);
+    void this.emitSyntheticMessage(
+      orchestratorSessionId,
+      `Paused: nothing else can run until ${ids} lands. ${board.pausedReason}\n\n` +
+        `\`get_findings\` has the details; resume re-checks the landing first.`,
+      { event: "project-paused-unlanded" },
+    );
+  }
+
   // Surface "project stuck behind failed dependencies" by ending the
   // user's held turn with a failure resolution. Called from the
   // scheduler when no task is eligible AND no worker is in flight AND
@@ -4629,6 +4705,13 @@ export class PlannerBridge {
     // Project-complete short-circuit. Emit a final plan snapshot,
     // transition state, resolve the held turn (if any) with a success
     // summary so handleCreate/Execute replies to commands/invoke.
+    const unlanded = board.tasks.filter(
+      (t) => t.status === "done" && hasUnconfirmedLanding(t),
+    );
+    if (allTerminal(board) && unlanded.length > 0) {
+      this.pauseForUnlanded(orchestratorSessionId, board, unlanded);
+      return;
+    }
     if (allTerminal(board)) {
       setBoardState(board, "done");
       saveBoard(board, orchestratorSessionId);
@@ -4708,7 +4791,11 @@ export class PlannerBridge {
           inFlightCount(board) === 0 &&
           board.tasks.some((t) => t.status === "pending")
         ) {
-          this.notifyBlockedByFailure(orchestratorSessionId, board);
+          if (unlanded.length > 0) {
+            this.pauseForUnlanded(orchestratorSessionId, board, unlanded);
+          } else {
+            this.notifyBlockedByFailure(orchestratorSessionId, board);
+          }
         }
         return;
       }
@@ -7317,28 +7404,73 @@ export class PlannerBridge {
     // resolve it. The resolution turn runs OUTSIDE the integration-tree
     // queue (only the retried landing goes back in) so a long agent turn
     // does not block every other landing.
+    //
+    // An unconfirmed (not declined) outcome is retried too: the usual
+    // cause is a resolution that left its merge uncommitted, which the
+    // landing reports as unknown rather than as another conflict.
     for (
       let attempt = 1;
       attempt <= MAX_CONFLICT_RESOLUTIONS &&
       task.workspaceLanding !== undefined &&
-      isConflictDecline(task.workspaceLanding) &&
+      (isConflictDecline(task.workspaceLanding) || isRetryableUnknown(task.workspaceLanding)) &&
       board.state === "running";
       attempt++
     ) {
       const holder = preferSessionId ?? task.workerSessions?.at(-1);
       if (!holder) break;
-      const ok = await this.resolveLandingConflict(
-        orchestratorSessionId,
-        holder,
-        board,
-        task,
-        task.workspaceLanding.detail ?? "",
-        MAX_CONFLICT_RESOLUTIONS - attempt + 1,
-      );
-      if (!ok) break;
+      if (isConflictDecline(task.workspaceLanding)) {
+        const ok = await this.resolveLandingConflict(
+          orchestratorSessionId,
+          holder,
+          board,
+          task,
+          task.workspaceLanding.detail ?? "",
+          MAX_CONFLICT_RESOLUTIONS - attempt + 1,
+        );
+        if (!ok) break;
+      }
+      if (!(await this.ensureWorkspaceCommitted(holder, task))) break;
       await attemptLanding();
     }
     this.haltIfLandingUnconfirmed(board, orchestratorSessionId, task);
+  }
+
+  // Make sure the session holding a workspace has committed everything,
+  // reminding it (bounded, like the post-task commit reminder) when it
+  // has not. Returns false when the workspace is still dirty or the
+  // reminder turn could not run; the caller then leaves the landing as
+  // it was.
+  private async ensureWorkspaceCommitted(
+    holderSessionId: string,
+    task: Task,
+  ): Promise<boolean> {
+    for (let used = 0; ; used++) {
+      const state = await this.verifyWorkspaceCommitted(holderSessionId);
+      if (state !== "uncommitted") return true;
+      if (used >= COMMIT_REPROMPT_LIMIT || this.shuttingDown) return false;
+      log.info(
+        `task ${task.id}: workspace is dirty before landing; asking …${holderSessionId.slice(-8)} to commit (${COMMIT_REPROMPT_LIMIT - used} attempt(s) left)`,
+      );
+      try {
+        await this.client.request("hydra-acp/message/emit", {
+          sessionId: holderSessionId,
+          method: "session/prompt",
+          envelope: buildTextPromptEnvelope({
+            sessionId: holderSessionId,
+            text: buildCommitRepromptPrompt(task, COMMIT_REPROMPT_LIMIT - used),
+            ancillary: true,
+          }),
+          route: "queue",
+        });
+      } catch (err) {
+        if (!this.isShutdownError(err)) {
+          log.error(
+            `commit reminder for ${task.id} on …${holderSessionId.slice(-8)} failed: ${(err as Error).message}`,
+          );
+        }
+        return false;
+      }
+    }
   }
 
   // One resolution turn on the session that holds a declined workspace.
@@ -7442,41 +7574,34 @@ export class PlannerBridge {
     task.workspaceLanding = landing;
   }
 
-  // Hold the project when a task's work did not verifiably reach the
-  // integration tree.
+  // Record that a task's work did not verifiably reach the integration
+  // tree.
   //
-  // Without this, a dependent forks a tree that is missing the very work
-  // it depends on and produces something plausible and wrong — the
-  // failure mode this whole design exists to avoid. Pausing rather than
-  // failing the task is deliberate: the work EXISTS, in a workspace we
-  // deliberately keep, so this is a "come look at it" and not a loss.
+  // Dependents of this task are held back by the scheduler (pickEligible
+  // refuses a dep with an unconfirmed landing), because they would fork a
+  // tree missing the very work they depend on and produce something
+  // plausible and wrong. Independent branches keep running; the scheduler
+  // pauses the project (pauseForUnlanded) once nothing else can progress.
+  // The work is not lost: it is kept in a workspace, so this is a "come
+  // look at it" and not a failure.
   private haltIfLandingUnconfirmed(
     board: Board,
     orchestratorSessionId: string,
     task: Task,
   ): void {
-    const status = task.workspaceLanding?.status;
-    if (status !== "declined" && status !== "unknown") return;
-    // Dependents are stopped by pausing: scheduleEligibleTasks already
-    // refuses to dispatch on a paused board, so this needs no new
-    // scheduler state.
-    if (board.state === "running") {
-      setBoardState(board, "paused");
-      saveBoard(board, orchestratorSessionId);
-      this.emitPlanUpdate(orchestratorSessionId, board);
-    }
+    if (!hasUnconfirmedLanding(task)) return;
     const where = task.workspace?.path ?? "its workspace";
     const session = task.workerSessions?.at(-1);
     log.warn(
-      `project ${shortProjectId(board.projectId)} paused: ${task.id}'s work did not confirm landing`,
+      `project ${shortProjectId(board.projectId)}: ${task.id}'s work did not confirm landing; holding its dependents`,
     );
     void this.emitSyntheticMessage(
       orchestratorSessionId,
-      `Paused: ${task.id}'s work did not confirm landing into the integration tree, so anything depending on it would build on a tree missing that work.\n\n` +
-        `The work is not lost — it is still in ${where}${session ? ` (session ${shortSessionId(session)})` : ""}.\n` +
+      `${task.id}'s work did not confirm landing into the integration tree. Tasks depending on it are held back so they do not build on a tree missing that work; independent tasks keep running.\n\n` +
+        `The work is not lost: it is still in ${where}${session ? ` (session ${shortSessionId(session)})` : ""}.\n` +
         `${task.workspaceLanding?.detail ?? ""}\n\n` +
-        `Check it, land it by hand if it is sound, then resume. \`get_findings\` has the details.`,
-      { event: "project-paused-unlanded", taskId: task.id },
+        `Check it and land it by hand if it is sound, then resume. \`get_findings\` has the details.`,
+      { event: "task-landing-unconfirmed", taskId: task.id },
     );
   }
 
@@ -8709,6 +8834,7 @@ export class PlannerBridge {
       );
     }
     setBoardState(board, "paused");
+    board.pausedReason = "paused by user";
     saveBoard(board, sessionId);
     const inFlight = inFlightCount(board);
     this.replyMcpResult(

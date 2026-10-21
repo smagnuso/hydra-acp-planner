@@ -208,6 +208,9 @@ export function buildAsciiPlanText(board: Board): string {
   if (inFlight > 0) counts.push(`${inFlight} running`);
   if (failed > 0) counts.push(`${failed} failed`);
   lines.push(`── ${shortProjectId(board.projectId)} (${board.state}) — ${counts.join(", ")} ──`);
+  if (board.state === "paused" && board.pausedReason) {
+    lines.push(`  paused: ${board.pausedReason}`);
+  }
   if (board.isolation?.mode === "per-task") {
     lines.push(`  isolation: per-task${board.isolation.auto ? " (auto)" : ""}; [isolated] tasks run in their own workspace`);
   }

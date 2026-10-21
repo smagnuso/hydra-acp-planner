@@ -1250,3 +1250,12 @@ describe("formatIsolationTag", () => {
     assert.equal(formatIsolationTag(b.tasks[0]!, b), "");
   });
 });
+
+describe("paused reason", () => {
+  it("is shown in the status body only while paused", () => {
+    const b = board({ state: "paused", pausedReason: "T4: work did not land" });
+    assert.match(formatStatus(b, false), /Paused: T4: work did not land/);
+    b.state = "running";
+    assert.doesNotMatch(formatStatus(b, false), /Paused:/);
+  });
+});

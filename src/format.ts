@@ -461,6 +461,9 @@ export function formatStatusBody(
   const failed = board.tasks.filter((t) => t.status === "failed").length;
   lines.push(`${shortProjectId(board.projectId)}  (${board.state})`);
   lines.push(`   ${board.description}`);
+  if (board.state === "paused" && board.pausedReason) {
+    lines.push(`   Paused: ${board.pausedReason}`);
+  }
   lines.push("");
   const counts = [`${board.tasks.length} total`, `${done} done`];
   if (inFlight > 0) counts.push(`${inFlight} in flight`);

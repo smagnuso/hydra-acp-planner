@@ -124,6 +124,9 @@ function runList(argv: readonly string[]): void {
     process.stdout.write(
       `${shortProjectId(p.projectId).padEnd(idW)}  ${p.state.padEnd(stateW)}  ${tasks}  ${age}  ${sess}  ${desc}\n`,
     );
+    if (p.state === "paused" && p.pausedReason) {
+      process.stdout.write(`${" ".repeat(idW + 2)}paused: ${p.pausedReason}\n`);
+    }
   }
   if (truncated > 0) {
     process.stdout.write(

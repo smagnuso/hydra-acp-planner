@@ -27,6 +27,7 @@ import {
   resolveReviewLane,
   resolveTaskLane,
   saveBoard,
+  setBoardState,
   shortProjectId,
   shortSessionId,
   stopBoardBookkeeping,
@@ -258,6 +259,28 @@ describe("pickEligible", () => {
 
   it("returns undefined for an empty board", () => {
     assert.equal(pickEligible(makeBoard([])), undefined);
+  });
+
+  it("holds dependents of a done task whose landing did not confirm, not independents", () => {
+    const landing = (status: "landed" | "declined" | "unknown") => ({ status, at: "" });
+    const board = makeBoard([
+      makeTask("T1", { status: "done", workspaceLanding: landing("declined") }),
+      makeTask("T2", { deps: ["T1"] }),
+      makeTask("T3"),
+    ]);
+    assert.equal(pickEligible(board)?.id, "T3");
+    board.tasks[2]!.status = "done";
+    assert.equal(pickEligible(board), undefined);
+    board.tasks[0]!.workspaceLanding = landing("landed");
+    assert.equal(pickEligible(board)?.id, "T2");
+  });
+
+  it("clears pausedReason when the board leaves paused", () => {
+    const board = makeBoard([]);
+    setBoardState(board, "paused");
+    board.pausedReason = "paused by user";
+    setBoardState(board, "running");
+    assert.equal(board.pausedReason, undefined);
   });
 
   it("returns the first pending task with no deps", () => {
