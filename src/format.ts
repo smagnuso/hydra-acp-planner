@@ -1,7 +1,7 @@
 // Text formatters for board state. Pure functions over Board — no I/O,
 // no daemon calls — so they're directly unit-testable.
 
-import { isInFlight, resolveAgent, resolveModel, resolveTaskLane, sessionLink, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
+import { isInFlight, needsIsolatedWorkspace, resolveAgent, resolveModel, resolveTaskLane, sessionLink, shortProjectId, shortSessionId, type Board, type Task, type TaskArtifacts, type WorkerUsage } from "./board.js";
 import {
   buildReviewsByParent,
   isMultiRevieweeReview,
@@ -173,6 +173,15 @@ export function formatTaskTag(task: Task, board?: Board): string {
   if (!a && !m) return "";
   const inner = a && m ? `${a}·${m}` : (a ?? m);
   return ` {${inner}}`;
+}
+
+// Marks a task that runs (or will run) in its own isolated workspace.
+// Already-spawned tasks are judged by their recorded workspace; pending
+// ones by what the scheduler will decide when it spawns them.
+export function formatIsolationTag(task: Task, board: Board): string {
+  if (task.workspace) return " [isolated]";
+  if (task.status !== "pending") return "";
+  return needsIsolatedWorkspace(board, task.id) ? " [isolated]" : "";
 }
 
 // Live-panel annotation for a task whose isolated workspace didn't
@@ -404,7 +413,7 @@ export function formatBoardContext(board: Board): string {
         isInFlight(task.status) && task.assignedTo
           ? `, worker: ${shortSessionId(task.assignedTo)}`
           : "";
-      const tag = formatTaskTag(task, board);
+      const tag = `${formatTaskTag(task, board)}${formatIsolationTag(task, board)}`;
       const dur = formatTaskDuration(task);
       const durTag = dur ? `, duration: ${dur}` : "";
       lines.push(`  ${glyph} ${task.id} ${task.title}${tag} [${displayStatus}${deps}${worker}${durTag}]`);
@@ -508,7 +517,7 @@ export function formatStatusBody(
       if (targets.every((id) => renderedTaskIds.has(id))) {
         const line = renderReviewTask(t, renderedReviews, {
           indent: "   ",
-          renderTaskTag: (x) => formatTaskTag(x, board),
+          renderTaskTag: (x) => `${formatTaskTag(x, board)}${formatIsolationTag(x, board)}`,
           allTasks: board.tasks,
         });
         if (line) lines.push(line);
@@ -532,7 +541,7 @@ export function formatStatusBody(
       isInFlight(task.status) && task.assignedTo
         ? `  → ${shortSessionId(task.assignedTo)}`
         : "";
-    const tag = formatTaskTag(task, board);
+    const tag = `${formatTaskTag(task, board)}${formatIsolationTag(task, board)}`;
     const dur = formatTaskDuration(task);
     const durStr = dur ? `  (${dur})` : "";
     lines.push(`   ${glyph} ${task.id}  ${task.title}${tag}${deps}${worker}${durStr}`);
@@ -542,7 +551,7 @@ export function formatStatusBody(
       for (const r of childReviews) {
         const line = renderReviewTask(r, renderedReviews, {
           indent: "    ",
-          renderTaskTag: (t) => formatTaskTag(t, board),
+          renderTaskTag: (t) => `${formatTaskTag(t, board)}${formatIsolationTag(t, board)}`,
           allTasks: board.tasks,
         });
         if (line) lines.push(line);
@@ -555,7 +564,7 @@ export function formatStatusBody(
   for (const t of pendingPeerReviews) {
     const line = renderReviewTask(t, renderedReviews, {
       indent: "   ",
-      renderTaskTag: (x) => formatTaskTag(x, board),
+      renderTaskTag: (x) => `${formatTaskTag(x, board)}${formatIsolationTag(x, board)}`,
       allTasks: board.tasks,
     });
     if (line) lines.push(line);

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectFindings, countFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatTaskTag, formatWorkspaceLandingTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
+import { collectFindings, countFindings, formatBoardContext, formatCompletionFindings, formatFindingBlock, formatSessionLinksFooter, formatSessionsTable, formatStatus, formatIsolationTag, formatTaskTag, formatWorkspaceLandingTag, orchestratorUsageSincePlan, totalUsage } from "../src/format.ts";
 import { setBoardState, type Board, type Task } from "../src/board.ts";
 
 function task(id: string, opts: Partial<Task> = {}): Task {
@@ -1219,5 +1219,34 @@ describe("workerSessions in findings", () => {
     );
     const block = formatFindingBlock(finding!);
     assert.doesNotMatch(block, /sessions:/);
+  });
+});
+
+describe("formatIsolationTag", () => {
+  const parallel = () =>
+    board({
+      isolation: { mode: "per-task" },
+      concurrencyCap: 2,
+      tasks: [task("T1"), task("T2"), task("T3", { deps: ["T1", "T2"] })],
+    });
+
+  it("marks pending tasks that can overlap another writer", () => {
+    const b = parallel();
+    assert.equal(formatIsolationTag(b.tasks[0]!, b), " [isolated]");
+    assert.equal(formatIsolationTag(b.tasks[2]!, b), "");
+  });
+
+  it("marks tasks that already hold a workspace", () => {
+    const b = parallel();
+    const t = b.tasks[2]!;
+    t.status = "done";
+    t.workspace = { path: "/w", sourceCwd: "/s", label: "l", provider: "git" };
+    assert.equal(formatIsolationTag(t, b), " [isolated]");
+  });
+
+  it("renders nothing when isolation is unset", () => {
+    const b = parallel();
+    b.isolation = undefined;
+    assert.equal(formatIsolationTag(b.tasks[0]!, b), "");
   });
 });

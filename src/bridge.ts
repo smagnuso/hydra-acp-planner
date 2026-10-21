@@ -130,6 +130,7 @@ import {
   summarizeDiff,
   type DiffFile,
 } from "./util/session-diff.js";
+import { isInsideGitTree } from "./util/git-tree.js";
 import { fetchSessionInfo, integrationTreeOf, type SessionInfo } from "./util/session-info.js";
 import {
   buildAddTaskPrompt,
@@ -2222,6 +2223,12 @@ export class PlannerBridge {
       info = undefined;
     }
     const tree = info ? integrationTreeOf(info) : undefined;
+    if (board.isolation.auto && (tree === undefined || !isInsideGitTree(tree))) {
+      board.isolation = undefined;
+      saveBoard(board, sessionId);
+      log.info(`${shortProjectId(board.projectId)}: auto isolation dropped, working tree is not a git repo`);
+      return;
+    }
     if (tree === undefined) {
       log.warn(
         `${shortProjectId(board.projectId)}: isolation is on but the orchestrator's working tree could not be resolved; tasks will fall back to inheriting it implicitly`,
@@ -2231,12 +2238,40 @@ export class PlannerBridge {
     board.integrationTree = tree;
     saveBoard(board, sessionId);
     log.info(`${shortProjectId(board.projectId)}: integration tree ${tree}`);
+    if (board.isolation.auto && !board.tasks.some((t) => needsIsolatedWorkspace(board, t.id))) {
+      return;
+    }
     void this.emitSyntheticMessage(
       sessionId,
-      `Isolation is on. Task work happens in separate workspaces and lands into ${tree} as each task is accepted. ` +
+      `Isolation is on${board.isolation.auto ? " (enabled automatically because tasks can run in parallel; turn it off with update_plan isolation mode 'off')" : ""}. Task work happens in separate workspaces and lands into ${tree} as each task is accepted. ` +
         `Workers fork from the last commit, so they will NOT see uncommitted changes in that tree — commit or stash first if this plan is meant to build on work in progress.`,
       { event: "project-integration-tree" },
     );
+  }
+
+  // A plan that says nothing about isolation gets per-task isolation when
+  // the orchestrator's tree is a git repo. Whether any task actually gets
+  // a workspace stays a DAG/cap question (needsIsolatedWorkspace), so a
+  // linear plan is unaffected and a later add_task is covered. An explicit
+  // {mode:"off"} is never reached here. Re-checked at run start, since the
+  // tree can change in between.
+  private async autoEnableIsolation(sessionId: string, board: Board): Promise<void> {
+    const fetcher = this.fetchSessionInfoOverride
+      ?? ((sid: string) =>
+        fetchSessionInfo(sid, {
+          daemonHttpBase: this.daemonHttpBase,
+          token: this.daemonToken,
+        }));
+    let info: SessionInfo | undefined;
+    try {
+      info = await fetcher(sessionId);
+    } catch {
+      return;
+    }
+    const tree = info ? integrationTreeOf(info) : undefined;
+    if (tree === undefined || !isInsideGitTree(tree)) return;
+    board.isolation = { mode: "per-task", auto: true };
+    saveBoard(board, sessionId);
   }
 
   private async resumeBoardToRunning(
@@ -8214,6 +8249,8 @@ export class PlannerBridge {
     }
     if (boardIsolation) {
       board.isolation = boardIsolation;
+    } else {
+      await this.autoEnableIsolation(sessionId, board);
     }
     board.pendingExecute = false; // ready, awaiting start
     boards.set(sessionId, board);
@@ -8262,7 +8299,14 @@ export class PlannerBridge {
     const reviewBlurb = reviewCount > 0
       ? ` + ${reviewCount} auto-synthesized review${reviewCount === 1 ? "" : "s"}`
       : "";
-    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}. Call start when ready to start.`;
+    const isolatedIds = board.tasks
+      .filter((t) => needsIsolatedWorkspace(board, t.id))
+      .map((t) => t.id);
+    const isolationBlurb =
+      board.isolation?.auto && isolatedIds.length > 0
+        ? ` Isolation was enabled automatically; ${isolatedIds.join(", ")} will run in separate workspaces (update_plan isolation mode 'off' to disable).`
+        : "";
+    const summary = `Saved ${normalized.tasks.length} task${normalized.tasks.length === 1 ? "" : "s"}${reviewBlurb} (concurrency cap ${board.concurrencyCap}): ${titles}.${isolationBlurb} Call start when ready to start.`;
     this.replyMcpResult(reqId, summary, {
       projectId: board.projectId,
       replacedReadyProjectId: replacedReadyId,
@@ -9049,7 +9093,7 @@ export class PlannerBridge {
         );
       }
       if (JSON.stringify(board.isolation ?? null) !== JSON.stringify(next)) {
-        board.isolation = next.mode === "off" && !next.required ? undefined : next;
+        board.isolation = next;
         changes.push(`isolation=${next.mode}${next.required ? "+required" : ""}`);
       }
     }

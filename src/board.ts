@@ -523,6 +523,9 @@ export interface Board {
   isolation?: {
     mode: "off" | "per-task";
     required?: boolean;
+    // Set when the planner turned isolation on itself because the plan
+    // left it unset. An explicit {mode:"off"} is never overridden.
+    auto?: boolean;
   };
   // The tree isolated task workspaces fork from and land back into: the
   // orchestrator session's effective cwd, which is the user's checkout

@@ -22,7 +22,7 @@ import {
   type UpdateEnvelope,
 } from "./util/text.js";
 import { isInFlight, shortProjectId } from "./board.js";
-import { formatTaskTag, formatWorkspaceLandingTag } from "./format.js";
+import { formatIsolationTag, formatTaskTag, formatWorkspaceLandingTag } from "./format.js";
 import {
   buildReviewsByParent,
   isMultiRevieweeReview,
@@ -146,7 +146,7 @@ export function buildPlanUpdateEnvelope(opts: {
   for (const t of board.tasks) {
     const failedPrefix = t.status === "failed" ? "[FAILED] " : "";
     entries.push({
-      content: `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}${formatWorkspaceLandingTag(t)}`,
+      content: `${failedPrefix}${t.id}  ${t.title}${formatTaskTag(t, board)}${formatIsolationTag(t, board)}${formatWorkspaceLandingTag(t)}`,
       priority: taskPriority(t, blockedByCount),
       status: mapStatus(t),
     });
@@ -208,11 +208,14 @@ export function buildAsciiPlanText(board: Board): string {
   if (inFlight > 0) counts.push(`${inFlight} running`);
   if (failed > 0) counts.push(`${failed} failed`);
   lines.push(`── ${shortProjectId(board.projectId)} (${board.state}) — ${counts.join(", ")} ──`);
+  if (board.isolation?.mode === "per-task") {
+    lines.push(`  isolation: per-task${board.isolation.auto ? " (auto)" : ""}; [isolated] tasks run in their own workspace`);
+  }
 
   const reviewsByParent = buildReviewsByParent(board.tasks);
   const renderedReviews = new Set<string>();
 
-  const tagFor = (t: Task) => `${formatTaskTag(t, board)}${formatWorkspaceLandingTag(t)}`;
+  const tagFor = (t: Task) => `${formatTaskTag(t, board)}${formatIsolationTag(t, board)}${formatWorkspaceLandingTag(t)}`;
   const cap = workerSubtodoCap();
   const workerByTask = new Map<string, string>();
   for (const [wid, w] of Object.entries(board.workers)) {

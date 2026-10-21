@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -565,6 +565,60 @@ describe("set_plan", () => {
 });
 
 // ── update_plan / update_task title+onReject ───────────────
+
+describe("set_plan auto isolation", () => {
+  const parallelPlan = {
+    description: "x",
+    tasks: [
+      { id: "T1", title: "a", reviewHint: "skip" },
+      { id: "T2", title: "b", reviewHint: "skip" },
+    ],
+  };
+
+  function bridgeWithCwd(cwd: string) {
+    client = new FakeClient();
+    bridge = new PlannerBridge({
+      daemonWsUrl: "ws://unused",
+      token: "unused",
+      client,
+      fetchSessionInfo: async () => ({ interactive: true, cwd }),
+    });
+  }
+
+  function repoDir(): string {
+    const dir = join(tmpHome, "repo");
+    mkdirSync(join(dir, ".git"), { recursive: true });
+    return dir;
+  }
+
+  it("turns isolation on when the plan is silent and the tree is a git repo", async () => {
+    bridgeWithCwd(repoDir());
+    dispatch(mkInvoke(930, "set_plan", { ...parallelPlan, concurrencyCap: 2 }));
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.deepEqual(board.isolation, { mode: "per-task", auto: true });
+    const text = (client.lastReply().result as { content: Array<{ text: string }> }).content[0]!.text;
+    assert.match(text, /Isolation was enabled automatically; T1, T2/);
+  });
+
+  it("leaves isolation unset outside a git repo", async () => {
+    const plain = join(tmpHome, "plain");
+    mkdirSync(plain, { recursive: true });
+    bridgeWithCwd(plain);
+    dispatch(mkInvoke(931, "set_plan", { ...parallelPlan, concurrencyCap: 2 }));
+    await settle();
+    assert.equal(boards.get("hydra_session_test")!.isolation, undefined);
+  });
+
+  it("never overrides an explicit off", async () => {
+    bridgeWithCwd(repoDir());
+    dispatch(
+      mkInvoke(932, "set_plan", { ...parallelPlan, concurrencyCap: 2, isolation: { mode: "off" } }),
+    );
+    await settle();
+    assert.deepEqual(boards.get("hydra_session_test")!.isolation, { mode: "off" });
+  });
+});
 
 describe("update_plan", () => {
   function seed(state: "ready" | "done" = "ready") {
@@ -2100,10 +2154,11 @@ describe("requireInteractive guard", () => {
     await settle();
 
     // Second call should reuse cached interactive value; total fetch count
-    // should not increase by more than what seedOrchestratorIdentity adds.
+    // should not increase by more than what seedOrchestratorIdentity and the
+    // auto-isolation cwd lookup add.
     const secondFetchCount = fetchCount;
     assert.ok(
-      secondFetchCount < firstFetchCount + 2,
+      secondFetchCount < firstFetchCount + 3,
       `expected cache hit (fetches: ${firstFetchCount} → ${secondFetchCount})`,
     );
   });
