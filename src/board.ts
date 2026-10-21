@@ -879,6 +879,26 @@ export function parseIsolationFromObject(
   return isolation;
 }
 
+export function parseReviewPolicyFromObject(
+  raw: unknown,
+): Board["reviewPolicy"] | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const rp = raw as Record<string, unknown>;
+  const validModes = ["off", "hints", "all", "high-only"];
+  let mode: NonNullable<Board["reviewPolicy"]>["mode"] = "hints";
+  if (typeof rp.mode === "string" && validModes.includes(rp.mode)) {
+    mode = rp.mode as typeof mode;
+  }
+  const policy: NonNullable<Board["reviewPolicy"]> = {
+    mode,
+    overrideHint: typeof rp.overrideHint === "boolean" ? rp.overrideHint : false,
+  };
+  if (typeof rp.maxAttempts === "number" && Number.isFinite(rp.maxAttempts) && rp.maxAttempts > 0) {
+    policy.maxAttempts = Math.floor(rp.maxAttempts);
+  }
+  return policy;
+}
+
 export function newBoard(opts: {
   description: string;
   fleetDefaults?: FleetDefaults;

@@ -564,6 +564,123 @@ describe("set_plan", () => {
   });
 });
 
+// ── update_plan / update_task title+onReject ───────────────
+
+describe("update_plan", () => {
+  function seed(state: "ready" | "done" = "ready") {
+    const b = newBoard({ description: "x" });
+    b.state = state;
+    b.tasks = [
+      { id: "T1", title: "first", deps: [], status: "pending", attemptCount: 0, reviewHint: "skip" },
+    ];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+    return b;
+  }
+
+  it("sets isolation, contractBrief, concurrencyCap and fleetDefaults", async () => {
+    seed();
+    dispatch(
+      mkInvoke(910, "update_plan", {
+        isolation: { mode: "per-task", required: true },
+        contractBrief: "keep it small",
+        concurrencyCap: 3,
+        fleetDefaults: { agent: "a1", work: { model: "m1" } },
+      }),
+    );
+    await settle();
+    const board = boards.get("hydra_session_test")!;
+    assert.deepEqual(board.isolation, { mode: "per-task", required: true });
+    assert.equal(board.contractBrief, "keep it small");
+    assert.equal(board.concurrencyCap, 3);
+    assert.equal(board.concurrencyCapLocked, true);
+    assert.equal(board.fleetDefaults.agent, "a1");
+    assert.deepEqual(board.fleetDefaults.work, { model: "m1" });
+  });
+
+  it("rejects an invalid isolation blob", async () => {
+    seed();
+    dispatch(mkInvoke(911, "update_plan", { isolation: { mode: "bogus" } }));
+    await settle();
+    const result = client.lastReply().result as { isError?: boolean };
+    assert.equal(result.isError, true);
+  });
+
+  it("refuses done projects", async () => {
+    seed("done");
+    dispatch(mkInvoke(912, "update_plan", { concurrencyCap: 2 }));
+    await settle();
+    const result = client.lastReply().result as { isError?: boolean };
+    assert.equal(result.isError, true);
+  });
+});
+
+describe("update_task deps", () => {
+  function seed() {
+    const b = newBoard({ description: "x" });
+    b.state = "ready";
+    b.tasks = [
+      { id: "T1", title: "a", deps: [], status: "pending", attemptCount: 0, reviewHint: "skip" },
+      { id: "T2", title: "b", deps: ["T1"], status: "pending", attemptCount: 0, reviewHint: "skip" },
+      { id: "T3", title: "c", deps: [], status: "pending", attemptCount: 0, reviewHint: "skip" },
+    ];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+  }
+
+  it("rewrites deps", async () => {
+    seed();
+    dispatch(mkInvoke(920, "update_task", { taskId: "T2", deps: ["T3"] }));
+    await settle();
+    assert.deepEqual(boards.get("hydra_session_test")!.tasks[1]!.deps, ["T3"]);
+  });
+
+  it("rejects cycles, self deps and unknown ids", async () => {
+    seed();
+    for (const [id, args] of [
+      [921, { taskId: "T1", deps: ["T2"] }],
+      [922, { taskId: "T1", deps: ["T1"] }],
+      [923, { taskId: "T1", deps: ["nope"] }],
+    ] as const) {
+      dispatch(mkInvoke(id, "update_task", args));
+      await settle();
+      const result = client.lastReply().result as { isError?: boolean };
+      assert.equal(result.isError, true, `case ${id}`);
+    }
+    assert.deepEqual(boards.get("hydra_session_test")!.tasks[0]!.deps, []);
+  });
+});
+
+describe("update_task title/onReject", () => {
+  it("updates title and merges onReject", async () => {
+    const b = newBoard({ description: "x" });
+    b.state = "ready";
+    b.tasks = [{ id: "T1", title: "first", deps: [], status: "pending", attemptCount: 0 }];
+    boards.set("hydra_session_test", b);
+    saveBoard(b, "hydra_session_test");
+
+    dispatch(
+      mkInvoke(913, "update_task", {
+        taskId: "T1",
+        title: "renamed",
+        onReject: { strategy: "escalate", maxAttempts: 2, escalateTo: { agent: "a", model: "m" } },
+      }),
+    );
+    await settle();
+    const task = boards.get("hydra_session_test")!.tasks[0]!;
+    assert.equal(task.title, "renamed");
+    assert.deepEqual(task.onReject, {
+      strategy: "escalate",
+      maxAttempts: 2,
+      escalateTo: { agent: "a", model: "m" },
+    });
+
+    dispatch(mkInvoke(914, "update_task", { taskId: "T1", onReject: {} }));
+    await settle();
+    assert.equal(boards.get("hydra_session_test")!.tasks[0]!.onReject, undefined);
+  });
+});
+
 // ── update_task: riskLevel / reviewHint ────────────────────
 
 describe("update_task riskLevel/reviewHint", () => {
@@ -2040,7 +2157,7 @@ describe("requireInteractive guard", () => {
   });
 
   it("all mutating tools produce correct error message", async () => {
-    const mutatingTools = ["set_plan", "start", "add_task", "update_task", "restart", "stop", "pause", "resume", "skip", "retry", "remove"];
+    const mutatingTools = ["set_plan", "start", "add_task", "update_task", "update_plan", "restart", "stop", "pause", "resume", "skip", "retry", "remove"];
     const sid = `guard_test_all_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
     for (const tool of mutatingTools) {

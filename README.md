@@ -396,6 +396,7 @@ The tools your agent calls. Names match `src/mcp-tools.ts`.
 | `get_findings` | Two-call drill-down for failed tasks, review verdicts, follow-ups, and `verified_diff` descriptors. |
 | `add_task`     | Slot a new task into the running project. |
 | `update_task`  | Mutate fields on an existing task. |
+| `update_plan`  | Change plan-level settings (isolation, reviewPolicy, contractBrief, concurrencyCap, fleetDefaults) without replacing tasks. |
 | `retry`        | Reset a task to pending and resume work. |
 | `skip`         | Mark a task done without running it. |
 | `pause`        | Stop scheduling new tasks. |

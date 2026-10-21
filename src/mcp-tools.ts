@@ -500,6 +500,35 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
           description:
             "Revised risk classification. Empty string clears back to the implicit default ('medium').",
         },
+        title: {
+          type: "string",
+          description: "Revised short title. Cannot be empty.",
+        },
+        deps: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Replacement dependency list (task ids), replacing the existing one; pass [] to remove all deps. Every id must exist, a task cannot depend on itself, and the change is rejected if it would create a cycle. Not allowed on review or distill tasks, whose deps follow from what they review or distill. Unless concurrencyCap was pinned, it is recomputed from the new DAG shape.",
+        },
+        onReject: {
+          type: "object",
+          description:
+            "Revised rejection handling for a review task (what happens when the reviewer rejects). Sub-fields merge onto the existing value; pass an empty string (or 0 for maxAttempts) to clear one sub-field, or an empty object to clear the whole override.",
+          properties: {
+            strategy: { type: "string", enum: ["fresh", "continue", "escalate", ""] },
+            maxAttempts: { type: "integer" },
+            agent: { type: "string" },
+            model: { type: "string" },
+            escalateTo: {
+              type: "object",
+              description: "Required when strategy is 'escalate'.",
+              properties: {
+                agent: { type: "string" },
+                model: { type: "string" },
+              },
+            },
+          },
+        },
         reviewHint: {
           type: "string",
           enum: ["skip", "optional", "recommended", "required"],
@@ -583,3 +612,31 @@ export const PLANNER_MCP_TOOLS: PlannerMcpTool[] = [
     },
   },
 ];
+
+const setPlanTool = PLANNER_MCP_TOOLS.find((t) => t.name === "set_plan");
+const setPlanProps = (setPlanTool?.inputSchema as { properties: Record<string, unknown> })
+  .properties;
+
+PLANNER_MCP_TOOLS.splice(
+  PLANNER_MCP_TOOLS.findIndex((t) => t.name === "update_task") + 1,
+  0,
+  {
+    name: "update_plan",
+    description:
+      "Change plan-level settings on the existing project without replacing its tasks: isolation, reviewPolicy, contractBrief, concurrencyCap, fleetDefaults. Only the fields you pass change; each has the same shape and meaning as on set_plan. Use when the user wants to turn worktree isolation on or off, change review strictness, adjust parallelism, or revise the contract brief mid-project ('isolate the tasks', 'drop reviews', 'run 3 at a time'). Tasks already running keep the settings they started with (an existing workspace is not torn down); pending tasks pick up the change when scheduled. Changing reviewPolicy synthesizes any newly required reviews but does not remove existing ones. Setting concurrencyCap pins it, so it is no longer recomputed from the DAG. fleetDefaults merges per key: agent/model are replaced (empty string clears), and work/review/distill buckets are replaced wholesale when passed. Refused on done or failed projects.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        isolation: setPlanProps.isolation,
+        reviewPolicy: setPlanProps.reviewPolicy,
+        contractBrief: {
+          type: "string",
+          description:
+            "Replacement contract brief (see set_plan). Empty string clears it.",
+        },
+        concurrencyCap: setPlanProps.concurrencyCap,
+        fleetDefaults: setPlanProps.fleetDefaults,
+      },
+    },
+  },
+);

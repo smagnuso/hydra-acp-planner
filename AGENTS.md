@@ -13,7 +13,7 @@ user started from.
 
 The planner exposes its capabilities to the agent as schema-validated MCP
 tools (`set_plan`, `start`, `execute_plan`, `get_status`, `get_findings`,
-`add_task`, `update_task`, `retry`, `skip`, `stop`, `pause`, `resume`,
+`add_task`, `update_task`, `update_plan`, `retry`, `skip`, `stop`, `pause`, `resume`,
 `restart`, `remove`, `list_agents`). Slash commands (`/hydra planner …`)
 exist as a power-user path but the main mode is conversational.
 

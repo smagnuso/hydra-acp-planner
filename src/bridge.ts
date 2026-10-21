@@ -100,10 +100,12 @@ import {
   newBoard,
   nowIso,
   parseFleetDefaultsFromObject,
+  type FleetDefaults,
   isCompetitionCandidate,
   isCompetitionReview,
   needsIsolatedWorkspace,
   parseIsolationFromObject,
+  parseReviewPolicyFromObject,
   pickEligible,
   resolveAgent,
   resolveModel,
@@ -7988,7 +7990,7 @@ export class PlannerBridge {
       );
     }
     const MUTATING_TOOLS = new Set([
-      'set_plan', 'start', 'execute_plan', 'add_task', 'update_task', 'restart',
+      'set_plan', 'start', 'execute_plan', 'add_task', 'update_task', 'update_plan', 'restart',
       'stop', 'pause', 'resume', 'skip', 'retry', 'remove',
     ]);
     if (MUTATING_TOOLS.has(tool) && !(await this.requireInteractive(sessionId))) {
@@ -8020,6 +8022,8 @@ export class PlannerBridge {
           return await this.toolAddTask(req.id, sessionId, args);
         case "update_task":
           return this.toolUpdateTask(req.id, sessionId, args);
+        case "update_plan":
+          return this.toolUpdatePlan(req.id, sessionId, args);
         case "stop":
           return this.toolStop(req.id, sessionId);
         case "pause":
@@ -8182,24 +8186,7 @@ export class PlannerBridge {
         ? Math.floor(concurrencyCapRaw)
         : undefined;
 
-    // Parse reviewPolicy from tool args.
-    const reviewPolicyRaw = args.reviewPolicy;
-    let boardReviewPolicy: ReviewPolicy | undefined;
-    if (reviewPolicyRaw && typeof reviewPolicyRaw === "object" && !Array.isArray(reviewPolicyRaw)) {
-      const rp = reviewPolicyRaw as Record<string, unknown>;
-      const validModes = ["off", "hints", "all", "high-only"];
-      let mode: ReviewPolicy["mode"] = "hints";
-      if (typeof rp.mode === "string" && validModes.includes(rp.mode)) {
-        mode = rp.mode as ReviewPolicy["mode"];
-      }
-      const overrideHint = typeof rp.overrideHint === "boolean" ? rp.overrideHint : false;
-      boardReviewPolicy = { mode, overrideHint };
-      if (typeof rp.maxAttempts === "number" && Number.isFinite(rp.maxAttempts) && rp.maxAttempts > 0) {
-        boardReviewPolicy.maxAttempts = Math.floor(rp.maxAttempts);
-      }
-    } else {
-      boardReviewPolicy = undefined;
-    }
+    const boardReviewPolicy = parseReviewPolicyFromObject(args.reviewPolicy);
 
     // Parse isolation from tool args. Delegated to parseIsolationFromObject
     // (board.ts) so the lenient-parsing posture matches fleetDefaults/
@@ -8741,6 +8728,17 @@ export class PlannerBridge {
     ];
     const changes: Record<string, string> = {};
     let touched = false;
+    if (typeof args.title === "string") {
+      const title = args.title.trim();
+      if (title === "") {
+        return this.replyMcpTextError(reqId, "update_task: `title` cannot be empty");
+      }
+      if (task.title !== title) {
+        task.title = title;
+        changes.title = title;
+        touched = true;
+      }
+    }
     for (const key of MUTABLE) {
       const raw = args[key];
       if (typeof raw !== "string") continue;
@@ -8846,6 +8844,118 @@ export class PlannerBridge {
         }
       }
     }
+    let depsChanged = false;
+    if (args.deps !== undefined) {
+      if (!Array.isArray(args.deps) || !args.deps.every((d) => typeof d === "string")) {
+        return this.replyMcpTextError(reqId, "update_task: `deps` must be an array of task ids");
+      }
+      if (task.kind === "review" || task.kind === "distill") {
+        return this.replyMcpTextError(
+          reqId,
+          `update_task: ${taskId} is a ${task.kind} task; its deps follow from what it ${task.kind === "review" ? "reviews" : "distills"} and cannot be edited`,
+        );
+      }
+      const next = [...new Set((args.deps as string[]).map((d) => d.trim()).filter((d) => d !== ""))];
+      const unknown = next.filter((d) => !findTaskById(board, d));
+      if (unknown.length > 0) {
+        return this.replyMcpTextError(
+          reqId,
+          `update_task: unknown dep id(s): ${unknown.join(", ")}`,
+        );
+      }
+      if (next.includes(task.id)) {
+        return this.replyMcpTextError(reqId, `update_task: ${taskId} cannot depend on itself`);
+      }
+      // A cycle exists iff task.id is reachable from any new dep via existing deps.
+      const seen = new Set<string>();
+      const stack = [...next];
+      while (stack.length > 0) {
+        const id = stack.pop()!;
+        if (id === task.id) {
+          return this.replyMcpTextError(
+            reqId,
+            `update_task: deps [${next.join(", ")}] would create a dependency cycle through ${taskId}`,
+          );
+        }
+        if (seen.has(id)) continue;
+        seen.add(id);
+        stack.push(...(findTaskById(board, id)?.deps ?? []));
+      }
+      if (JSON.stringify([...task.deps].sort()) !== JSON.stringify([...next].sort())) {
+        task.deps = next;
+        changes.deps = next.length > 0 ? next.join("+") : "(none)";
+        touched = true;
+        depsChanged = true;
+      }
+    }
+    if (args.onReject !== undefined) {
+      const raw = args.onReject;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        return this.replyMcpTextError(reqId, "update_task: `onReject` must be an object");
+      }
+      const rec = raw as Record<string, unknown>;
+      const STRATEGIES = ["fresh", "continue", "escalate"] as const;
+      if (
+        rec.strategy !== undefined &&
+        rec.strategy !== "" &&
+        !(STRATEGIES as readonly unknown[]).includes(rec.strategy)
+      ) {
+        return this.replyMcpTextError(
+          reqId,
+          `update_task: invalid onReject.strategy '${String(rec.strategy)}'; expected one of ${STRATEGIES.join(", ")}`,
+        );
+      }
+      const hasAnyKey = ["strategy", "maxAttempts", "agent", "model", "escalateTo"].some(
+        (k) => rec[k] !== undefined,
+      );
+      let next: Task["onReject"] | undefined;
+      if (hasAnyKey) {
+        const merged: NonNullable<Task["onReject"]> = { ...(task.onReject ?? {}) };
+        if (rec.strategy === "") {
+          delete merged.strategy;
+        } else if (typeof rec.strategy === "string") {
+          merged.strategy = rec.strategy as NonNullable<Task["onReject"]>["strategy"];
+        }
+        if (rec.maxAttempts === 0) {
+          delete merged.maxAttempts;
+        } else if (
+          typeof rec.maxAttempts === "number" &&
+          Number.isFinite(rec.maxAttempts) &&
+          rec.maxAttempts > 0
+        ) {
+          merged.maxAttempts = Math.floor(rec.maxAttempts);
+        }
+        for (const key of ["agent", "model"] as const) {
+          const v = rec[key];
+          if (typeof v !== "string") continue;
+          if (v.trim() === "") {
+            delete merged[key];
+          } else {
+            merged[key] = v.trim();
+          }
+        }
+        if (rec.escalateTo !== undefined) {
+          const esc = rec.escalateTo;
+          if (esc && typeof esc === "object" && !Array.isArray(esc)) {
+            const e = esc as Record<string, unknown>;
+            const prev = merged.escalateTo;
+            const agent = typeof e.agent === "string" ? e.agent.trim() : prev?.agent ?? "";
+            const model = typeof e.model === "string" ? e.model.trim() : prev?.model ?? "";
+            if (agent === "" && model === "") {
+              delete merged.escalateTo;
+            } else {
+              merged.escalateTo = { agent, model };
+            }
+          }
+        }
+        next = Object.keys(merged).length > 0 ? merged : undefined;
+      }
+      if (JSON.stringify(task.onReject ?? null) !== JSON.stringify(next ?? null)) {
+        task.onReject = next;
+        changes.onReject = next ? Object.keys(next).join("+") : "(cleared)";
+        touched = true;
+      }
+    }
     let hintChanged = false;
     if (typeof args.reviewHint === "string") {
       const raw = args.reviewHint.trim();
@@ -8884,8 +8994,14 @@ export class PlannerBridge {
           .filter((id) => !before.has(id));
       }
     }
+    if (depsChanged && !board.concurrencyCapLocked) {
+      board.concurrencyCap = sweepLineConcurrencyCap(board.tasks);
+    }
     saveBoard(board, sessionId);
     this.emitPlanUpdate(sessionId, board);
+    if (depsChanged && board.state === "running") {
+      void this.scheduleEligibleTasks(sessionId, board);
+    }
     const summary = Object.entries(changes)
       .map(([k, v]) => `${k}=${v}`)
       .join(", ");
@@ -8903,6 +9019,132 @@ export class PlannerBridge {
     this.replyMcpResult(
       reqId,
       `Updated ${taskId} (${Object.keys(changes).join(", ")})${propSummary}${reviewSummary}.`,
+    );
+  }
+
+  private toolUpdatePlan(
+    reqId: number | string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): void {
+    const ctx = this.requireBoardForTool(sessionId);
+    if ("error" in ctx) return this.replyMcpTextError(reqId, ctx.error);
+    const { board } = ctx;
+    if (board.state === "done" || board.state === "failed") {
+      return this.replyMcpTextError(
+        reqId,
+        `update_plan: project is ${board.state}; plan-level settings can no longer be changed. Use set_plan to start a new plan.`,
+      );
+    }
+    const changes: string[] = [];
+    let reviewPolicyChanged = false;
+    let capChanged = false;
+
+    if (args.isolation !== undefined) {
+      const next = parseIsolationFromObject(args.isolation);
+      if (!next) {
+        return this.replyMcpTextError(
+          reqId,
+          "update_plan: `isolation` must be an object with mode 'off' or 'per-task'",
+        );
+      }
+      if (JSON.stringify(board.isolation ?? null) !== JSON.stringify(next)) {
+        board.isolation = next.mode === "off" && !next.required ? undefined : next;
+        changes.push(`isolation=${next.mode}${next.required ? "+required" : ""}`);
+      }
+    }
+
+    if (args.reviewPolicy !== undefined) {
+      const next = parseReviewPolicyFromObject(args.reviewPolicy);
+      if (!next) {
+        return this.replyMcpTextError(reqId, "update_plan: `reviewPolicy` must be an object");
+      }
+      if (JSON.stringify(board.reviewPolicy ?? null) !== JSON.stringify(next)) {
+        board.reviewPolicy = next;
+        changes.push(`reviewPolicy=${next.mode}`);
+        reviewPolicyChanged = true;
+      }
+    }
+
+    if (args.contractBrief !== undefined) {
+      if (typeof args.contractBrief !== "string") {
+        return this.replyMcpTextError(reqId, "update_plan: `contractBrief` must be a string");
+      }
+      const next = args.contractBrief.trim() === "" ? undefined : args.contractBrief;
+      if ((board.contractBrief ?? undefined) !== next) {
+        board.contractBrief = next;
+        changes.push(next ? "contractBrief" : "contractBrief=(cleared)");
+      }
+    }
+
+    if (args.concurrencyCap !== undefined) {
+      const raw = args.concurrencyCap;
+      if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 1) {
+        return this.replyMcpTextError(
+          reqId,
+          "update_plan: `concurrencyCap` must be a positive integer",
+        );
+      }
+      const next = Math.floor(raw);
+      if (board.concurrencyCap !== next || !board.concurrencyCapLocked) {
+        board.concurrencyCap = next;
+        board.concurrencyCapLocked = true;
+        changes.push(`concurrencyCap=${next}`);
+        capChanged = true;
+      }
+    }
+
+    if (args.fleetDefaults !== undefined) {
+      const raw = args.fleetDefaults;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        return this.replyMcpTextError(reqId, "update_plan: `fleetDefaults` must be an object");
+      }
+      const rec = raw as Record<string, unknown>;
+      const parsed = parseFleetDefaultsFromObject(raw);
+      const next: FleetDefaults = { ...board.fleetDefaults };
+      for (const key of ["agent", "model"] as const) {
+        if (typeof rec[key] === "string") {
+          next[key] = rec[key] === "" ? null : parsed[key];
+        }
+      }
+      for (const key of ["work", "review", "distill"] as const) {
+        if (rec[key] !== undefined) {
+          (next as unknown as Record<string, unknown>)[key] = parsed[key];
+        }
+      }
+      if (JSON.stringify(board.fleetDefaults) !== JSON.stringify(next)) {
+        board.fleetDefaults = next;
+        changes.push("fleetDefaults");
+      }
+    }
+
+    if (changes.length === 0) {
+      return this.replyMcpResult(reqId, "update_plan: no changes.");
+    }
+
+    let newReviewIds: string[] = [];
+    if (reviewPolicyChanged) {
+      const before = new Set(board.tasks.map((t) => t.id));
+      const updated = applyReviewPolicy(board, resolveReviewPolicy(board.reviewPolicy));
+      if (updated !== board) {
+        board.tasks = updated.tasks;
+        newReviewIds = board.tasks.map((t) => t.id).filter((id) => !before.has(id));
+      }
+    }
+    saveBoard(board, sessionId);
+    this.emitPlanUpdate(sessionId, board);
+    if (capChanged && board.state === "running") {
+      void this.scheduleEligibleTasks(sessionId, board);
+    }
+    const reviewSummary = newReviewIds.length > 0 ? ` (synthesized ${newReviewIds.join(", ")})` : "";
+    void this.emitSyntheticMessage(
+      sessionId,
+      `updated plan: ${changes.join(", ")}${reviewSummary}`,
+      { event: "plan-updated" },
+    );
+    this.replyMcpResult(
+      reqId,
+      `Updated plan (${changes.join(", ")})${reviewSummary}. Tasks already running keep the settings they started with.`,
     );
   }
 
