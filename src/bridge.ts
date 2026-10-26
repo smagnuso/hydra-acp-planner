@@ -3987,6 +3987,14 @@ export class PlannerBridge {
       this.client.reply(reqId, { action: "continue" });
       return;
     }
+    if (
+      board.state === "stopped" ||
+      board.state === "done" ||
+      board.state === "failed"
+    ) {
+      this.client.reply(reqId, { action: "continue" });
+      return;
+    }
     const orchState = getOrchestratorState(sessionId);
     if (orchState?.awaitingDecomposition) {
       this.client.reply(reqId, { action: "continue" });
