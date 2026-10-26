@@ -476,6 +476,9 @@ function enqueueOnIntegrationTree<T>(
 // review rejection: recoverable, but not indefinitely.
 const COMMIT_REPROMPT_LIMIT = 2;
 
+// Well under the daemon's 5 minute claim timeout.
+const CLAIM_KEEP_ALIVE_MS = 60_000;
+
 // Pull the text out of a session/update notification IF it's a
 // hydra-emitted synthetic reply (emitExtensionReply on the daemon side —
 // used for every `/hydra ...` slash-command reply, not just workspace
@@ -4040,6 +4043,14 @@ export class PlannerBridge {
     // call open until we discharge `token`.
     this.client.reply(reqId, { action: "processing" });
 
+    // The daemon abandons a claim after a fixed timeout, then resends the
+    // original prompt to an agent that is still busy with ours.
+    const heartbeat = setInterval(() => {
+      this.client
+        .request("hydra-acp/connection/keep_alive", { token, sessionId })
+        .catch(() => {});
+    }, CLAIM_KEEP_ALIVE_MS);
+
     void (async () => {
       try {
         // Emit the rewritten prompt down the rest of the chain to the
@@ -4085,6 +4096,8 @@ export class PlannerBridge {
             respondsTo: token,
           })
           .catch(() => {});
+      } finally {
+        clearInterval(heartbeat);
       }
     })();
   }
