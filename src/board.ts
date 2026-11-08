@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import { renameWithRetry, type RenameRetryDeps } from "./util/rename-retry.js";
 import {
   boardPath,
   orchestratorPointerPath,
@@ -1045,14 +1046,18 @@ export function loadBoard(projectId: string): Board | undefined {
 // if the process is killed mid-save. Crash safety is the only
 // invariant we maintain here; in-process ordering is the transformer's
 // single event loop (single writer, no concurrency).
-export function saveBoard(board: Board, orchestratorSessionId: string): void {
+export function saveBoard(
+  board: Board,
+  orchestratorSessionId: string,
+  renameDeps?: RenameRetryDeps,
+): void {
   board.updatedAt = nowIso();
   const dir = projectDir(board.projectId);
   mkdirSync(dir, { recursive: true });
   const target = boardPath(board.projectId);
   const tmp = `${target}.tmp.${process.pid}`;
   writeFileSync(tmp, JSON.stringify(board, null, 2));
-  renameSync(tmp, target);
+  renameWithRetry(tmp, target, renameDeps);
   // Persist the orchestrator session pointer so cold-start recovery can
   // reverse-map projectId -> session without scanning every session.
   writeFileSync(orchestratorPointerPath(board.projectId), `${orchestratorSessionId}\n`);
