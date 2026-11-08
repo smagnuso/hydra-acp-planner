@@ -687,8 +687,15 @@ function orchestratorSessionForProject(projectId: string): string | undefined {
 // Formatters moved to ./format.ts for unit-testability without
 // dragging in the PlannerBridge constructor and its WS connection.
 
+export function expandHome(raw: string, home: string): string {
+  if (raw === "~" || raw.startsWith("~/") || raw.startsWith("~\\")) {
+    return `${home}${raw.slice(1)}`;
+  }
+  return raw;
+}
+
 // Resolve a list of `--attach <path>` values into Attachment records.
-// Tilde-expands `~/...`, then resolves relative paths against the
+// Tilde-expands `~`, `~/...` and `~\...`, then resolves relative paths against the
 // daemon's cwd. Reads the file synchronously (these are user-supplied
 // at command time — we want to fail loudly before decomposition
 // starts rather than crash a worker mid-task). Returns a list of
@@ -697,7 +704,7 @@ function orchestratorSessionForProject(projectId: string): string | undefined {
 function loadAttachments(paths: string[]): { attachments: import("./board.js").Attachment[] } | { error: string } {
   const out: import("./board.js").Attachment[] = [];
   for (const raw of paths) {
-    const expanded = raw.startsWith("~/") ? `${homedir()}${raw.slice(1)}` : raw;
+    const expanded = expandHome(raw, homedir());
     const absolute = resolvePath(expanded);
     try {
       const content = readFileSync(absolute, "utf8");
