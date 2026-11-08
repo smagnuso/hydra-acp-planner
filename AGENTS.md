@@ -118,6 +118,21 @@ Ships as `hydra-acp-planner` on PATH. Registered via
 - **`workerForwarders` buffers agent chunks per worker** so streamed
   text isn't split mid-sentence by `[Tn] ` prefixes injected between
   chunks. Boundary flushing lives in `worker-forward.ts`.
+- **Treat every path as possibly Windows-shaped, whatever host this runs on.**
+  A cwd, a tool-call path or a session field can arrive as `C:\x`, `C:/x`, a
+  mix, or UNC from a daemon on Windows, even when this code runs on Linux. Never
+  split, prefix-match or find the last separator with a hard-coded `/` on a
+  filesystem path; use `path.relative`, `isAbsolute` and `basename` (URLs and
+  ids are not paths). Containment is `path.relative` plus a first-segment `..`
+  test, never a string prefix. Windows shows full paths, never `~`; expand `~`,
+  `~/` and `~\` on input only. The full checklist (spawning, renames, signals,
+  testing) is in the `hydra-acp/cli` AGENTS.md under "Treat every path as
+  possibly Windows-shaped".
+- **Spawn `hydra-acp` through `src/windows-spawn.ts`.** Its `quoteForCmd` escapes
+  `"` with a backslash, which cmd.exe does not honour, and does not refuse `%`.
+  That is acceptable only while every argument is a fixed flag or a daemon-issued
+  id; if user or agent text ever reaches it, use the CLI's stricter
+  `resolveSpawnTarget` instead.
 
 ## Updating this file
 
