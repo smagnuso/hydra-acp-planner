@@ -133,6 +133,15 @@ Ships as `hydra-acp-planner` on PATH. Registered via
   That is acceptable only while every argument is a fixed flag or a daemon-issued
   id; if user or agent text ever reaches it, use the CLI's stricter
   `resolveSpawnTarget` instead.
+- **Write-then-rename of state goes through `src/util/rename-retry.ts`.** On
+  Windows a rename throws EPERM, EBUSY or EACCES when another process (the CLI,
+  antivirus, an indexer) has the target open; `renameWithRetry` retries those,
+  removes the temp file when it gives up and rethrows the original error.
+- **`bridge.stop()` is never the only place state is persisted.** `SIGTERM` is a
+  hard kill on Windows, so the handler never runs; `saveBoard` runs on every
+  mutation and that is what keeps a kill harmless.
+- **Expand `~` on user input through `expandHome`** (`bridge.ts`), which handles
+  `~`, `~/` and `~\` and leaves `~foo` alone.
 
 ## Updating this file
 
